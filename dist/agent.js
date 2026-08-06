@@ -62,6 +62,8 @@ class TavilyHardwareAgent {
                         timestamp: new Date().toISOString()
                     });
                 }
+                // Inter-retailer delay to stay comfortably under Groq 30 RPM limit
+                await new Promise(r => setTimeout(r, 600));
             }
         }
         state.scrapedOffers.sort((a, b) => a.price - b.price);
@@ -199,8 +201,10 @@ class TavilyHardwareAgent {
                     }
                     catch (e) { }
                 }
+                // Clean URL by stripping trailing /reviews
+                const cleanProductUrl = fullUrl.replace(/\/reviews\/?$/i, '');
                 // 100% LLM extraction via Groq or OpenRouter
-                const parsed = await this.parseAccuratePriceWithLLM(rawContent, modelQuery, retailerName, fullUrl, category);
+                const parsed = await this.parseAccuratePriceWithLLM(rawContent, modelQuery, retailerName, cleanProductUrl, category);
                 if (parsed && parsed.price && parsed.price > 0) {
                     console.log(`✅ [TAVILY AI + LLM EXTRACTED] ${retailerName}: "$${parsed.price}" -> ${parsed.title.substring(0, 60)}`);
                     return {
@@ -209,7 +213,7 @@ class TavilyHardwareAgent {
                         originalPrice: parsed.originalPrice,
                         title: parsed.title || hit.title || modelQuery,
                         brand: parsed.brand,
-                        url: fullUrl,
+                        url: cleanProductUrl,
                         inStock: parsed.inStock,
                         isRefurbished: parsed.isRefurbished,
                         snippet: hit.content
@@ -277,21 +281,19 @@ class TavilyHardwareAgent {
             console.warn('[Groq LLM] No GROQ_API_KEY provided in .env');
             return null;
         }
-        // Models available on Groq free tier — rotated if a model hits rate limit (TPM 429)
+        // Active supported models on Groq free tier
         const GROQ_MODELS = [
             'llama-3.1-8b-instant',
-            'gemma2-9b-it',
-            'llama-3.3-70b-versatile',
-            'mixtral-8x7b-32768'
+            'llama-3.3-70b-versatile'
         ];
-        const systemPrompt = `You are a high-precision PC hardware price extraction AI. Your job is to extract the exact current sale price of the requested item from the webpage content.
+        const systemPrompt = `You are a high-precision PC hardware price extraction AI. Your mission is to extract the EXACT current sale price displayed in the main Buy Box for the product on the retailer webpage.
 
-CRITICAL INSTRUCTIONS:
-1. Identify the MAIN product on the webpage matching "${query}".
-2. Ignore sidebar ads, "Customers Also Viewed", "Sponsored Products", shipping costs, and warranty fees.
-3. Extract the exact numerical current sale price in USD (e.g. 599.99).
-4. If listed, extract the original MSRP/list price (number or null).
-5. Output JSON ONLY in this exact format:
+CRITICAL PRODUCT PAGE EXTRACTION RULES:
+1. MAIN BUY BOX PRICE ONLY: Extract the price listed next to the main "Add to Cart" or "Buy Now" button.
+2. IGNORE THIRD-PARTY MARKETPLACE LISTINGS: Do NOT extract prices from "Other Sellers", "Used & New from $XXX", or sidebar third-party offers.
+3. SALE PRICE vs REGULAR MSRP: If a regular price is struck through ($699.99) and a sale price is shown ($599.99), set currentPrice = 599.99 and originalPrice = 699.99.
+4. IGNORE UNRELATED PRODUCTS: Ignore "Customers Also Viewed", "Sponsored Products", protection plans, and warranty add-ons.
+5. Output JSON ONLY in this format:
 {
   "currentPrice": number or null,
   "originalPrice": number or null,
@@ -336,9 +338,8 @@ CRITICAL INSTRUCTIONS:
                     }
                 }
                 else if (res.status === 429) {
-                    console.warn(`[Groq Rate Limit 429] Model ${modelName} rate limited — rotating to next Groq model...`);
-                    // Brief pause before trying next model
-                    await new Promise(r => setTimeout(r, 400));
+                    console.warn(`[Groq Rate Limit 429] Model ${modelName} rate limited — waiting 1.2s before retrying next model...`);
+                    await new Promise(r => setTimeout(r, 1200));
                     continue;
                 }
                 else {
