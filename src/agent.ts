@@ -320,7 +320,7 @@ export class TavilyHardwareAgent {
   }
 
   /**
-   * Groq LLM API Price Extractor (Llama 3.1 8B Instant)
+   * Groq LLM API Price Extractor with automatic multi-model rotation on HTTP 429
    */
   private async parseWithGroqLLM(text: string, query: string, retailer: string, category: string): Promise<{
     price: number | null;
@@ -336,8 +336,15 @@ export class TavilyHardwareAgent {
       return null;
     }
 
-    try {
-      const systemPrompt = `You are a high-precision PC hardware price extraction AI. Your job is to extract the exact current sale price of the requested item from the webpage content.
+    // Models available on Groq free tier — rotated if a model hits rate limit (TPM 429)
+    const GROQ_MODELS = [
+      'llama-3.1-8b-instant',
+      'gemma2-9b-it',
+      'llama-3.3-70b-versatile',
+      'mixtral-8x7b-32768'
+    ];
+
+    const systemPrompt = `You are a high-precision PC hardware price extraction AI. Your job is to extract the exact current sale price of the requested item from the webpage content.
 
 CRITICAL INSTRUCTIONS:
 1. Identify the MAIN product on the webpage matching "${query}".
@@ -354,44 +361,56 @@ CRITICAL INSTRUCTIONS:
   "brand": string
 }`;
 
-      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({
-          model: 'llama-3.1-8b-instant',
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: `Item Query: "${query}" (${category})\nRetailer: "${retailer}"\nPage Content:\n${text.substring(0, 6000)}` }
-          ],
-          temperature: 0.1,
-          response_format: { type: 'json_object' }
-        })
-      });
+    // Trim text to 2,500 characters (~500 tokens) to stay well under token per minute limits
+    const trimmedSnippet = text.substring(0, 2500);
 
-      if (res.ok) {
-        const data: any = await res.json();
-        const content = data.choices?.[0]?.message?.content || '';
-        const parsed = JSON.parse(content);
-        if (typeof parsed.currentPrice === 'number' && parsed.currentPrice > 0) {
-          return {
-            price: parsed.currentPrice,
-            originalPrice: typeof parsed.originalPrice === 'number' ? parsed.originalPrice : undefined,
-            title: parsed.cleanTitle || query,
-            brand: parsed.brand,
-            inStock: Boolean(parsed.inStock),
-            isRefurbished: Boolean(parsed.isRefurbished)
-          };
+    for (const modelName of GROQ_MODELS) {
+      try {
+        const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`
+          },
+          body: JSON.stringify({
+            model: modelName,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: `Item Query: "${query}" (${category})\nRetailer: "${retailer}"\nPage Content:\n${trimmedSnippet}` }
+            ],
+            temperature: 0.1,
+            response_format: { type: 'json_object' }
+          })
+        });
+
+        if (res.ok) {
+          const data: any = await res.json();
+          const content = data.choices?.[0]?.message?.content || '';
+          const parsed = JSON.parse(content);
+          if (typeof parsed.currentPrice === 'number' && parsed.currentPrice > 0) {
+            return {
+              price: parsed.currentPrice,
+              originalPrice: typeof parsed.originalPrice === 'number' ? parsed.originalPrice : undefined,
+              title: parsed.cleanTitle || query,
+              brand: parsed.brand,
+              inStock: Boolean(parsed.inStock),
+              isRefurbished: Boolean(parsed.isRefurbished)
+            };
+          }
+        } else if (res.status === 429) {
+          console.warn(`[Groq Rate Limit 429] Model ${modelName} rate limited — rotating to next Groq model...`);
+          // Brief pause before trying next model
+          await new Promise(r => setTimeout(r, 400));
+          continue;
+        } else {
+          const errText = await res.text();
+          console.warn(`[Groq API Error ${modelName}] HTTP ${res.status}:`, errText.substring(0, 150));
         }
-      } else {
-        const errText = await res.text();
-        console.warn(`[Groq API Error] HTTP ${res.status}:`, errText.substring(0, 200));
+      } catch (err: any) {
+        console.warn(`[Groq LLM Error ${modelName}] ${retailer}:`, err?.message || err);
       }
-    } catch (err: any) {
-      console.warn(`[Groq LLM Error] ${retailer}:`, err?.message || err);
     }
+
     return null;
   }
 
