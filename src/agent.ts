@@ -230,7 +230,10 @@ export class TavilyHardwareAgent {
         // If rawContent is not returned in search, use official Tavily extract API
         if (rawContent.length < 300) {
           try {
-            const extRes = await this.tvlyClient.extract([fullUrl]);
+            const extRes = await this.tvlyClient.extract([fullUrl], {
+              extractDepth: 'advanced', // Bypasses many JS walls
+              format: 'markdown' // Converts noisy HTML to clean text
+            });
             const extPage = (extRes.results || [])[0];
             if (extPage && extPage.rawContent) {
               rawContent = extPage.rawContent;
@@ -272,7 +275,10 @@ export class TavilyHardwareAgent {
   private async extractDirectPage(url: string, retailerName: string, category: string): Promise<AgentOffer | null> {
     try {
       console.log(`[Tavily AI SDK Extract] Reading DOM content from ${url}...`);
-      const extRes = await this.tvlyClient.extract([url]);
+      const extRes = await this.tvlyClient.extract([url], {
+        extractDepth: 'advanced',
+        format: 'markdown'
+      });
       const hit = (extRes.results || [])[0];
 
       if (hit) {
@@ -347,14 +353,15 @@ export class TavilyHardwareAgent {
       'llama-3.3-70b-versatile'
     ];
 
-    const systemPrompt = `You are a high-precision PC hardware price extraction AI. Your mission is to extract the EXACT current sale price displayed in the main Buy Box for the product on the retailer webpage.
+    const systemPrompt = `You are a high-precision PC hardware price extraction AI. 
+Your mission is to extract the EXACT current sale price from the provided webpage markdown.
 
 CRITICAL PRODUCT PAGE EXTRACTION RULES:
-1. MAIN BUY BOX PRICE ONLY: Extract the price listed next to the main "Add to Cart" or "Buy Now" button.
-2. IGNORE THIRD-PARTY MARKETPLACE LISTINGS: Do NOT extract prices from "Other Sellers", "Used & New from $XXX", or sidebar third-party offers.
-3. SALE PRICE vs REGULAR MSRP: If a regular price is struck through ($699.99) and a sale price is shown ($599.99), set currentPrice = 599.99 and originalPrice = 699.99.
-4. IGNORE UNRELATED PRODUCTS: Ignore "Customers Also Viewed", "Sponsored Products", protection plans, and warranty add-ons.
-5. Output JSON ONLY in this format:
+1. BYPASS HEADERS: Ignore top navigation links, breadcrumbs, and footer elements. Scan deep into the text.
+2. MAIN BUY BOX PRICE ONLY: Extract the price listed next to the main "Add to Cart" or "Buy Now" button.
+3. IGNORE THIRD-PARTY: Do NOT extract prices from "Other Sellers", "Used & New from $XXX", or sidebar ads.
+4. SALE PRICE vs REGULAR MSRP: If a regular price is struck through ($699.99) and a sale price is shown ($599.99), set currentPrice = 599.99 and originalPrice = 699.99.
+5. Output strictly in this JSON format:
 {
   "currentPrice": number or null,
   "originalPrice": number or null,
