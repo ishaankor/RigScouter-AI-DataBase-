@@ -16,14 +16,14 @@ class TavilyHardwareAgent {
         this.tavilyApiKey = TAVILY_API_KEY;
     }
     /**
-     * Main agent entrypoint for extracting prices of ANY & ALL PC parts or direct product URLs.
+     * Main agent entrypoint — 100% Tavily Search & DOM Extract + Groq/OpenRouter LLM Parsing.
      */
     async run(prompt, emit) {
         const cleanPrompt = prompt.trim();
         const isUrl = cleanPrompt.startsWith('http://') || cleanPrompt.startsWith('https://');
         const category = this.detectCategory(cleanPrompt);
         console.log(`\n======================================================`);
-        console.log(`[Universal Tavily Agent] Extracting live price for: "${cleanPrompt}" (${category})`);
+        console.log(`[Pure Tavily + LLM Agent] Extracting price for: "${cleanPrompt}" (${category})`);
         console.log(`======================================================\n`);
         emit?.('agent_start', { query: cleanPrompt, category, timestamp: new Date().toISOString() });
         const state = {
@@ -45,10 +45,9 @@ class TavilyHardwareAgent {
                 { name: 'Best Buy', domain: 'bestbuy.com' },
                 { name: 'B&H', domain: 'bhphotovideo.com' }
             ];
-            const bounds = this.getCategoryPriceBounds(category);
             for (const r of RETAILERS) {
                 const offer = await this.scrapeRetailerAccurateOffer(cleanPrompt, r.name, r.domain, category);
-                if (offer && offer.price >= bounds.min && offer.price <= bounds.max) {
+                if (offer && offer.price > 0) {
                     state.scrapedOffers.push(offer);
                     emit?.('retailer_found', {
                         query: cleanPrompt,
@@ -74,7 +73,6 @@ class TavilyHardwareAgent {
         }
         if (state.bestOffer) {
             try {
-                // Check previous price in DB before upsert for price-change tracking
                 const { data: existing } = await supabase_js_1.supabase
                     .from('hardware_components')
                     .select('current_price')
@@ -137,7 +135,7 @@ class TavilyHardwareAgent {
                     deal_score: 95,
                     updated_at: new Date().toISOString()
                 });
-                console.log(`[DB Persist Success] "${state.bestOffer.title}" ($${state.bestOffer.price.toFixed(2)}) [${state.priceChange}] at ${state.bestOffer.url}`);
+                console.log(`[DB Persist Success] "${state.bestOffer.title}" ($${state.bestOffer.price.toFixed(2)}) at ${state.bestOffer.url}`);
                 emit?.('agent_complete', {
                     query: cleanPrompt,
                     bestOffer: state.bestOffer,
@@ -185,6 +183,7 @@ class TavilyHardwareAgent {
                     if (!this.isValidDirectProductUrl(fullUrl, domainPattern))
                         continue;
                     let rawContent = (hit.title || '') + '\n' + (hit.content || '');
+                    // Extract full DOM content via Tavily Extract
                     try {
                         const extRes = await fetch('https://api.tavily.com/extract', {
                             method: 'POST',
@@ -200,15 +199,10 @@ class TavilyHardwareAgent {
                         }
                     }
                     catch (e) { }
-                    const parsed = await this.parseAccuratePrice(rawContent, modelQuery, retailerName, fullUrl, category);
-                    const bounds = this.getCategoryPriceBounds(category);
-                    if (parsed && parsed.price && parsed.price >= bounds.min && parsed.price <= bounds.max) {
-                        // Title relevance check — verify title matches the query hardware
-                        if (!this.isTitleRelevant(parsed.title, modelQuery)) {
-                            console.warn(`[Relevance Reject] ${retailerName}: title "${parsed.title.substring(0, 60)}" doesn't match query "${modelQuery}"`);
-                            continue;
-                        }
-                        console.log(`✅ [ACCURATE PRICE EXTRACTED] ${retailerName}: "$${parsed.price}" -> ${parsed.title.substring(0, 60)}`);
+                    // 100% LLM extraction via Groq or OpenRouter
+                    const parsed = await this.parseAccuratePriceWithLLM(rawContent, modelQuery, retailerName, fullUrl, category);
+                    if (parsed && parsed.price && parsed.price > 0) {
+                        console.log(`✅ [LLM EXTRACTED] ${retailerName}: "$${parsed.price}" -> ${parsed.title.substring(0, 60)}`);
                         return {
                             retailer: retailerName,
                             price: parsed.price,
@@ -228,38 +222,39 @@ class TavilyHardwareAgent {
         }
         return null;
     }
-    async parseAccuratePrice(text, query, retailer, url, category) {
-        // 1. HTML Structured Data Parser (JSON-LD Product/Offer schema + OpenGraph meta tags)
-        const structuredResult = this.parseStructuredData(text, query, retailer);
-        if (structuredResult && structuredResult.price) {
-            return structuredResult;
-        }
-        // 2. Groq LLM API (Fast Llama 3.1 8B Instant — 14,400 free requests/day)
+    /**
+     * 100% LLM-driven price extraction (Groq Llama 3.1 8B Primary -> OpenRouter Llama 3.2 3B Fallback)
+     */
+    async parseAccuratePriceWithLLM(text, query, retailer, url, category) {
+        // 1. Primary LLM: Groq API (Llama 3.1 8B Instant — 14,400 free requests/day)
         const groqResult = await this.parseWithGroqLLM(text, query, retailer, category);
         if (groqResult && groqResult.price) {
             return groqResult;
         }
-        // 3. OpenRouter Free LLM Fallback (Llama 3.2 3B / Gemma 2 9B)
+        // 2. Secondary LLM: OpenRouter Free API (Llama 3.2 3B / Gemma 2 9B)
         const openRouterResult = await this.parseWithOpenRouterLLM(text, query, retailer, category);
         if (openRouterResult && openRouterResult.price) {
             return openRouterResult;
         }
-        // 4. Deterministic Exact Regex Parser
-        return this.deterministicExactParser(text, query, retailer, category);
+        return null;
     }
     /**
-     * Free Groq LLM API Parser (14,400 requests/day free tier)
+     * Groq LLM API Price Extractor (Llama 3.1 8B Instant)
      */
     async parseWithGroqLLM(text, query, retailer, category) {
         const apiKey = GROQ_API_KEY;
-        if (!apiKey || apiKey.includes('placeholder'))
+        if (!apiKey || apiKey.includes('placeholder')) {
+            console.warn('[Groq LLM] No GROQ_API_KEY provided in .env');
             return null;
+        }
         try {
-            const promptText = `Analyze product page text snippet for PC hardware "${query}" (${category}) from retailer "${retailer}".
-Find the exact current sale dollar price listed for item "${query}".
-Ignore shipping fees, warranty fees, monthly payments ($19/mo), and unrelated ads.
+            const systemPrompt = `You are a high-precision PC hardware price extraction AI. Your job is to extract the exact current sale price of the requested item from the retailer webpage text.
 
-Return JSON ONLY:
+CRITICAL INSTRUCTIONS:
+1. Identify the MAIN product on the webpage that matches the user query "${query}".
+2. Ignore sidebar ads, "Customers Also Viewed", "Sponsored Products", shipping costs, and warranty fees.
+3. Return the exact numerical sale price in USD (e.g. 599.99 or 249.99).
+4. Output JSON ONLY in this format:
 {
   "currentPrice": number or null,
   "originalPrice": number or null,
@@ -276,8 +271,8 @@ Return JSON ONLY:
                 body: JSON.stringify({
                     model: 'llama-3.1-8b-instant',
                     messages: [
-                        { role: 'system', content: 'You are a specialized PC hardware price extraction assistant. Output clean JSON only.' },
-                        { role: 'user', content: `${promptText}\n\nSnippet:\n${text.substring(0, 5000)}` }
+                        { role: 'system', content: systemPrompt },
+                        { role: 'user', content: `Item Query: "${query}" (${category})\nRetailer: "${retailer}"\nPage Content:\n${text.substring(0, 6000)}` }
                     ],
                     temperature: 0.1,
                     response_format: { type: 'json_object' }
@@ -297,14 +292,18 @@ Return JSON ONLY:
                     };
                 }
             }
+            else {
+                const errText = await res.text();
+                console.warn(`[Groq API Error] HTTP ${res.status}:`, errText.substring(0, 200));
+            }
         }
         catch (err) {
-            console.warn(`[Groq LLM Warning] ${retailer}:`, err?.message || err);
+            console.warn(`[Groq LLM Error] ${retailer}:`, err?.message || err);
         }
         return null;
     }
     /**
-     * Free OpenRouter LLM Fallback (Llama 3.2 3B Instruct Free)
+     * OpenRouter Free LLM Fallback (Llama 3.2 3B Instruct Free)
      */
     async parseWithOpenRouterLLM(text, query, retailer, category) {
         const apiKey = OPENROUTER_API_KEY || 'sk-or-v1-free';
@@ -320,8 +319,8 @@ Return JSON ONLY:
                 body: JSON.stringify({
                     model: 'meta-llama/llama-3.2-3b-instruct:free',
                     messages: [
-                        { role: 'system', content: 'Extract PC hardware price JSON.' },
-                        { role: 'user', content: `Item: ${query} (${category})\nRetailer: ${retailer}\nSnippet:\n${text.substring(0, 4000)}\n\nReturn JSON: {"currentPrice": number, "inStock": boolean, "cleanTitle": string}` }
+                        { role: 'system', content: 'You extract PC hardware price JSON.' },
+                        { role: 'user', content: `Item: "${query}" (${category})\nRetailer: "${retailer}"\nSnippet:\n${text.substring(0, 4000)}\n\nReturn JSON: {"currentPrice": number, "originalPrice": number, "inStock": boolean, "cleanTitle": string}` }
                     ],
                     temperature: 0.1
                 })
@@ -347,109 +346,6 @@ Return JSON ONLY:
         catch (e) { }
         return null;
     }
-    /**
-     * Parses JSON-LD microdata schema.org/Product or OpenGraph meta tags from raw HTML DOM
-     */
-    parseStructuredData(htmlText, query, retailer) {
-        if (!htmlText || (!htmlText.includes('<script') && !htmlText.includes('meta'))) {
-            return null;
-        }
-        try {
-            const lower = htmlText.toLowerCase();
-            const isRefurbished = lower.includes('refurbished') || lower.includes('renewed') || lower.includes('open box');
-            const inStock = !(lower.includes('out of stock') || lower.includes('sold out') || lower.includes('unavailable'));
-            // OpenGraph meta tag: <meta property="og:price:amount" content="399.99">
-            const ogPriceMatch = htmlText.match(/property=["'](?:og|product):price:amount["']\s+content=["']([\d.]+)/i) ||
-                htmlText.match(/content=["']([\d.]+)["']\s+property=["'](?:og|product):price:amount["']/i);
-            if (ogPriceMatch) {
-                const p = parseFloat(ogPriceMatch[1]);
-                if (p > 5 && p < 10000) {
-                    const titleMatch = htmlText.match(/property=["']og:title["']\s+content=["']([^"']+)["']/i);
-                    const cleanTitle = titleMatch ? this.cleanTitle(titleMatch[1], query) : query;
-                    return { price: p, title: cleanTitle, inStock, isRefurbished };
-                }
-            }
-            // JSON-LD scripts: <script type="application/ld+json">...</script>
-            const jsonLdMatches = htmlText.match(/<script\s+type=["']application\/ld\+json["']>([\s\S]*?)<\/script>/gi);
-            if (jsonLdMatches) {
-                for (const block of jsonLdMatches) {
-                    const cleanBlock = block.replace(/<\/?script[^>]*>/gi, '').trim();
-                    try {
-                        const parsed = JSON.parse(cleanBlock);
-                        const target = Array.isArray(parsed) ? parsed[0] : parsed;
-                        if (target && (target['@type'] === 'Product' || target['@type'] === 'Offer' || target.offers)) {
-                            let priceVal = null;
-                            let titleVal = target.name || query;
-                            const offersObj = target.offers ? (Array.isArray(target.offers) ? target.offers[0] : target.offers) : target;
-                            if (offersObj && (offersObj.price || offersObj.lowPrice)) {
-                                priceVal = parseFloat(offersObj.price || offersObj.lowPrice);
-                            }
-                            if (priceVal && !isNaN(priceVal) && priceVal > 5 && priceVal < 10000) {
-                                return {
-                                    price: priceVal,
-                                    title: this.cleanTitle(titleVal, query),
-                                    inStock,
-                                    isRefurbished
-                                };
-                            }
-                        }
-                    }
-                    catch (e) { }
-                }
-            }
-        }
-        catch (e) { }
-        return null;
-    }
-    deterministicExactParser(text, query, retailer, category) {
-        const lower = text.toLowerCase();
-        const isRefurbished = lower.includes('refurbished') || lower.includes('renewed') || lower.includes('open box');
-        const inStock = !(lower.includes('out of stock') ||
-            lower.includes('not available') ||
-            lower.includes('0 in stock') ||
-            lower.includes('sold out') ||
-            lower.includes('shipping not available'));
-        let price = null;
-        let originalPrice;
-        const bounds = this.getCategoryPriceBounds(category);
-        // Direct retailer priority text patterns
-        const buyInStoreMatch = text.match(/BUY\s*IN\s*STORE\s*\$\s*(\d{1,4}(?:\.\d{2})?)/i);
-        const todaysMatch = text.match(/Todays\s*price\s*\$\s*(\d{1,4}(?:\.\d{2})?)/i) || text.match(/Today's\s*price\s*\$\s*(\d{1,4}(?:\.\d{2})?)/i);
-        const origMatch = text.match(/Original\s*price\s*\$\s*(\d{1,4}(?:\.\d{2})?)/i);
-        const priceProductPageMatch = text.match(/Price,\s*product\s*page\$\s*(\d{1,4}(?:\.\d{2})?)/i) || text.match(/\$\s*(\d{1,4}\.\d{2})\s*\(Renewed\)/i);
-        if (origMatch)
-            originalPrice = parseFloat(origMatch[1]);
-        if (buyInStoreMatch) {
-            price = parseFloat(buyInStoreMatch[1]);
-        }
-        else if (todaysMatch) {
-            price = parseFloat(todaysMatch[1]);
-        }
-        else if (priceProductPageMatch) {
-            price = parseFloat(priceProductPageMatch[1]);
-        }
-        else {
-            const SKIP_PRICES = new Set([1599.99, 1299.99, 429.99, 4.99, 9.99, 14.99, 19.99, 24.99, 29.99]);
-            const matches = text.match(/\$\s*(\d{1,4}(?:\.\d{2})?)/g);
-            if (matches) {
-                for (const m of matches) {
-                    const num = parseFloat(m.replace(/\$|\s/g, ''));
-                    if (num >= bounds.min && num <= bounds.max && !SKIP_PRICES.has(num)) {
-                        price = num;
-                        break;
-                    }
-                }
-            }
-        }
-        const titleLine = text.split('\n')[0] || query;
-        return {
-            price,
-            originalPrice,
-            title: this.cleanTitle(titleLine.substring(0, 120), query),
-            inStock,
-            isRefurbished
-        };
-    }
     async extractDirectPage(url, retailerName, category) {
         try {
             console.log(`[Tavily Direct Extract] Reading DOM content from ${url}...`);
@@ -466,7 +362,7 @@ Return JSON ONLY:
                 const hit = (data.results || [])[0];
                 if (hit) {
                     const rawText = (hit.raw_content || hit.content || hit.title || '');
-                    const parsed = await this.parseAccuratePrice(rawText, url, retailerName, url, category);
+                    const parsed = await this.parseAccuratePriceWithLLM(rawText, url, retailerName, url, category);
                     if (parsed && parsed.price) {
                         return {
                             retailer: retailerName,
@@ -626,41 +522,6 @@ Return JSON ONLY:
             case 'Peripheral': return 'PC peripheral';
             default: return 'PC hardware';
         }
-    }
-    /**
-     * Dynamic, category-aware price ranges for hardware verification
-     */
-    getCategoryPriceBounds(category) {
-        switch (category) {
-            case 'GPU': return { min: 50, max: 3500 };
-            case 'CPU': return { min: 40, max: 2500 };
-            case 'RAM': return { min: 15, max: 1000 };
-            case 'SSD': return { min: 20, max: 1000 };
-            case 'HDD': return { min: 20, max: 1000 };
-            case 'Motherboard': return { min: 40, max: 1500 };
-            case 'PSU': return { min: 30, max: 800 };
-            case 'Case': return { min: 30, max: 800 };
-            case 'Cooler': return { min: 15, max: 600 };
-            case 'Fan': return { min: 5, max: 300 };
-            case 'Monitor': return { min: 50, max: 3000 };
-            case 'Peripheral': return { min: 10, max: 500 };
-            default: return { min: 5, max: 2000 };
-        }
-    }
-    /**
-     * Ensures product title contains relevant model/brand keywords from the query.
-     */
-    isTitleRelevant(title, query) {
-        if (!title || !query)
-            return true;
-        const titleLower = title.toLowerCase();
-        const queryLower = query.toLowerCase();
-        // Extract alphanumeric keywords from query (allowing models like 1080, 4070, 7800x3d, i7, 850w, AM5, DDR5)
-        const tokens = queryLower.split(/[\s\-_,.]+/).filter(t => t.length >= 2 && !['buy', 'price', 'card', 'best'].includes(t));
-        if (tokens.length === 0)
-            return true;
-        // Must match at least 1 significant token from the query
-        return tokens.some(token => titleLower.includes(token));
     }
     cleanTitle(title, fallbackQuery) {
         if (!title)
