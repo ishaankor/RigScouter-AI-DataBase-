@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: rigscouter-ai-database
+    env: node
+    region: oregon
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: node dist/server.js
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: TAVILY_API_KEY
+        value: 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
+      - key: NEXT_PUBLIC_SUPABASE_URL
+        value: https://mfzokxffhmedvtuhykdw.supabase.co
+      - key: NEXT_PUBLIC_SUPABASE_ANON_KEY
+        value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1mem9reGZmaG1lZHZ0dWh5a2R3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU5NjY1NjIsImV4cCI6MjEwMTU0MjU2Mn0.pkKw3G6EbD0A3cUydWPA79WE07RJElQdWkRcQXjkUoQ
+      - key: DATABASE_URL
+        value: postgresql://postgres:majhu2-nepwyq-deqkEk@db.mfzokxffhmedvtuhykdw.supabase.co:5432/postgres
+      - key: GROQ_API_KEY
+        sync: false
