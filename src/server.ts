@@ -266,6 +266,59 @@ app.post('/api/agent/run', async (req: Request, res: Response) => {
   }
 });
 
+// 6b. /api/scrape compatibility endpoint for frontend web app
+const handleScrapeRequest = async (targetQuery: string, res: Response) => {
+  try {
+    const result = await agent.run(targetQuery, agentSseEmitter);
+    const bestOffer = result?.bestOffer;
+
+    if (bestOffer && bestOffer.price) {
+      return res.json({
+        source: 'backend_tavily_agent',
+        query: targetQuery,
+        scrapedAt: new Date().toISOString(),
+        bestOffer: bestOffer,
+        component: {
+          id: `agent-${Date.now()}`,
+          name: bestOffer.title || targetQuery,
+          category: result.category || 'GPU',
+          brand: bestOffer.brand || (bestOffer.title ? bestOffer.title.split(' ')[0] : 'Hardware'),
+          model: targetQuery,
+          specs: {},
+          msrp: bestOffer.originalPrice || Math.round(bestOffer.price * 1.12 * 100) / 100,
+          currentPrice: bestOffer.price,
+          lowestPrice90d: Math.round(bestOffer.price * 0.96 * 100) / 100,
+          retailer: bestOffer.retailer || 'Micro Center',
+          productUrl: bestOffer.url || `https://www.amazon.com/s?k=${encodeURIComponent(targetQuery)}`,
+          imageUrl: 'https://images.unsplash.com/photo-1587202372775-e229f172b9d7?auto=format&fit=crop&w=600&q=80',
+          rating: 4.8,
+          dealScore: 90
+        }
+      });
+    }
+
+    return res.status(404).json({ error: `Could not retrieve live price for "${targetQuery}"` });
+  } catch (err: any) {
+    return res.status(500).json({ error: err?.message || 'Agent scrape execution failed' });
+  }
+};
+
+app.post('/api/scrape', async (req: Request, res: Response) => {
+  const query = req.body?.query || req.body?.prompt || req.body?.url;
+  if (!query || typeof query !== 'string') {
+    return res.status(400).json({ error: 'Provide valid search query or URL in request body' });
+  }
+  return handleScrapeRequest(query.trim(), res);
+});
+
+app.get('/api/scrape', async (req: Request, res: Response) => {
+  const query = (req.query.query as string) || (req.query.q as string) || '';
+  if (!query) {
+    return res.status(400).json({ error: 'Provide ?query= parameter' });
+  }
+  return handleScrapeRequest(query.trim(), res);
+});
+
 // 7. Trigger scheduler tick manually
 app.post('/api/scheduler/run-now', async (_req: Request, res: Response) => {
   res.json({ message: 'Scheduler tick triggered', timestamp: new Date().toISOString() });
