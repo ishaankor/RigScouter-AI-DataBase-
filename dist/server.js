@@ -298,7 +298,12 @@ const handleDatabaseProxyScrape = async (targetQuery, res) => {
                 }
             });
         }
-        return res.status(404).json({ error: `Could not retrieve live price for "${cleanQuery}"` });
+        return res.status(200).json({
+            found: false,
+            query: cleanQuery,
+            component: null,
+            notice: `Could not retrieve live price for "${cleanQuery}"`
+        });
     }
     catch (err) {
         console.error('[Backend Proxy Error]:', err);

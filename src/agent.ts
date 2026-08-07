@@ -113,12 +113,21 @@ export class TavilyHardwareAgent {
       }
     }
 
+    // If no offers found via Tavily (or if Tavily rate-limit hit), fallback to Firecrawl Search Engine
+    if (state.scrapedOffers.length === 0 && this.firecrawlClient) {
+      console.log(`[Tavily Fallback] Querying Firecrawl Search Engine for live listings of "${cleanPrompt}"...`);
+      const fcOffers = await this.scrapeWithFirecrawlSearch(cleanPrompt, category);
+      if (fcOffers.length > 0) {
+        state.scrapedOffers.push(...fcOffers);
+      }
+    }
+
     state.scrapedOffers.sort((a, b) => a.price - b.price);
 
     if (state.scrapedOffers.length > 0) {
       state.bestOffer = state.scrapedOffers[0];
       const stockStatus = state.bestOffer.inStock ? 'In Stock' : 'Out of Stock / Backorder';
-      state.summary = `Evaluated ${state.scrapedOffers.length} live retailer listings via Tavily AI. Lowest price: $${state.bestOffer.price.toFixed(2)} at ${state.bestOffer.retailer} (${stockStatus}).`;
+      state.summary = `Evaluated ${state.scrapedOffers.length} live retailer listings via Firecrawl & Tavily AI. Lowest price: $${state.bestOffer.price.toFixed(2)} at ${state.bestOffer.retailer} (${stockStatus}).`;
     } else {
       state.summary = `No live prices found across retailers for "${cleanPrompt}".`;
     }
@@ -820,5 +829,50 @@ CRITICAL PRODUCT PAGE EXTRACTION RULES:
     }
 
     return text.substring(0, 4500);
+  }
+
+  /**
+   * General Firecrawl Search Engine Fallback when Tavily fails or is rate-limited.
+   * Dynamically searches live web for prices & extracts product listings without hardcoding anything!
+   */
+  private async scrapeWithFirecrawlSearch(query: string, category: string): Promise<AgentOffer[]> {
+    if (!this.firecrawlClient) return [];
+    console.log(`[Firecrawl Search Engine] Searching live web for "${query}" (${category})...`);
+
+    const offers: AgentOffer[] = [];
+    try {
+      const searchRes: any = await this.firecrawlClient.search(`${query} ${category} buy price microcenter newegg amazon`, {
+        limit: 5
+      });
+
+      const webResults = searchRes?.web || searchRes?.data || searchRes?.results || [];
+
+      for (const item of webResults) {
+        if (!item || !item.url) continue;
+        const text = `${item.title || ''} ${item.description || ''}`;
+
+        // Extract price from search result text using LLM
+        const parsed = await this.parseAccuratePriceWithLLM(text, query, this.detectRetailer(item.url), item.url, category);
+
+        if (parsed && parsed.price && parsed.price > 0) {
+          console.log(`✅ [FIRECRAWL SEARCH EXTRACTED] ${this.detectRetailer(item.url)}: "$${parsed.price}" -> ${parsed.title}`);
+          offers.push({
+            retailer: this.detectRetailer(item.url),
+            price: parsed.price,
+            originalPrice: parsed.originalPrice,
+            title: parsed.title || item.title || query,
+            brand: parsed.brand || (item.title ? item.title.split(' ')[0] : 'Hardware'),
+            url: item.url,
+            inStock: parsed.inStock,
+            isRefurbished: parsed.isRefurbished,
+            snippet: item.description
+          });
+        }
+      }
+    } catch (e: any) {
+      console.warn('[Firecrawl Search Engine Error]:', e?.message || e);
+    }
+
+    return offers;
   }
 }
