@@ -138,12 +138,13 @@ class TavilyHardwareAgent {
                 const calculatedDealScore = realMsrp > state.bestOffer.price
                     ? Math.min(100, Math.max(50, Math.round(50 + ((realMsrp - state.bestOffer.price) / realMsrp) * 100)))
                     : 50;
+                const baseModelGroup = this.normalizeModel(state.bestOffer.title, cleanPrompt);
                 await supabase_js_1.supabase.from('hardware_components').upsert({
                     id: componentId,
                     name: state.bestOffer.title,
                     category: category,
                     brand: state.bestOffer.brand || state.bestOffer.title.split(' ')[0] || 'Hardware',
-                    model: cleanPrompt,
+                    model: baseModelGroup,
                     specs: JSON.stringify({
                         AgentSummary: state.summary,
                         RetailerOffers: state.scrapedOffers,
@@ -165,6 +166,19 @@ class TavilyHardwareAgent {
                     updated_at: new Date().toISOString()
                 });
                 console.log(`[DB Persist Success] "${state.bestOffer.title}" ($${state.bestOffer.price.toFixed(2)}) at ${state.bestOffer.url}`);
+                // Insert timestamped price snapshot hand-in-hand for 90-day trend tracking
+                try {
+                    await supabase_js_1.supabase.from('price_snapshots').insert({
+                        id: `snap-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+                        watchlist_item_id: componentId,
+                        price: state.bestOffer.price,
+                        in_stock: state.bestOffer.inStock,
+                        scraped_at: new Date().toISOString()
+                    });
+                }
+                catch (err) {
+                    console.warn('[Price Snapshot Insert Notice]:', err?.message || err);
+                }
                 emit?.('agent_complete', {
                     query: cleanPrompt,
                     bestOffer: state.bestOffer,
@@ -588,6 +602,154 @@ CRITICAL PRODUCT PAGE EXTRACTION RULES:
             return 'Accessories';
         }
         return 'Not compatible (N/A)';
+    }
+    /**
+     * Normalizes any raw product title or user query into a clean, unified base model group
+     * e.g. "MSI GeForce RTX 4070 Super VENTUS 2X 12GB" -> "RTX 4070 Super"
+     * e.g. "GIGABYTE AORUS GeForce GTX 1080 Ti 11GB" -> "GTX 1080 Ti"
+     * e.g. "AMD Ryzen 7 9800X3D 8-Core Processor" -> "Ryzen 7 9800X3D"
+     */
+    normalizeModel(text, fallback = '') {
+        const lower = text.toLowerCase();
+        // GPUs - RTX 50 Series
+        if (lower.includes('5090'))
+            return 'RTX 5090';
+        if (lower.includes('5080'))
+            return 'RTX 5080';
+        if (lower.includes('5070 ti') || lower.includes('5070ti'))
+            return 'RTX 5070 Ti';
+        if (lower.includes('5070'))
+            return 'RTX 5070';
+        if (lower.includes('5060 ti') || lower.includes('5060ti'))
+            return 'RTX 5060 Ti';
+        if (lower.includes('5060'))
+            return 'RTX 5060';
+        // GPUs - RTX 40 Series
+        if (lower.includes('4090'))
+            return 'RTX 4090';
+        if (lower.includes('4080 super'))
+            return 'RTX 4080 Super';
+        if (lower.includes('4080'))
+            return 'RTX 4080';
+        if (lower.includes('4070 ti super') || lower.includes('4070ti super'))
+            return 'RTX 4070 Ti Super';
+        if (lower.includes('4070 ti') || lower.includes('4070ti'))
+            return 'RTX 4070 Ti';
+        if (lower.includes('4070 super'))
+            return 'RTX 4070 Super';
+        if (lower.includes('4070'))
+            return 'RTX 4070';
+        if (lower.includes('4060 ti') || lower.includes('4060ti'))
+            return 'RTX 4060 Ti';
+        if (lower.includes('4060'))
+            return 'RTX 4060';
+        // GPUs - GTX 10/20/30 Series
+        if (lower.includes('1080 ti') || lower.includes('1080ti'))
+            return 'GTX 1080 Ti';
+        if (lower.includes('1080'))
+            return 'GTX 1080';
+        if (lower.includes('1070 ti') || lower.includes('1070ti'))
+            return 'GTX 1070 Ti';
+        if (lower.includes('1070'))
+            return 'GTX 1070';
+        if (lower.includes('1060'))
+            return 'GTX 1060';
+        if (lower.includes('3090 ti') || lower.includes('3090ti'))
+            return 'RTX 3090 Ti';
+        if (lower.includes('3090'))
+            return 'RTX 3090';
+        if (lower.includes('3080 ti') || lower.includes('3080ti'))
+            return 'RTX 3080 Ti';
+        if (lower.includes('3080'))
+            return 'RTX 3080';
+        if (lower.includes('3070 ti') || lower.includes('3070ti'))
+            return 'RTX 3070 Ti';
+        if (lower.includes('3070'))
+            return 'RTX 3070';
+        if (lower.includes('3060 ti') || lower.includes('3060ti'))
+            return 'RTX 3060 Ti';
+        if (lower.includes('3060'))
+            return 'RTX 3060';
+        // GPUs - AMD Radeon RX 7000/9000
+        if (lower.includes('9070 xt') || lower.includes('9070xt'))
+            return 'RX 9070 XT';
+        if (lower.includes('9070'))
+            return 'RX 9070';
+        if (lower.includes('7900 xtx'))
+            return 'RX 7900 XTX';
+        if (lower.includes('7900 xt'))
+            return 'RX 7900 XT';
+        if (lower.includes('7900 gre'))
+            return 'RX 7900 GRE';
+        if (lower.includes('7800 xt'))
+            return 'RX 7800 XT';
+        if (lower.includes('7700 xt'))
+            return 'RX 7700 XT';
+        if (lower.includes('7600 xt'))
+            return 'RX 7600 XT';
+        if (lower.includes('7600'))
+            return 'RX 7600';
+        // CPUs - AMD Ryzen 9000 / 7000 / 5000
+        if (lower.includes('9950x3d'))
+            return 'Ryzen 9 9950X3D';
+        if (lower.includes('9950x'))
+            return 'Ryzen 9 9950X';
+        if (lower.includes('9900x'))
+            return 'Ryzen 9 9900X';
+        if (lower.includes('9800x3d'))
+            return 'Ryzen 7 9800X3D';
+        if (lower.includes('9700x'))
+            return 'Ryzen 7 9700X';
+        if (lower.includes('9600x'))
+            return 'Ryzen 5 9600X';
+        if (lower.includes('7950x3d'))
+            return 'Ryzen 9 7950X3D';
+        if (lower.includes('7950x'))
+            return 'Ryzen 9 7950X';
+        if (lower.includes('7900x3d'))
+            return 'Ryzen 9 7900X3D';
+        if (lower.includes('7900x'))
+            return 'Ryzen 9 7900X';
+        if (lower.includes('7800x3d'))
+            return 'Ryzen 7 7800X3D';
+        if (lower.includes('7700x'))
+            return 'Ryzen 7 7700X';
+        if (lower.includes('7600x'))
+            return 'Ryzen 5 7600X';
+        if (lower.includes('7600'))
+            return 'Ryzen 5 7600';
+        if (lower.includes('5800x3d'))
+            return 'Ryzen 7 5800X3D';
+        // CPUs - Intel Core Ultra / 14th Gen / 13th Gen
+        if (lower.includes('285k'))
+            return 'Core Ultra 9 285K';
+        if (lower.includes('265k'))
+            return 'Core Ultra 7 265K';
+        if (lower.includes('245k'))
+            return 'Core Ultra 5 245K';
+        if (lower.includes('14900k'))
+            return 'Core i9-14900K';
+        if (lower.includes('14700k'))
+            return 'Core i7-14700K';
+        if (lower.includes('14600k'))
+            return 'Core i5-14600K';
+        if (lower.includes('13900k'))
+            return 'Core i9-13900K';
+        if (lower.includes('13700k'))
+            return 'Core i7-13700K';
+        if (lower.includes('13600k'))
+            return 'Core i5-13600K';
+        // SSDs
+        if (lower.includes('990 pro'))
+            return 'Samsung 990 Pro';
+        if (lower.includes('980 pro'))
+            return 'Samsung 980 Pro';
+        if (lower.includes('sn850x'))
+            return 'WD_BLACK SN850X';
+        if (lower.includes('t700'))
+            return 'Crucial T700';
+        const cleanFallback = fallback.replace(/^https?:\/\/[^\/]+\//, '').replace(/-/g, ' ').trim();
+        return cleanFallback || text;
     }
     /**
      * Smart Buy Box Window Selector:
