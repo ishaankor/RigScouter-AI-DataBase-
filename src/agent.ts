@@ -203,7 +203,7 @@ export class TavilyHardwareAgent {
           retailer: state.bestOffer.retailer,
           product_url: state.bestOffer.url,
           image_url: 'https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=600&q=80',
-          rating: 4.5,
+          rating: (state.bestOffer as any).rating || null,
           deal_score: calculatedDealScore,
           updated_at: new Date().toISOString()
         });
