@@ -272,7 +272,39 @@ class TavilyHardwareAgent {
             }
         }
         catch (e) {
-            console.warn(`[Tavily SDK Search Error] ${retailerName}:`, e);
+            console.warn(`[Tavily Search Quota / Error] ${retailerName} -> Falling back to Firecrawl Search:`, e?.message || e);
+            if (this.firecrawlClient) {
+                try {
+                    const fcRes = await this.firecrawlClient.search(`buy ${modelQuery} ${retailerName} ${category} price`, {
+                        limit: 5
+                    });
+                    const fcHits = fcRes?.web || fcRes?.data || fcRes?.results || [];
+                    for (const hit of fcHits) {
+                        if (!hit || !hit.url)
+                            continue;
+                        const cleanUrl = hit.url.replace(/\/reviews\/?$/i, '');
+                        const text = `${hit.title || ''} ${hit.description || ''}`;
+                        const parsed = await this.parseAccuratePriceWithLLM(text, modelQuery, retailerName, cleanUrl, category);
+                        if (parsed && parsed.price && parsed.price > 0) {
+                            console.log(`✅ [FIRECRAWL SEARCH FALLBACK EXTRACTED] ${retailerName}: "$${parsed.price}" -> ${parsed.title}`);
+                            return {
+                                retailer: retailerName,
+                                price: parsed.price,
+                                originalPrice: parsed.originalPrice,
+                                title: parsed.title || hit.title || modelQuery,
+                                brand: parsed.brand || (hit.title ? hit.title.split(' ')[0] : 'Hardware'),
+                                url: cleanUrl,
+                                inStock: parsed.inStock,
+                                isRefurbished: parsed.isRefurbished,
+                                snippet: hit.description
+                            };
+                        }
+                    }
+                }
+                catch (fcErr) {
+                    console.warn(`[Firecrawl Fallback Search Error] ${retailerName}:`, fcErr?.message || fcErr);
+                }
+            }
         }
         return null;
     }
