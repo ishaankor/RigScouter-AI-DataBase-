@@ -1,9 +1,4 @@
 .env
 .DS_Store
-scratch/test-firecrawl.ts
-scratch/test-firecrawl-agent.ts
+/scratch/**
 .gitignore
-scratch/test-tavily-5060.ts
-.gitignore
-scratch/test-agent-5060-live.ts
-scratch/test-firecrawl-5060.ts

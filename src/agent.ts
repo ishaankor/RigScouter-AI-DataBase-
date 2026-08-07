@@ -862,45 +862,88 @@ CRITICAL PRODUCT PAGE EXTRACTION RULES:
   }
 
   /**
+   * Validates that extracted product title matches requested hardware model query
+   */
+  private doesTitleMatchQuery(title: string, query: string): boolean {
+    if (!title || !query) return false;
+    const lTitle = title.toLowerCase();
+    const lQuery = query.toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').trim();
+    const queryTokens = lQuery.split(/\s+/).filter(t => t.length > 1);
+
+    // Extract numbers like 1080, 4070, 7800, 5060 from query
+    const modelNumbers = lQuery.match(/\b\d{3,5}(?:\s*ti|\s*super|\s*xt|\s*x3d)?\b/gi) || [];
+
+    for (const num of modelNumbers) {
+      const cleanNum = num.replace(/\s+/g, '');
+      if (!lTitle.replace(/\s+/g, '').includes(cleanNum)) {
+        return false;
+      }
+    }
+
+    let matches = 0;
+    for (const token of queryTokens) {
+      if (lTitle.includes(token)) matches++;
+    }
+
+    return matches >= Math.ceil(queryTokens.length * 0.4);
+  }
+
+  /**
    * General Firecrawl Search Engine Fallback when Tavily fails or is rate-limited.
-   * Dynamically searches live web for prices & extracts product listings without hardcoding anything!
+   * Dynamically searches direct product URLs across major retailers and scrapes full DOM schemas!
    */
   private async scrapeWithFirecrawlSearch(query: string, category: string): Promise<AgentOffer[]> {
     if (!this.firecrawlClient) return [];
-    console.log(`[Firecrawl Search Engine] Searching live web for "${query}" (${category})...`);
+    console.log(`[Firecrawl Search Engine] Searching direct product pages for "${query}" (${category})...`);
 
     const offers: AgentOffer[] = [];
-    try {
-      const searchRes: any = await this.firecrawlClient.search(`${query} ${category} buy price microcenter newegg amazon`, {
-        limit: 5
-      });
+    const searchPrompts = [
+      `site:microcenter.com/product ${query}`,
+      `site:newegg.com/p/ ${query}`,
+      `site:amazon.com/dp/ ${query}`,
+      `site:bhphotovideo.com/c/product/ ${query}`
+    ];
 
-      const webResults = searchRes?.web || searchRes?.data || searchRes?.results || [];
+    for (const prompt of searchPrompts) {
+      try {
+        const searchRes: any = await this.firecrawlClient.search(prompt, { limit: 3 });
+        const webResults = searchRes?.web || searchRes?.data || searchRes?.results || [];
 
-      for (const item of webResults) {
-        if (!item || !item.url) continue;
-        const text = `${item.title || ''} ${item.description || ''}`;
+        for (const item of webResults) {
+          if (!item || !item.url) continue;
+          const cleanUrl = item.url.replace(/\/reviews\/?$/i, '');
+          const retailer = this.detectRetailer(cleanUrl);
 
-        // Extract price from search result text using LLM
-        const parsed = await this.parseAccuratePriceWithLLM(text, query, this.detectRetailer(item.url), item.url, category);
+          // 1. Scrape structured JSON DOM directly via Firecrawl API
+          const fcOffer = await this.extractWithFirecrawl(cleanUrl, retailer, category);
+          if (fcOffer && fcOffer.price > 0 && this.doesTitleMatchQuery(fcOffer.title, query)) {
+            offers.push(fcOffer);
+            break; // Stop after first matching direct product offer per retailer
+          }
 
-        if (parsed && parsed.price && parsed.price > 0) {
-          console.log(`✅ [FIRECRAWL SEARCH EXTRACTED] ${this.detectRetailer(item.url)}: "$${parsed.price}" -> ${parsed.title}`);
-          offers.push({
-            retailer: this.detectRetailer(item.url),
-            price: parsed.price,
-            originalPrice: parsed.originalPrice,
-            title: parsed.title || item.title || query,
-            brand: parsed.brand || (item.title ? item.title.split(' ')[0] : 'Hardware'),
-            url: item.url,
-            inStock: parsed.inStock,
-            isRefurbished: parsed.isRefurbished,
-            snippet: item.description
-          });
+          // 2. Fallback to LLM text extraction on search result snippet
+          const text = `${item.title || ''} ${item.description || ''}`;
+          const parsed = await this.parseAccuratePriceWithLLM(text, query, retailer, cleanUrl, category);
+
+          if (parsed && parsed.price && parsed.price > 0 && this.doesTitleMatchQuery(parsed.title || item.title, query)) {
+            console.log(`✅ [FIRECRAWL SEARCH EXTRACTED] ${retailer}: "$${parsed.price}" -> ${parsed.title}`);
+            offers.push({
+              retailer: retailer,
+              price: parsed.price,
+              originalPrice: parsed.originalPrice,
+              title: parsed.title || item.title || query,
+              brand: parsed.brand || (item.title ? item.title.split(' ')[0] : 'Hardware'),
+              url: cleanUrl,
+              inStock: parsed.inStock,
+              isRefurbished: parsed.isRefurbished,
+              snippet: item.description
+            });
+            break;
+          }
         }
+      } catch (e: any) {
+        console.warn(`[Firecrawl Search Engine Notice] Prompt "${prompt}" failed:`, e?.message || e);
       }
-    } catch (e: any) {
-      console.warn('[Firecrawl Search Engine Error]:', e?.message || e);
     }
 
     return offers;
