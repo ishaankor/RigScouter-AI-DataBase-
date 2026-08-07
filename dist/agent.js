@@ -5,21 +5,24 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.TavilyHardwareAgent = void 0;
 const core_1 = require("@tavily/core");
-const firecrawl_js_1 = __importDefault(require("@mendable/firecrawl-js"));
 const supabase_js_1 = require("./supabase.js");
 const dotenv_1 = __importDefault(require("dotenv"));
 dotenv_1.default.config();
-const TAVILY_API_KEY = process.env.TAVILY_API_KEY || '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';
-const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY || '';
+const rawTavilyKeys = process.env.TAVILY_API_KEYS || process.env.TAVILY_API_KEY || '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';
+const TAVILY_API_KEYS = rawTavilyKeys.split(',').map(k => k.trim()).filter(Boolean);
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 class TavilyHardwareAgent {
-    tvlyClient;
-    firecrawlClient = null;
-    constructor() {
-        this.tvlyClient = (0, core_1.tavily)({ apiKey: TAVILY_API_KEY });
-        if (FIRECRAWL_API_KEY) {
-            this.firecrawlClient = new firecrawl_js_1.default({ apiKey: FIRECRAWL_API_KEY });
+    currentKeyIndex = 0;
+    constructor() { }
+    getTavilyClient() {
+        const key = TAVILY_API_KEYS[this.currentKeyIndex % TAVILY_API_KEYS.length];
+        return (0, core_1.tavily)({ apiKey: key });
+    }
+    rotateTavilyKey() {
+        if (TAVILY_API_KEYS.length > 1) {
+            this.currentKeyIndex = (this.currentKeyIndex + 1) % TAVILY_API_KEYS.length;
+            console.log(`[Tavily Key Rotated] Active key index: ${this.currentKeyIndex + 1}/${TAVILY_API_KEYS.length}`);
         }
     }
     /**
@@ -85,19 +88,59 @@ class TavilyHardwareAgent {
                 await new Promise(r => setTimeout(r, 600));
             }
         }
-        // If no offers found via Tavily (or if Tavily rate-limit hit), fallback to Firecrawl Search Engine
-        if (state.scrapedOffers.length === 0 && this.firecrawlClient) {
-            console.log(`[Tavily Fallback] Querying Firecrawl Search Engine for live listings of "${cleanPrompt}"...`);
-            const fcOffers = await this.scrapeWithFirecrawlSearch(cleanPrompt, category);
-            if (fcOffers.length > 0) {
-                state.scrapedOffers.push(...fcOffers);
+        // Secondary Tavily General Search Pass if no specific retailer hit was found
+        if (state.scrapedOffers.length === 0) {
+            console.log(`[Tavily General Search] Querying broad Tavily web search for "${cleanPrompt}"...`);
+            for (let attempt = 0; attempt < TAVILY_API_KEYS.length; attempt++) {
+                const tvly = this.getTavilyClient();
+                try {
+                    const searchRes = await tvly.search(`buy ${cleanPrompt} ${category} price`, {
+                        searchDepth: 'advanced',
+                        includeRawContent: 'text',
+                        maxResults: 5
+                    });
+                    for (const hit of searchRes.results || []) {
+                        const fullUrl = hit.url || '';
+                        const retailer = this.detectRetailer(fullUrl);
+                        let cleanUrl = fullUrl.replace(/\/reviews\/?$/i, '').split('?')[0];
+                        if (retailer === 'Amazon' && cleanUrl.includes('/dp/')) {
+                            cleanUrl = `https://www.amazon.com/s?k=${encodeURIComponent(cleanPrompt)}`;
+                        }
+                        const text = `${hit.title || ''} ${hit.content || ''} ${hit.rawContent || ''}`;
+                        const parsed = await this.parseAccuratePriceWithLLM(text, cleanPrompt, retailer, cleanUrl, category);
+                        if (parsed && parsed.price && parsed.price > 0) {
+                            console.log(`✅ [TAVILY GENERAL SEARCH EXTRACTED] ${retailer}: "$${parsed.price}" -> ${parsed.title}`);
+                            state.scrapedOffers.push({
+                                retailer: retailer,
+                                price: parsed.price,
+                                originalPrice: parsed.originalPrice,
+                                title: parsed.title || hit.title || cleanPrompt,
+                                brand: parsed.brand || (hit.title ? hit.title.split(' ')[0] : 'Hardware'),
+                                url: cleanUrl,
+                                inStock: parsed.inStock,
+                                isRefurbished: parsed.isRefurbished,
+                                snippet: hit.content
+                            });
+                        }
+                    }
+                    break; // Stop loop if search succeeded
+                }
+                catch (e) {
+                    console.warn(`[Tavily General Search Notice] Key ${this.currentKeyIndex + 1}/${TAVILY_API_KEYS.length}:`, e?.message || e);
+                    if (TAVILY_API_KEYS.length > 1) {
+                        this.rotateTavilyKey();
+                    }
+                    else {
+                        break;
+                    }
+                }
             }
         }
         state.scrapedOffers.sort((a, b) => a.price - b.price);
         if (state.scrapedOffers.length > 0) {
             state.bestOffer = state.scrapedOffers[0];
             const stockStatus = state.bestOffer.inStock ? 'In Stock' : 'Out of Stock / Backorder';
-            state.summary = `Evaluated ${state.scrapedOffers.length} live retailer listings via Firecrawl & Tavily AI. Lowest price: $${state.bestOffer.price.toFixed(2)} at ${state.bestOffer.retailer} (${stockStatus}).`;
+            state.summary = `Evaluated ${state.scrapedOffers.length} live retailer listings via Tavily AI. Lowest price: $${state.bestOffer.price.toFixed(2)} at ${state.bestOffer.retailer} (${stockStatus}).`;
         }
         else {
             state.summary = `No live prices found across retailers for "${cleanPrompt}".`;
@@ -174,7 +217,6 @@ class TavilyHardwareAgent {
                     updated_at: new Date().toISOString()
                 });
                 console.log(`[DB Persist Success] "${state.bestOffer.title}" ($${state.bestOffer.price.toFixed(2)}) at ${state.bestOffer.url}`);
-                // Insert timestamped price snapshot hand-in-hand for 90-day trend tracking
                 try {
                     await supabase_js_1.supabase.from('price_snapshots').insert({
                         id: `snap-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
@@ -213,187 +255,113 @@ class TavilyHardwareAgent {
         return state;
     }
     /**
-     * Scrapes retailer using official @tavily/core SDK search + raw content extraction
+     * Scrapes retailer using official @tavily/core SDK search + raw content extraction with key rotation
      */
     async scrapeRetailerAccurateOffer(modelQuery, retailerName, domainPattern, category) {
         console.log(`[Tavily AI SDK] Querying ${retailerName} for "${modelQuery}" (${category})...`);
-        try {
-            // Official Tavily AI SDK search call with advanced search depth & includeRawContent: 'text'
-            const searchRes = await this.tvlyClient.search(`buy ${modelQuery} ${category} price`, {
-                searchDepth: 'advanced',
-                includeDomains: [domainPattern],
-                includeRawContent: 'text',
-                maxResults: 5
-            });
-            const results = searchRes.results || [];
-            for (const hit of results) {
-                const fullUrl = hit.url || '';
-                if (!this.isValidDirectProductUrl(fullUrl, domainPattern))
-                    continue;
-                let rawContent = (hit.rawContent || hit.content || hit.title || '');
-                // If rawContent is not returned in search, use official Tavily extract API
-                if (rawContent.length < 300) {
-                    try {
-                        const extRes = await this.tvlyClient.extract([fullUrl], {
-                            extractDepth: 'advanced', // Bypasses many JS walls
-                            format: 'markdown' // Converts noisy HTML to clean text
-                        });
-                        const extPage = (extRes.results || [])[0];
-                        if (extPage && extPage.rawContent) {
-                            rawContent = extPage.rawContent;
+        for (let attempt = 0; attempt < TAVILY_API_KEYS.length; attempt++) {
+            const tvly = this.getTavilyClient();
+            try {
+                const searchRes = await tvly.search(`buy ${modelQuery} ${category} price`, {
+                    searchDepth: 'advanced',
+                    includeDomains: [domainPattern],
+                    includeRawContent: 'text',
+                    maxResults: 5
+                });
+                const results = searchRes.results || [];
+                for (const hit of results) {
+                    const fullUrl = hit.url || '';
+                    if (!this.isValidDirectProductUrl(fullUrl, domainPattern))
+                        continue;
+                    let rawContent = (hit.rawContent || hit.content || hit.title || '');
+                    if (rawContent.length < 300) {
+                        try {
+                            const extRes = await tvly.extract([fullUrl], {
+                                extractDepth: 'advanced',
+                                format: 'markdown'
+                            });
+                            const extPage = (extRes.results || [])[0];
+                            if (extPage && extPage.rawContent) {
+                                rawContent = extPage.rawContent;
+                            }
                         }
+                        catch (e) { }
                     }
-                    catch (e) { }
+                    let cleanProductUrl = fullUrl.replace(/\/reviews\/?$/i, '').split('?')[0];
+                    if (retailerName === 'Amazon' && cleanProductUrl.includes('/dp/')) {
+                        cleanProductUrl = `https://www.amazon.com/s?k=${encodeURIComponent(modelQuery)}`;
+                    }
+                    const parsed = await this.parseAccuratePriceWithLLM(rawContent, modelQuery, retailerName, cleanProductUrl, category);
+                    if (parsed && parsed.price && parsed.price > 0) {
+                        console.log(`✅ [TAVILY AI + LLM EXTRACTED] ${retailerName}: "$${parsed.price}" -> ${parsed.title.substring(0, 60)}`);
+                        return {
+                            retailer: retailerName,
+                            price: parsed.price,
+                            originalPrice: parsed.originalPrice,
+                            title: parsed.title || hit.title || modelQuery,
+                            brand: parsed.brand,
+                            url: cleanProductUrl,
+                            inStock: parsed.inStock,
+                            isRefurbished: parsed.isRefurbished,
+                            snippet: hit.content
+                        };
+                    }
                 }
-                // Clean URL by stripping trailing /reviews
-                const cleanProductUrl = fullUrl.replace(/\/reviews\/?$/i, '');
-                // 1. Try Firecrawl API Native Schema Extraction first if client is configured
-                if (this.firecrawlClient) {
-                    const fcOffer = await this.extractWithFirecrawl(cleanProductUrl, retailerName, category);
-                    if (fcOffer)
-                        return fcOffer;
-                }
-                // 2. 100% LLM extraction via Groq or OpenRouter
-                const parsed = await this.parseAccuratePriceWithLLM(rawContent, modelQuery, retailerName, cleanProductUrl, category);
-                if (parsed && parsed.price && parsed.price > 0) {
-                    console.log(`✅ [TAVILY AI + LLM EXTRACTED] ${retailerName}: "$${parsed.price}" -> ${parsed.title.substring(0, 60)}`);
-                    return {
-                        retailer: retailerName,
-                        price: parsed.price,
-                        originalPrice: parsed.originalPrice,
-                        title: parsed.title || hit.title || modelQuery,
-                        brand: parsed.brand,
-                        url: cleanProductUrl,
-                        inStock: parsed.inStock,
-                        isRefurbished: parsed.isRefurbished,
-                        snippet: hit.content
-                    };
-                }
+                return null;
             }
-        }
-        catch (e) {
-            console.warn(`[Tavily Search Quota / Error] ${retailerName} -> Falling back to Firecrawl Search:`, e?.message || e);
-            if (this.firecrawlClient) {
-                try {
-                    const fcRes = await this.firecrawlClient.search(`buy ${modelQuery} ${retailerName} ${category} price`, {
-                        limit: 5
-                    });
-                    const fcHits = fcRes?.web || fcRes?.data || fcRes?.results || [];
-                    for (const hit of fcHits) {
-                        if (!hit || !hit.url)
-                            continue;
-                        const cleanUrl = hit.url.replace(/\/reviews\/?$/i, '');
-                        const text = `${hit.title || ''} ${hit.description || ''}`;
-                        const parsed = await this.parseAccuratePriceWithLLM(text, modelQuery, retailerName, cleanUrl, category);
-                        if (parsed && parsed.price && parsed.price > 0) {
-                            console.log(`✅ [FIRECRAWL SEARCH FALLBACK EXTRACTED] ${retailerName}: "$${parsed.price}" -> ${parsed.title}`);
-                            return {
-                                retailer: retailerName,
-                                price: parsed.price,
-                                originalPrice: parsed.originalPrice,
-                                title: parsed.title || hit.title || modelQuery,
-                                brand: parsed.brand || (hit.title ? hit.title.split(' ')[0] : 'Hardware'),
-                                url: cleanUrl,
-                                inStock: parsed.inStock,
-                                isRefurbished: parsed.isRefurbished,
-                                snippet: hit.description
-                            };
-                        }
-                    }
+            catch (e) {
+                console.warn(`[Tavily Search Quota / Error] ${retailerName} (Key ${this.currentKeyIndex + 1}/${TAVILY_API_KEYS.length}):`, e?.message || e);
+                if (TAVILY_API_KEYS.length > 1) {
+                    this.rotateTavilyKey();
                 }
-                catch (fcErr) {
-                    console.warn(`[Firecrawl Fallback Search Error] ${retailerName}:`, fcErr?.message || fcErr);
+                else {
+                    break;
                 }
             }
         }
         return null;
     }
     /**
-     * Direct URL extraction using Firecrawl API (Primary) -> Tavily SDK + Groq LLM (Fallback)
+     * Direct URL extraction using Tavily AI SDK + LLM
      */
     async extractDirectPage(url, retailerName, category) {
-        // 1. Try Firecrawl Native LLM Extraction API first
-        const firecrawlOffer = await this.extractWithFirecrawl(url, retailerName, category);
-        if (firecrawlOffer)
-            return firecrawlOffer;
-        // 2. Fallback to Tavily AI SDK + Groq LLM
-        try {
-            console.log(`[Tavily AI SDK Extract] Reading DOM content from ${url}...`);
-            const extRes = await this.tvlyClient.extract([url], {
-                extractDepth: 'advanced',
-                format: 'markdown'
-            });
-            const hit = (extRes.results || [])[0];
-            if (hit) {
-                const rawText = (hit.rawContent || '');
-                const parsed = await this.parseAccuratePriceWithLLM(rawText, url, retailerName, url, category);
-                if (parsed && parsed.price) {
-                    return {
-                        retailer: retailerName,
-                        price: parsed.price,
-                        originalPrice: parsed.originalPrice,
-                        title: parsed.title || url,
-                        brand: parsed.brand,
-                        url: url,
-                        inStock: parsed.inStock,
-                        isRefurbished: parsed.isRefurbished,
-                        snippet: rawText.substring(0, 300)
-                    };
+        for (let attempt = 0; attempt < TAVILY_API_KEYS.length; attempt++) {
+            const tvly = this.getTavilyClient();
+            try {
+                console.log(`[Tavily AI SDK Extract] Reading DOM content from ${url}...`);
+                const extRes = await tvly.extract([url], {
+                    extractDepth: 'advanced',
+                    format: 'markdown'
+                });
+                const hit = (extRes.results || [])[0];
+                if (hit) {
+                    const rawText = (hit.rawContent || '');
+                    const parsed = await this.parseAccuratePriceWithLLM(rawText, url, retailerName, url, category);
+                    if (parsed && parsed.price) {
+                        return {
+                            retailer: retailerName,
+                            price: parsed.price,
+                            originalPrice: parsed.originalPrice,
+                            title: parsed.title || url,
+                            brand: parsed.brand,
+                            url: url,
+                            inStock: parsed.inStock,
+                            isRefurbished: parsed.isRefurbished,
+                            snippet: rawText.substring(0, 300)
+                        };
+                    }
+                }
+                return null;
+            }
+            catch (e) {
+                console.warn(`[Tavily SDK Extract Warning] ${url} extract failed:`, e?.message || e);
+                if (TAVILY_API_KEYS.length > 1) {
+                    this.rotateTavilyKey();
+                }
+                else {
+                    break;
                 }
             }
-        }
-        catch (e) {
-            console.warn(`[Tavily SDK Extract Warning] ${url} extract failed:`, e);
-        }
-        return null;
-    }
-    /**
-     * Primary Native LLM Schema Extraction via Firecrawl API (v1/scrape format json)
-     */
-    async extractWithFirecrawl(url, retailerName, category) {
-        if (!this.firecrawlClient)
-            return null;
-        try {
-            console.log(`[Firecrawl API Extract] Extracting structured JSON schema from ${url}...`);
-            const res = await this.firecrawlClient.scrapeUrl(url, {
-                formats: [
-                    {
-                        type: 'json',
-                        prompt: `Extract the main product current sale price, original MSRP list price, full clean title, brand, and in-stock status from this page: "${url}". Ignore sponsored competitor ads and sidebar items.`,
-                        schema: {
-                            type: 'object',
-                            properties: {
-                                currentPrice: { type: 'number' },
-                                originalPrice: { type: 'number' },
-                                title: { type: 'string' },
-                                brand: { type: 'string' },
-                                inStock: { type: 'boolean' },
-                                isRefurbished: { type: 'boolean' }
-                            },
-                            required: ['currentPrice', 'title']
-                        }
-                    }
-                ]
-            });
-            const extracted = res?.json || res?.data?.json;
-            const imageUrl = res?.metadata?.ogImage || res?.metadata?.['og:image'] || undefined;
-            if (extracted && typeof extracted.currentPrice === 'number' && extracted.currentPrice > 0) {
-                console.log(`✅ [FIRECRAWL EXTRACTED] ${retailerName}: "$${extracted.currentPrice}" -> ${extracted.title}`);
-                return {
-                    retailer: retailerName,
-                    price: extracted.currentPrice,
-                    originalPrice: extracted.originalPrice,
-                    title: extracted.title || url,
-                    brand: extracted.brand,
-                    url,
-                    inStock: Boolean(extracted.inStock),
-                    isRefurbished: Boolean(extracted.isRefurbished),
-                    snippet: imageUrl ? `Image: ${imageUrl}` : 'Extracted via Firecrawl AI cloud browser schema extraction'
-                };
-            }
-        }
-        catch (e) {
-            console.warn(`[Firecrawl API Warning] ${url}:`, e?.message || e);
         }
         return null;
     }
@@ -619,7 +587,7 @@ CRITICAL PRODUCT PAGE EXTRACTION RULES:
         if (lower.includes('ddr5') || lower.includes('ddr4') || lower.includes('ram') || lower.includes('memory kit')) {
             return 'RAM';
         }
-        if (lower.includes('ssd') || lower.includes('nvme') || lower.includes('m.2') || lower.includes('hard drive') || lower.includes('hdd') || lower.includes('samsung 990') || lower.includes('wd_black')) {
+        if (lower.includes('ssd') || lower.includes('nvme') || lower.includes('m.2') || lower.includes('hard drive') || lower.includes('hdd') || lower.includes('samsung') || lower.includes('wd_black') || lower.includes('crucial') || /\b\d+\s*(tb|gb)\b/i.test(lower)) {
             return 'SSD';
         }
         if (lower.includes('motherboard') || lower.includes('mobo') || lower.includes('b650') || lower.includes('z790') ||
@@ -866,62 +834,6 @@ CRITICAL PRODUCT PAGE EXTRACTION RULES:
                 matches++;
         }
         return matches >= Math.ceil(queryTokens.length * 0.4);
-    }
-    /**
-     * General Firecrawl Search Engine Fallback when Tavily fails or is rate-limited.
-     * Dynamically searches direct product URLs across major retailers and scrapes full DOM schemas!
-     */
-    async scrapeWithFirecrawlSearch(query, category) {
-        if (!this.firecrawlClient)
-            return [];
-        console.log(`[Firecrawl Search Engine] Searching direct product pages for "${query}" (${category})...`);
-        const offers = [];
-        const searchPrompts = [
-            `site:microcenter.com/product ${query}`,
-            `site:newegg.com/p/ ${query}`,
-            `site:amazon.com/dp/ ${query}`,
-            `site:bhphotovideo.com/c/product/ ${query}`
-        ];
-        for (const prompt of searchPrompts) {
-            try {
-                const searchRes = await this.firecrawlClient.search(prompt, { limit: 3 });
-                const webResults = searchRes?.web || searchRes?.data || searchRes?.results || [];
-                for (const item of webResults) {
-                    if (!item || !item.url)
-                        continue;
-                    const cleanUrl = item.url.replace(/\/reviews\/?$/i, '');
-                    const retailer = this.detectRetailer(cleanUrl);
-                    // 1. Scrape structured JSON DOM directly via Firecrawl API
-                    const fcOffer = await this.extractWithFirecrawl(cleanUrl, retailer, category);
-                    if (fcOffer && fcOffer.price > 0 && this.doesTitleMatchQuery(fcOffer.title, query)) {
-                        offers.push(fcOffer);
-                        break; // Stop after first matching direct product offer per retailer
-                    }
-                    // 2. Fallback to LLM text extraction on search result snippet
-                    const text = `${item.title || ''} ${item.description || ''}`;
-                    const parsed = await this.parseAccuratePriceWithLLM(text, query, retailer, cleanUrl, category);
-                    if (parsed && parsed.price && parsed.price > 0 && this.doesTitleMatchQuery(parsed.title || item.title, query)) {
-                        console.log(`✅ [FIRECRAWL SEARCH EXTRACTED] ${retailer}: "$${parsed.price}" -> ${parsed.title}`);
-                        offers.push({
-                            retailer: retailer,
-                            price: parsed.price,
-                            originalPrice: parsed.originalPrice,
-                            title: parsed.title || item.title || query,
-                            brand: parsed.brand || (item.title ? item.title.split(' ')[0] : 'Hardware'),
-                            url: cleanUrl,
-                            inStock: parsed.inStock,
-                            isRefurbished: parsed.isRefurbished,
-                            snippet: item.description
-                        });
-                        break;
-                    }
-                }
-            }
-            catch (e) {
-                console.warn(`[Firecrawl Search Engine Notice] Prompt "${prompt}" failed:`, e?.message || e);
-            }
-        }
-        return offers;
     }
 }
 exports.TavilyHardwareAgent = TavilyHardwareAgent;
