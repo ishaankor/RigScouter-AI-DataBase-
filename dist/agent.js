@@ -292,7 +292,7 @@ class TavilyHardwareAgent {
                         cleanProductUrl = `https://www.amazon.com/s?k=${encodeURIComponent(modelQuery)}`;
                     }
                     const parsed = await this.parseAccuratePriceWithLLM(rawContent, modelQuery, retailerName, cleanProductUrl, category);
-                    if (parsed && parsed.price && parsed.price > 0) {
+                    if (parsed && parsed.price && parsed.price > 0 && this.doesTitleMatchQuery(parsed.title || hit.title || '', modelQuery)) {
                         console.log(`✅ [TAVILY AI + LLM EXTRACTED] ${retailerName}: "$${parsed.price}" -> ${parsed.title.substring(0, 60)}`);
                         return {
                             retailer: retailerName,
@@ -305,6 +305,9 @@ class TavilyHardwareAgent {
                             isRefurbished: parsed.isRefurbished,
                             snippet: hit.content
                         };
+                    }
+                    else if (parsed && parsed.title) {
+                        console.warn(`⚠️ [Title Mismatch Rejected] ${retailerName}: Extracted "${parsed.title}" does not match requested model "${modelQuery}"`);
                     }
                 }
                 return null;
@@ -817,23 +820,27 @@ CRITICAL PRODUCT PAGE EXTRACTION RULES:
     doesTitleMatchQuery(title, query) {
         if (!title || !query)
             return false;
-        const lTitle = title.toLowerCase();
-        const lQuery = query.toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').trim();
-        const queryTokens = lQuery.split(/\s+/).filter(t => t.length > 1);
-        // Extract numbers like 1080, 4070, 7800, 5060 from query
-        const modelNumbers = lQuery.match(/\b\d{3,5}(?:\s*ti|\s*super|\s*xt|\s*x3d)?\b/gi) || [];
-        for (const num of modelNumbers) {
-            const cleanNum = num.replace(/\s+/g, '');
-            if (!lTitle.replace(/\s+/g, '').includes(cleanNum)) {
+        const lTitle = title.toLowerCase().replace(/[^a-z0-9]+/g, ' ');
+        const lQuery = query.toLowerCase().replace(/[^a-z0-9]+/g, ' ');
+        // Extract exact GPU/CPU model numbers (e.g. 4080, 4070, 4060, 5090, 7800, 9800, 990, 980)
+        const queryModelNum = lQuery.match(/\b(5090|5080|5070|5060|4090|4080|4070|4060|3090|3080|3070|3060|1080|1070|1060|7900|7800|7700|7600|9950x|9900x|9800x3d|9700x|9600x|7950x|7900x|7800x3d|7700x|7600x|14900k|14700k|14600k|13900k|13700k|13600k|285k|265k|245k|990|980|sn850x)\b/i);
+        if (queryModelNum) {
+            const targetNum = queryModelNum[1].toLowerCase();
+            // Ensure target model number is explicitly in title
+            if (!lTitle.includes(targetNum)) {
                 return false;
             }
         }
-        let matches = 0;
-        for (const token of queryTokens) {
-            if (lTitle.includes(token))
-                matches++;
-        }
-        return matches >= Math.ceil(queryTokens.length * 0.4);
+        // Check critical GPU/CPU suffixes (Super, Ti, XT, X3D)
+        if (lQuery.includes('super') && !lTitle.includes('super'))
+            return false;
+        if (lQuery.includes(' ti') && !lTitle.includes('ti'))
+            return false;
+        if (lQuery.includes(' xt') && !lTitle.includes('xt'))
+            return false;
+        if (lQuery.includes('x3d') && !lTitle.includes('x3d'))
+            return false;
+        return true;
     }
 }
 exports.TavilyHardwareAgent = TavilyHardwareAgent;
