@@ -40,6 +40,19 @@ class TavilyHardwareAgent {
             scrapedOffers: [],
             summary: ''
         };
+        if (category === 'Not compatible (N/A)' && !isUrl) {
+            console.log(`[Non-PC Part Query Rejected] "${cleanPrompt}" is Not compatible (N/A)`);
+            state.summary = `Not compatible (N/A) — "${cleanPrompt}" is not a recognized PC hardware component.`;
+            emit?.('agent_complete', {
+                query: cleanPrompt,
+                category: 'Not compatible (N/A)',
+                bestOffer: null,
+                allOffers: [],
+                summary: state.summary,
+                timestamp: new Date().toISOString()
+            });
+            return state;
+        }
         if (isUrl) {
             const offer = await this.extractDirectPage(cleanPrompt, this.detectRetailer(cleanPrompt), category);
             if (offer)
@@ -522,36 +535,59 @@ CRITICAL PRODUCT PAGE EXTRACTION RULES:
     }
     detectCategory(query) {
         const lower = query.toLowerCase();
+        // Direct URLs are validated during extraction
+        if (lower.startsWith('http://') || lower.startsWith('https://')) {
+            if (lower.includes('rtx') || lower.includes('gtx') || lower.includes('radeon') || lower.includes('rx') || lower.includes('gpu'))
+                return 'GPU';
+            if (lower.includes('ryzen') || lower.includes('core') || lower.includes('cpu') || lower.includes('processor'))
+                return 'CPU';
+            if (lower.includes('ram') || lower.includes('ddr'))
+                return 'RAM';
+            if (lower.includes('ssd') || lower.includes('nvme') || lower.includes('m.2'))
+                return 'SSD';
+            if (lower.includes('motherboard') || lower.includes('mobo'))
+                return 'Motherboard';
+            if (lower.includes('psu') || lower.includes('power-supply'))
+                return 'PSU';
+            if (lower.includes('monitor') || lower.includes('display'))
+                return 'Monitor';
+            return 'Hardware';
+        }
         if (lower.includes('rtx') || lower.includes('gtx') || lower.includes('radeon') || lower.includes('rx') ||
-            lower.includes('graphics card') || lower.includes('video card') || lower.includes('gpu')) {
+            lower.includes('graphics card') || lower.includes('video card') || lower.includes('gpu') || lower.includes('arc a7')) {
             return 'GPU';
         }
         if (lower.includes('ryzen') || lower.includes('core i3') || lower.includes('core i5') || lower.includes('core i7') ||
-            lower.includes('core i9') || lower.includes('processor') || lower.includes('cpu')) {
+            lower.includes('core i9') || lower.includes('core ultra') || lower.includes('processor') || lower.includes('cpu') ||
+            lower.includes('threadripper') || lower.includes('xeon') || lower.includes('intel') || lower.includes('amd')) {
             return 'CPU';
         }
-        if (lower.includes('ddr5') || lower.includes('ddr4') || lower.includes('ram') || lower.includes('memory')) {
+        if (lower.includes('ddr5') || lower.includes('ddr4') || lower.includes('ram') || lower.includes('memory kit')) {
             return 'RAM';
         }
-        if (lower.includes('ssd') || lower.includes('nvme') || lower.includes('m.2') || lower.includes('storage')) {
+        if (lower.includes('ssd') || lower.includes('nvme') || lower.includes('m.2') || lower.includes('hard drive') || lower.includes('hdd') || lower.includes('samsung 990') || lower.includes('wd_black')) {
             return 'SSD';
         }
-        if (lower.includes('motherboard') || lower.includes('mobo') || lower.includes('b650') || lower.includes('z790')) {
+        if (lower.includes('motherboard') || lower.includes('mobo') || lower.includes('b650') || lower.includes('z790') ||
+            lower.includes('x670') || lower.includes('x870') || lower.includes('b550') || lower.includes('z690')) {
             return 'Motherboard';
         }
-        if (lower.includes('psu') || lower.includes('power supply') || lower.includes('watt') || lower.includes('850w')) {
+        if (lower.includes('psu') || lower.includes('power supply') || lower.includes('watt') || lower.includes('850w') || lower.includes('1000w') || lower.includes('750w')) {
             return 'PSU';
         }
-        if (lower.includes('case') || lower.includes('chassis') || lower.includes('mid tower')) {
+        if (lower.includes('case') || lower.includes('chassis') || lower.includes('mid tower') || lower.includes('full tower')) {
             return 'Case';
         }
-        if (lower.includes('aio') || lower.includes('liquid cooler') || lower.includes('air cooler')) {
+        if (lower.includes('aio') || lower.includes('liquid cooler') || lower.includes('air cooler') || lower.includes('thermalright') || lower.includes('noctua')) {
             return 'Cooler';
         }
-        if (lower.includes('monitor') || lower.includes('display')) {
+        if (lower.includes('monitor') || lower.includes('display') || lower.includes('oled') || lower.includes('hz')) {
             return 'Monitor';
         }
-        return 'Hardware';
+        if (lower.includes('mouse') || lower.includes('keyboard') || lower.includes('headset') || lower.includes('webcam') || lower.includes('pc fan')) {
+            return 'Accessories';
+        }
+        return 'Not compatible (N/A)';
     }
     /**
      * Smart Buy Box Window Selector:
