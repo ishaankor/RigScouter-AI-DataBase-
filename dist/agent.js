@@ -5,16 +5,22 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.TavilyHardwareAgent = void 0;
 const core_1 = require("@tavily/core");
+const firecrawl_js_1 = __importDefault(require("@mendable/firecrawl-js"));
 const supabase_js_1 = require("./supabase.js");
 const dotenv_1 = __importDefault(require("dotenv"));
 dotenv_1.default.config();
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY || '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';
+const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY || '';
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 class TavilyHardwareAgent {
     tvlyClient;
+    firecrawlClient = null;
     constructor() {
         this.tvlyClient = (0, core_1.tavily)({ apiKey: TAVILY_API_KEY });
+        if (FIRECRAWL_API_KEY) {
+            this.firecrawlClient = new firecrawl_js_1.default({ apiKey: FIRECRAWL_API_KEY });
+        }
     }
     /**
      * Main agent entrypoint using official @tavily/core SDK + Groq/OpenRouter LLM.
@@ -193,7 +199,10 @@ class TavilyHardwareAgent {
                 // If rawContent is not returned in search, use official Tavily extract API
                 if (rawContent.length < 300) {
                     try {
-                        const extRes = await this.tvlyClient.extract([fullUrl]);
+                        const extRes = await this.tvlyClient.extract([fullUrl], {
+                            extractDepth: 'advanced', // Bypasses many JS walls
+                            format: 'markdown' // Converts noisy HTML to clean text
+                        });
                         const extPage = (extRes.results || [])[0];
                         if (extPage && extPage.rawContent) {
                             rawContent = extPage.rawContent;
@@ -203,7 +212,13 @@ class TavilyHardwareAgent {
                 }
                 // Clean URL by stripping trailing /reviews
                 const cleanProductUrl = fullUrl.replace(/\/reviews\/?$/i, '');
-                // 100% LLM extraction via Groq or OpenRouter
+                // 1. Try Firecrawl API Native Schema Extraction first if client is configured
+                if (this.firecrawlClient) {
+                    const fcOffer = await this.extractWithFirecrawl(cleanProductUrl, retailerName, category);
+                    if (fcOffer)
+                        return fcOffer;
+                }
+                // 2. 100% LLM extraction via Groq or OpenRouter
                 const parsed = await this.parseAccuratePriceWithLLM(rawContent, modelQuery, retailerName, cleanProductUrl, category);
                 if (parsed && parsed.price && parsed.price > 0) {
                     console.log(`✅ [TAVILY AI + LLM EXTRACTED] ${retailerName}: "$${parsed.price}" -> ${parsed.title.substring(0, 60)}`);
@@ -227,12 +242,20 @@ class TavilyHardwareAgent {
         return null;
     }
     /**
-     * Direct URL extraction using official @tavily/core extract API
+     * Direct URL extraction using Firecrawl API (Primary) -> Tavily SDK + Groq LLM (Fallback)
      */
     async extractDirectPage(url, retailerName, category) {
+        // 1. Try Firecrawl Native LLM Extraction API first
+        const firecrawlOffer = await this.extractWithFirecrawl(url, retailerName, category);
+        if (firecrawlOffer)
+            return firecrawlOffer;
+        // 2. Fallback to Tavily AI SDK + Groq LLM
         try {
             console.log(`[Tavily AI SDK Extract] Reading DOM content from ${url}...`);
-            const extRes = await this.tvlyClient.extract([url]);
+            const extRes = await this.tvlyClient.extract([url], {
+                extractDepth: 'advanced',
+                format: 'markdown'
+            });
             const hit = (extRes.results || [])[0];
             if (hit) {
                 const rawText = (hit.rawContent || '');
@@ -254,6 +277,56 @@ class TavilyHardwareAgent {
         }
         catch (e) {
             console.warn(`[Tavily SDK Extract Warning] ${url} extract failed:`, e);
+        }
+        return null;
+    }
+    /**
+     * Primary Native LLM Schema Extraction via Firecrawl API (v1/scrape format json)
+     */
+    async extractWithFirecrawl(url, retailerName, category) {
+        if (!this.firecrawlClient)
+            return null;
+        try {
+            console.log(`[Firecrawl API Extract] Extracting structured JSON schema from ${url}...`);
+            const res = await this.firecrawlClient.scrapeUrl(url, {
+                formats: [
+                    {
+                        type: 'json',
+                        prompt: `Extract the main product current sale price, original MSRP list price, full clean title, brand, and in-stock status from this page: "${url}". Ignore sponsored competitor ads and sidebar items.`,
+                        schema: {
+                            type: 'object',
+                            properties: {
+                                currentPrice: { type: 'number' },
+                                originalPrice: { type: 'number' },
+                                title: { type: 'string' },
+                                brand: { type: 'string' },
+                                inStock: { type: 'boolean' },
+                                isRefurbished: { type: 'boolean' }
+                            },
+                            required: ['currentPrice', 'title']
+                        }
+                    }
+                ]
+            });
+            const extracted = res?.json || res?.data?.json;
+            const imageUrl = res?.metadata?.ogImage || res?.metadata?.['og:image'] || undefined;
+            if (extracted && typeof extracted.currentPrice === 'number' && extracted.currentPrice > 0) {
+                console.log(`✅ [FIRECRAWL EXTRACTED] ${retailerName}: "$${extracted.currentPrice}" -> ${extracted.title}`);
+                return {
+                    retailer: retailerName,
+                    price: extracted.currentPrice,
+                    originalPrice: extracted.originalPrice,
+                    title: extracted.title || url,
+                    brand: extracted.brand,
+                    url,
+                    inStock: Boolean(extracted.inStock),
+                    isRefurbished: Boolean(extracted.isRefurbished),
+                    snippet: imageUrl ? `Image: ${imageUrl}` : 'Extracted via Firecrawl AI cloud browser schema extraction'
+                };
+            }
+        }
+        catch (e) {
+            console.warn(`[Firecrawl API Warning] ${url}:`, e?.message || e);
         }
         return null;
     }
@@ -286,14 +359,17 @@ class TavilyHardwareAgent {
             'llama-3.1-8b-instant',
             'llama-3.3-70b-versatile'
         ];
-        const systemPrompt = `You are a high-precision PC hardware price extraction AI. Your mission is to extract the EXACT current sale price displayed in the main Buy Box for the product on the retailer webpage.
+        const systemPrompt = `You are a high-precision PC hardware price extraction AI. 
+Your mission is to extract the EXACT current sale price from the provided webpage markdown.
 
 CRITICAL PRODUCT PAGE EXTRACTION RULES:
-1. MAIN BUY BOX PRICE ONLY: Extract the price listed next to the main "Add to Cart" or "Buy Now" button.
-2. IGNORE THIRD-PARTY MARKETPLACE LISTINGS: Do NOT extract prices from "Other Sellers", "Used & New from $XXX", or sidebar third-party offers.
-3. SALE PRICE vs REGULAR MSRP: If a regular price is struck through ($699.99) and a sale price is shown ($599.99), set currentPrice = 599.99 and originalPrice = 699.99.
-4. IGNORE UNRELATED PRODUCTS: Ignore "Customers Also Viewed", "Sponsored Products", protection plans, and warranty add-ons.
-5. Output JSON ONLY in this format:
+1. BYPASS HEADERS & ADS: Ignore top navigation links, member banners, and footer elements.
+2. IGNORE SPONSORED ADS: Product pages often show sponsored competitor ads (e.g. "GIGABYTE... $649.99 Sponsored"). Ignore sponsored ads and extract the price for the MAIN item being sold on this page.
+3. MAIN BUY BOX SALE PRICE: Extract the current actual sale price for the main item.
+4. CLEARANCE & REFURBISHED: On refurbished, clearance, or open-box items, extract the current discounted sale price, NOT the original launch price.
+5. IGNORE THIRD-PARTY: Do NOT extract prices from "Other Sellers", "Used & New from $XXX", or sidebar ads.
+6. SALE PRICE vs REGULAR MSRP: If a regular price is struck through ($1,299.00) and a sale price is shown ($1,129.28), set currentPrice = 1129.28 and originalPrice = 1299.00.
+7. Output strictly in this JSON format:
 {
   "currentPrice": number or null,
   "originalPrice": number or null,
@@ -302,8 +378,8 @@ CRITICAL PRODUCT PAGE EXTRACTION RULES:
   "cleanTitle": string,
   "brand": string
 }`;
-        // Trim text to 2,500 characters (~500 tokens) to stay well under token per minute limits
-        const trimmedSnippet = text.substring(0, 2500);
+        // Smart Buy Box Window Selector: pinpoints exact price block across huge retailer DOMs
+        const trimmedSnippet = this.extractTargetedProductSnippet(text, query);
         for (const modelName of GROQ_MODELS) {
             try {
                 const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -476,6 +552,58 @@ CRITICAL PRODUCT PAGE EXTRACTION RULES:
             return 'Monitor';
         }
         return 'Hardware';
+    }
+    /**
+     * Smart Buy Box Window Selector:
+     * Finds the exact section of raw text containing the product model and live price tag,
+     * bypassing 100,000+ characters of site navigation headers and footer ads.
+     */
+    extractTargetedProductSnippet(text, query) {
+        if (text.length <= 4500)
+            return text;
+        const lowerText = text.toLowerCase();
+        const queryTerms = query
+            .toLowerCase()
+            .replace(/^https?:\/\/[^\/]+\//, '')
+            .split(/[^a-z0-9]+/)
+            .filter(t => t.length > 2 && !['product', 'html', 'http', 'https', 'www', 'com'].includes(t));
+        // Match standard ($1032.00) and bold markdown ($**1,032**.00) price tags
+        const priceRegex = /\$\s*\*{0,2}[\d,]+(\.\d{2})?\*{0,2}/g;
+        let match;
+        let bestIndex = -1;
+        let maxMatchScore = -1;
+        while ((match = priceRegex.exec(text)) !== null) {
+            const idx = match.index;
+            const windowText = lowerText.substring(Math.max(0, idx - 250), Math.min(text.length, idx + 250));
+            let score = 0;
+            for (const term of queryTerms) {
+                if (windowText.includes(term))
+                    score += 3;
+            }
+            if (windowText.includes('sponsored') || windowText.includes('seeing this ad')) {
+                score -= 10;
+            }
+            if (windowText.includes('buy in store') || windowText.includes('add to cart') || windowText.includes('todays price') || windowText.includes('our price') || windowText.includes('in stock') || windowText.includes('sold by')) {
+                score += 5;
+            }
+            if (windowText.includes('refurbished') || windowText.includes('clearance') || windowText.includes('open box')) {
+                score += 2;
+            }
+            if (score > maxMatchScore) {
+                maxMatchScore = score;
+                bestIndex = idx;
+            }
+        }
+        if (bestIndex !== -1 && maxMatchScore > 0) {
+            return text.substring(Math.max(0, bestIndex - 600), Math.min(text.length, bestIndex + 3400));
+        }
+        for (const term of queryTerms) {
+            const idx = lowerText.indexOf(term);
+            if (idx !== -1) {
+                return text.substring(Math.max(0, idx - 200), Math.min(text.length, idx + 3800));
+            }
+        }
+        return text.substring(0, 4500);
     }
 }
 exports.TavilyHardwareAgent = TavilyHardwareAgent;

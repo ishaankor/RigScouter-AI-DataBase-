@@ -9,6 +9,7 @@
     "dev": "tsx watch src/server.ts"
   },
   "dependencies": {
+    "@mendable/firecrawl-js": "^4.32.0",
     "@supabase/supabase-js": "^2.49.1",
     "@tavily/core": "^0.7.7",
     "cors": "^2.8.5",
