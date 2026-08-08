@@ -215,44 +215,48 @@ export class TavilyHardwareAgent {
 
         const componentId = `agent-${cleanPrompt.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${state.bestOffer.retailer.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
 
-        const realMsrp = state.bestOffer.originalPrice && state.bestOffer.originalPrice > state.bestOffer.price
-          ? state.bestOffer.originalPrice
-          : state.bestOffer.price;
+        // Persist ALL scraped retailer offers into hardware_components database table
+        for (const offer of state.scrapedOffers) {
+          const offerComponentId = `agent-${cleanPrompt.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${offer.retailer.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
+          const offerMsrp = offer.originalPrice && offer.originalPrice > offer.price
+            ? offer.originalPrice
+            : offer.price;
 
-        const calculatedDealScore = realMsrp > state.bestOffer.price
-          ? Math.min(100, Math.max(50, Math.round(50 + ((realMsrp - state.bestOffer.price) / realMsrp) * 100)))
-          : 50;
+          const offerDealScore = offerMsrp > offer.price
+            ? Math.min(100, Math.max(50, Math.round(50 + ((offerMsrp - offer.price) / offerMsrp) * 100)))
+            : 50;
 
-        const baseModelGroup = this.normalizeModel(state.bestOffer.title, cleanPrompt);
+          const offerModelGroup = this.normalizeModel(offer.title, cleanPrompt);
 
-        await supabase.from('hardware_components').upsert({
-          id: componentId,
-          name: state.bestOffer.title,
-          category: category,
-          brand: state.bestOffer.brand || state.bestOffer.title.split(' ')[0] || 'Hardware',
-          model: baseModelGroup,
-          specs: JSON.stringify({
-            AgentSummary: state.summary,
-            RetailerOffers: state.scrapedOffers,
-            InStock: state.bestOffer.inStock,
-            IsRefurbished: state.bestOffer.isRefurbished || false,
-            OriginalPrice: state.bestOffer.originalPrice || null,
-            PreviousPrice: previousPrice,
-            PriceChange: state.priceChange,
-            ScrapedAt: new Date().toISOString()
-          }),
-          msrp: realMsrp,
-          current_price: state.bestOffer.price,
-          lowest_price_90d: state.bestOffer.price,
-          retailer: state.bestOffer.retailer,
-          product_url: state.bestOffer.url,
-          image_url: 'https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=600&q=80',
-          rating: (state.bestOffer as any).rating || null,
-          deal_score: calculatedDealScore,
-          updated_at: new Date().toISOString()
-        });
+          await supabase.from('hardware_components').upsert({
+            id: offerComponentId,
+            name: offer.title,
+            category: category,
+            brand: offer.brand || offer.title.split(' ')[0] || 'Hardware',
+            model: offerModelGroup,
+            specs: JSON.stringify({
+              AgentSummary: state.summary,
+              RetailerOffers: state.scrapedOffers,
+              InStock: offer.inStock,
+              IsRefurbished: offer.isRefurbished || false,
+              OriginalPrice: offer.originalPrice || null,
+              PreviousPrice: previousPrice,
+              PriceChange: state.priceChange,
+              ScrapedAt: new Date().toISOString()
+            }),
+            msrp: offerMsrp,
+            current_price: offer.price,
+            lowest_price_90d: offer.price,
+            retailer: offer.retailer,
+            product_url: offer.url,
+            image_url: 'https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=600&q=80',
+            rating: (offer as any).rating || null,
+            deal_score: offerDealScore,
+            updated_at: new Date().toISOString()
+          });
 
-        console.log(`[DB Persist Success] "${state.bestOffer.title}" ($${state.bestOffer.price.toFixed(2)}) at ${state.bestOffer.url}`);
+          console.log(`[DB Persist Success] Saved "${offer.retailer}" offer: "${offer.title}" ($${offer.price.toFixed(2)}) to hardware_components`);
+        }
 
         try {
           await supabase.from('price_snapshots').insert({
@@ -853,9 +857,16 @@ CRITICAL PRODUCT PAGE EXTRACTION RULES:
 
     // Check critical GPU/CPU suffixes (Super, Ti, XT, X3D)
     if (lQuery.includes('super') && !lTitle.includes('super')) return false;
-    if (lQuery.includes(' ti') && !lTitle.includes('ti')) return false;
-    if (lQuery.includes(' xt') && !lTitle.includes('xt')) return false;
+    if (!lQuery.includes('super') && lTitle.includes('super')) return false; // Query did NOT ask for Super
+
+    if ((lQuery.includes(' ti') || lQuery.includes('ti ')) && !lTitle.includes('ti')) return false;
+    if (!lQuery.includes('ti') && lTitle.includes('ti')) return false; // Query did NOT ask for Ti
+
+    if ((lQuery.includes(' xt') || lQuery.includes('xt ')) && !lTitle.includes('xt')) return false;
+    if (!lQuery.includes('xt') && lTitle.includes('xt')) return false; // Query did NOT ask for XT
+
     if (lQuery.includes('x3d') && !lTitle.includes('x3d')) return false;
+    if (!lQuery.includes('x3d') && lTitle.includes('x3d')) return false; // Query did NOT ask for X3D
 
     return true;
   }
