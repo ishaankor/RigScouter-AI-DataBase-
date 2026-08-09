@@ -103,12 +103,11 @@ class TavilyHardwareAgent {
                         const fullUrl = hit.url || '';
                         const retailer = this.detectRetailer(fullUrl);
                         let cleanUrl = fullUrl.replace(/\/reviews\/?$/i, '').split('?')[0];
-                        if (retailer === 'Amazon' && cleanUrl.includes('/dp/')) {
-                            cleanUrl = `https://www.amazon.com/s?k=${encodeURIComponent(cleanPrompt)}`;
-                        }
+                        if (!this.isValidDirectProductUrl(cleanUrl, retailer))
+                            continue;
                         const text = `${hit.title || ''} ${hit.content || ''} ${hit.rawContent || ''}`;
                         const parsed = await this.parseAccuratePriceWithLLM(text, cleanPrompt, retailer, cleanUrl, category);
-                        if (parsed && parsed.price && parsed.price > 0) {
+                        if (parsed && parsed.price && this.isPriceSanityValid(parsed.price, cleanPrompt, category)) {
                             console.log(`✅ [TAVILY GENERAL SEARCH EXTRACTED] ${retailer}: "$${parsed.price}" -> ${parsed.title}`);
                             state.scrapedOffers.push({
                                 retailer: retailer,
@@ -136,11 +135,17 @@ class TavilyHardwareAgent {
                 }
             }
         }
-        state.scrapedOffers.sort((a, b) => a.price - b.price);
+        // Sort all scraped retailer offers: Available (inStock) items first, then lowest price
+        state.scrapedOffers.sort((a, b) => {
+            if (a.inStock !== b.inStock) {
+                return a.inStock ? -1 : 1;
+            }
+            return a.price - b.price;
+        });
         if (state.scrapedOffers.length > 0) {
             state.bestOffer = state.scrapedOffers[0];
             const stockStatus = state.bestOffer.inStock ? 'In Stock' : 'Out of Stock / Backorder';
-            state.summary = `Evaluated ${state.scrapedOffers.length} live retailer listings via Tavily AI. Lowest price: $${state.bestOffer.price.toFixed(2)} at ${state.bestOffer.retailer} (${stockStatus}).`;
+            state.summary = `Evaluated ${state.scrapedOffers.length} live retailer listings via Tavily AI. Cheapest available offer: $${state.bestOffer.price.toFixed(2)} at ${state.bestOffer.retailer} (${stockStatus}).`;
         }
         else {
             state.summary = `No live prices found across retailers for "${cleanPrompt}".`;
@@ -273,6 +278,7 @@ class TavilyHardwareAgent {
                     maxResults: 5
                 });
                 const results = searchRes.results || [];
+                const candidateOffers = [];
                 for (const hit of results) {
                     const fullUrl = hit.url || '';
                     if (!this.isValidDirectProductUrl(fullUrl, domainPattern))
@@ -292,13 +298,11 @@ class TavilyHardwareAgent {
                         catch (e) { }
                     }
                     let cleanProductUrl = fullUrl.replace(/\/reviews\/?$/i, '').split('?')[0];
-                    if (retailerName === 'Amazon' && cleanProductUrl.includes('/dp/')) {
-                        cleanProductUrl = `https://www.amazon.com/s?k=${encodeURIComponent(modelQuery)}`;
-                    }
+                    if (!this.isValidDirectProductUrl(cleanProductUrl, retailerName))
+                        continue;
                     const parsed = await this.parseAccuratePriceWithLLM(rawContent, modelQuery, retailerName, cleanProductUrl, category);
-                    if (parsed && parsed.price && parsed.price > 0 && this.doesTitleMatchQuery(parsed.title || hit.title || '', modelQuery)) {
-                        console.log(`✅ [TAVILY AI + LLM EXTRACTED] ${retailerName}: "$${parsed.price}" -> ${parsed.title.substring(0, 60)}`);
-                        return {
+                    if (parsed && parsed.price && this.isPriceSanityValid(parsed.price, modelQuery, category) && this.doesTitleMatchQuery(parsed.title || hit.title || '', modelQuery)) {
+                        candidateOffers.push({
                             retailer: retailerName,
                             price: parsed.price,
                             originalPrice: parsed.originalPrice,
@@ -308,11 +312,23 @@ class TavilyHardwareAgent {
                             inStock: parsed.inStock,
                             isRefurbished: parsed.isRefurbished,
                             snippet: hit.content
-                        };
+                        });
                     }
                     else if (parsed && parsed.title) {
-                        console.warn(`⚠️ [Title Mismatch Rejected] ${retailerName}: Extracted "${parsed.title}" does not match requested model "${modelQuery}"`);
+                        console.warn(`⚠️ [Mismatch/Sanity Rejected] ${retailerName}: Extracted "$${parsed.price}" / "${parsed.title}" failed validation for "${modelQuery}"`);
                     }
+                }
+                if (candidateOffers.length > 0) {
+                    // Sort candidate offers for this retailer: InStock first, then lowest price
+                    candidateOffers.sort((a, b) => {
+                        if (a.inStock !== b.inStock) {
+                            return a.inStock ? -1 : 1;
+                        }
+                        return a.price - b.price;
+                    });
+                    const cheapestAvailable = candidateOffers[0];
+                    console.log(`✅ [CHEAPEST AVAILABLE ${retailerName.toUpperCase()} OFFER] "$${cheapestAvailable.price}" (${cheapestAvailable.inStock ? 'In Stock' : 'Out of Stock'}) -> ${cheapestAvailable.title.substring(0, 60)}`);
+                    return cheapestAvailable;
                 }
                 return null;
             }
@@ -343,8 +359,11 @@ class TavilyHardwareAgent {
                 const hit = (extRes.results || [])[0];
                 if (hit) {
                     const rawText = (hit.rawContent || '');
+                    // Check if item is explicitly Not Carried / Out of Stock
+                    const lowerText = rawText.toLowerCase();
+                    const isNotCarried = lowerText.includes('not carried at') || lowerText.includes('item no longer available') || lowerText.includes('discontinued');
                     const parsed = await this.parseAccuratePriceWithLLM(rawText, url, retailerName, url, category);
-                    if (parsed && parsed.price) {
+                    if (parsed && parsed.price && !isNotCarried && this.isPriceSanityValid(parsed.price, url, category) && this.doesTitleMatchQuery(parsed.title, url)) {
                         return {
                             retailer: retailerName,
                             price: parsed.price,
@@ -356,6 +375,12 @@ class TavilyHardwareAgent {
                             isRefurbished: parsed.isRefurbished,
                             snippet: rawText.substring(0, 300)
                         };
+                    }
+                    else if (parsed && parsed.title) {
+                        console.warn(`⚠️ [Direct Extract Title Mismatch] Extracted "${parsed.title}" ($${parsed.price}) did not match URL product.`);
+                    }
+                    else if (isNotCarried) {
+                        console.log(`ℹ️ [Not Carried / Unpriced] ${retailerName} item "${url}" is Not Carried / Sold Out (no active price tag).`);
                     }
                 }
                 return null;
@@ -404,14 +429,14 @@ class TavilyHardwareAgent {
         const systemPrompt = `You are a high-precision PC hardware price extraction AI. 
 Your mission is to extract the EXACT current sale price from the provided webpage markdown.
 
-CRITICAL PRODUCT PAGE EXTRACTION RULES:
-1. BYPASS HEADERS & ADS: Ignore top navigation links, member banners, and footer elements.
-2. IGNORE SPONSORED ADS: Product pages often show sponsored competitor ads (e.g. "GIGABYTE... $649.99 Sponsored"). Ignore sponsored ads and extract the price for the MAIN item being sold on this page.
-3. MAIN BUY BOX SALE PRICE: Extract the current actual sale price for the main item.
-4. CLEARANCE & REFURBISHED: On refurbished, clearance, or open-box items, extract the current discounted sale price, NOT the original launch price.
-5. IGNORE THIRD-PARTY: Do NOT extract prices from "Other Sellers", "Used & New from $XXX", or sidebar ads.
+CRITICAL RULES:
+1. PRIMARY DISPLAYED PRICE: Extract the EXACT primary Buy Box sale price displayed to customers on screen (e.g. "$365.22" for "Buy Used: $365.22" or main price tag "$365.22").
+2. DO NOT USE GENERIC LIST PRICES / MSRPs: If the webpage displays an active Buy Box price like "$365.22", output 365.22. Do NOT output a generic launch MSRP like $369.99 when a live price tag is displayed.
+3. BUY USED / RENEWED / OPEN BOX: If the primary Buy Box option displays "Buy Used: $365.22" or "Used - Very Good" or "Open Box", set currentPrice = 365.22 and isRefurbished = true.
+4. IGNORE SPONSORED ADS: Ignore top navigation sponsored ads or "Customers also viewed" carousels (e.g. "MSI RTX 3050 $209.97 Sponsored"). Extract price ONLY for the main item featured in the page title.
+5. CLEARANCE & REFURBISHED: On refurbished, clearance, or open-box items, extract the current discounted sale price, NOT the original launch price.
 6. SALE PRICE vs REGULAR MSRP: If a regular price is struck through ($1,299.00) and a sale price is shown ($1,129.28), set currentPrice = 1129.28 and originalPrice = 1299.00.
-7. Output strictly in this JSON format:
+6. Output strictly in this JSON format:
 {
   "currentPrice": number or null,
   "originalPrice": number or null,
@@ -530,20 +555,91 @@ CRITICAL PRODUCT PAGE EXTRACTION RULES:
             lower.includes('searchpage.jsp') ||
             lower.includes('/shop/') ||
             lower.includes('/c/buy/') ||
+            lower.includes('/accessories') ||
+            lower.includes('/s?k=') ||
+            lower.includes('/p/pl') ||
             lower.endsWith('.pdf') ||
             lower.includes('page=')) {
             return false;
         }
-        if (domainPattern.includes('microcenter.com'))
+        if (domainPattern.includes('microcenter.com') || domainPattern === 'Micro Center')
             return lower.includes('/product/');
-        if (domainPattern.includes('amazon.com'))
+        if (domainPattern.includes('amazon.com') || domainPattern === 'Amazon')
             return lower.includes('/dp/') || lower.includes('/gp/product/');
-        if (domainPattern.includes('newegg.com'))
+        if (domainPattern.includes('newegg.com') || domainPattern === 'Newegg')
             return lower.includes('/p/') && !lower.includes('/p/pl');
-        if (domainPattern.includes('bestbuy.com'))
+        if (domainPattern.includes('bestbuy.com') || domainPattern === 'Best Buy')
             return lower.includes('/site/') && lower.includes('.p?');
-        if (domainPattern.includes('bhphotovideo.com'))
-            return lower.includes('/c/product/');
+        if (domainPattern.includes('bhphotovideo.com') || domainPattern === 'B&H')
+            return lower.includes('/c/product/') && !lower.includes('/accessories');
+        return true;
+    }
+    isPriceSanityValid(price, queryOrModel, category) {
+        if (!price || price <= 0 || isNaN(price))
+            return false;
+        const lower = queryOrModel.toLowerCase();
+        // Check specific GPU model bounds
+        if (lower.includes('4070 super')) {
+            if (price < 450 || price > 820)
+                return false;
+        }
+        else if (lower.includes('4070 ti super') || lower.includes('4070ti super')) {
+            if (price < 650 || price > 1100)
+                return false;
+        }
+        else if (lower.includes('4070 ti') || lower.includes('4070ti')) {
+            if (price < 580 || price > 1000)
+                return false;
+        }
+        else if (lower.includes('4070')) {
+            if (price < 400 || price > 750)
+                return false;
+        }
+        else if (lower.includes('4060 ti') || lower.includes('4060ti')) {
+            if (price < 300 || price > 550)
+                return false;
+        }
+        else if (lower.includes('4060')) {
+            if (price < 220 || price > 450)
+                return false;
+        }
+        else if (lower.includes('4080 super')) {
+            if (price < 800 || price > 1400)
+                return false;
+        }
+        else if (lower.includes('4080')) {
+            if (price < 750 || price > 1400)
+                return false;
+        }
+        else if (lower.includes('4090')) {
+            if (price < 1300 || price > 2800)
+                return false;
+        }
+        else if (lower.includes('1080 ti') || lower.includes('1080ti')) {
+            if (price < 120 || price > 450)
+                return false;
+        }
+        else if (lower.includes('7800x3d')) {
+            if (price < 260 || price > 550)
+                return false;
+        }
+        else if (lower.includes('9800x3d')) {
+            if (price < 380 || price > 700)
+                return false;
+        }
+        else if (lower.includes('990 pro')) {
+            if (price < 70 || price > 350)
+                return false;
+        }
+        // Category sanity limits
+        if (category === 'GPU' && (price < 80 || price > 3500))
+            return false;
+        if (category === 'CPU' && (price < 50 || price > 1500))
+            return false;
+        if (category === 'RAM' && (price < 20 || price > 600))
+            return false;
+        if (category === 'SSD' && (price < 25 || price > 800))
+            return false;
         return true;
     }
     detectRetailer(urlOrText) {
@@ -852,6 +948,11 @@ CRITICAL PRODUCT PAGE EXTRACTION RULES:
             return false;
         if (!lQuery.includes('x3d') && lTitle.includes('x3d'))
             return false; // Query did NOT ask for X3D
+        // Check capacity conflicts (e.g., query asked for 2TB, but title contains 500GB or 1TB)
+        if (lQuery.includes('2tb') && (lTitle.includes('500gb') || lTitle.includes('250gb') || lTitle.includes('1tb')))
+            return false;
+        if (lQuery.includes('1tb') && (lTitle.includes('500gb') || lTitle.includes('250gb') || lTitle.includes('2tb')))
+            return false;
         return true;
     }
 }

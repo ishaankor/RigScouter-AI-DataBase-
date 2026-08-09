@@ -12,10 +12,11 @@
     "@mendable/firecrawl-js": "^4.32.0",
     "@supabase/supabase-js": "^2.49.1",
     "@tavily/core": "^0.7.7",
+    "@types/pg": "^8.21.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
-    "playwright": "^1.51.0"
+    "pg": "^8.23.0"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
