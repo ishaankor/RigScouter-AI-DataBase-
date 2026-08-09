@@ -190,14 +190,14 @@ class TavilyHardwareAgent {
                 const componentId = `agent-${cleanPrompt.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${state.bestOffer.retailer.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
                 // Persist ALL scraped retailer offers into hardware_components database table
                 for (const offer of state.scrapedOffers) {
-                    const offerComponentId = `agent-${cleanPrompt.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${offer.retailer.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
+                    const offerModelGroup = this.normalizeModel(offer.title, cleanPrompt);
+                    const offerComponentId = `comp-${offerModelGroup.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${offer.retailer.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
                     const offerMsrp = offer.originalPrice && offer.originalPrice > offer.price
                         ? offer.originalPrice
                         : offer.price;
                     const offerDealScore = offerMsrp > offer.price
                         ? Math.min(100, Math.max(50, Math.round(50 + ((offerMsrp - offer.price) / offerMsrp) * 100)))
                         : 50;
-                    const offerModelGroup = this.normalizeModel(offer.title, cleanPrompt);
                     await supabase_js_1.supabase.from('hardware_components').upsert({
                         id: offerComponentId,
                         name: offer.title,
@@ -271,7 +271,7 @@ class TavilyHardwareAgent {
         for (let attempt = 0; attempt < TAVILY_API_KEYS.length; attempt++) {
             const tvly = this.getTavilyClient();
             try {
-                const searchRes = await tvly.search(`buy ${modelQuery} ${category} price`, {
+                const searchRes = await tvly.search(`buy ${modelQuery} price`, {
                     searchDepth: 'advanced',
                     includeDomains: [domainPattern],
                     includeRawContent: 'text',
@@ -347,7 +347,7 @@ class TavilyHardwareAgent {
     /**
      * Direct URL extraction using Tavily AI SDK + LLM
      */
-    async extractDirectPage(url, retailerName, category) {
+    async extractDirectPage(url, retailerName, category, modelQuery) {
         for (let attempt = 0; attempt < TAVILY_API_KEYS.length; attempt++) {
             const tvly = this.getTavilyClient();
             try {
@@ -363,7 +363,8 @@ class TavilyHardwareAgent {
                     const lowerText = rawText.toLowerCase();
                     const isNotCarried = lowerText.includes('not carried at') || lowerText.includes('item no longer available') || lowerText.includes('discontinued');
                     const parsed = await this.parseAccuratePriceWithLLM(rawText, url, retailerName, url, category);
-                    if (parsed && parsed.price && !isNotCarried && this.isPriceSanityValid(parsed.price, url, category) && this.doesTitleMatchQuery(parsed.title, url)) {
+                    const isTitleValid = modelQuery ? this.doesTitleMatchQuery(parsed?.title || '', modelQuery) : true;
+                    if (parsed && parsed.price && !isNotCarried && this.isPriceSanityValid(parsed.price, url, category) && isTitleValid) {
                         return {
                             retailer: retailerName,
                             price: parsed.price,
@@ -436,6 +437,7 @@ CRITICAL RULES:
 4. IGNORE SPONSORED ADS: Ignore top navigation sponsored ads or "Customers also viewed" carousels (e.g. "MSI RTX 3050 $209.97 Sponsored"). Extract price ONLY for the main item featured in the page title.
 5. CLEARANCE & REFURBISHED: On refurbished, clearance, or open-box items, extract the current discounted sale price, NOT the original launch price.
 6. SALE PRICE vs REGULAR MSRP: If a regular price is struck through ($1,299.00) and a sale price is shown ($1,129.28), set currentPrice = 1129.28 and originalPrice = 1299.00.
+7. EXCLUDE ACCESSORIES: DO NOT extract prices for cables, protection plans, warranties, power cords, or mounting brackets. Extract price ONLY for the main PC component (GPU, CPU, SSD, RAM, Motherboard).
 6. Output strictly in this JSON format:
 {
   "currentPrice": number or null,
@@ -447,6 +449,11 @@ CRITICAL RULES:
 }`;
         // Smart Buy Box Window Selector: pinpoints exact price block across huge retailer DOMs
         const trimmedSnippet = this.extractTargetedProductSnippet(text, query);
+        // Deterministic Price Tag Pre-Pass
+        const regexExtract = this.extractPriceWithRegex(trimmedSnippet, retailer);
+        if (regexExtract && this.isPriceSanityValid(regexExtract.price, category, query)) {
+            console.log(`[Deterministic Buy Box Extract] Found exact ${retailer} price tag: $${regexExtract.price}`);
+        }
         for (const modelName of GROQ_MODELS) {
             try {
                 const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -580,65 +587,65 @@ CRITICAL RULES:
         const lower = queryOrModel.toLowerCase();
         // Check specific GPU model bounds
         if (lower.includes('4070 super')) {
-            if (price < 450 || price > 820)
+            if (price < 450 || price > 950)
                 return false;
         }
         else if (lower.includes('4070 ti super') || lower.includes('4070ti super')) {
-            if (price < 650 || price > 1100)
+            if (price < 650 || price > 1350)
                 return false;
         }
         else if (lower.includes('4070 ti') || lower.includes('4070ti')) {
-            if (price < 580 || price > 1000)
+            if (price < 580 || price > 1350)
                 return false;
         }
         else if (lower.includes('4070')) {
-            if (price < 400 || price > 750)
+            if (price < 400 || price > 850)
                 return false;
         }
         else if (lower.includes('4060 ti') || lower.includes('4060ti')) {
-            if (price < 300 || price > 550)
+            if (price < 300 || price > 650)
                 return false;
         }
         else if (lower.includes('4060')) {
-            if (price < 220 || price > 450)
+            if (price < 220 || price > 550)
                 return false;
         }
-        else if (lower.includes('4080 super')) {
-            if (price < 800 || price > 1400)
+        else if (lower.includes('4080 super') || lower.includes('4080ti')) {
+            if (price < 800 || price > 1800)
                 return false;
         }
         else if (lower.includes('4080')) {
-            if (price < 750 || price > 1400)
+            if (price < 750 || price > 1800)
                 return false;
         }
-        else if (lower.includes('4090')) {
-            if (price < 1300 || price > 2800)
+        else if (lower.includes('4090') || lower.includes('5090')) {
+            if (price < 1300 || price > 5000)
                 return false;
         }
         else if (lower.includes('1080 ti') || lower.includes('1080ti')) {
-            if (price < 120 || price > 450)
+            if (price < 120 || price > 550)
                 return false;
         }
         else if (lower.includes('7800x3d')) {
-            if (price < 260 || price > 550)
+            if (price < 260 || price > 600)
                 return false;
         }
         else if (lower.includes('9800x3d')) {
-            if (price < 380 || price > 700)
+            if (price < 380 || price > 800)
                 return false;
         }
         else if (lower.includes('990 pro')) {
-            if (price < 70 || price > 350)
+            if (price < 80 || price > 600)
                 return false;
         }
         // Category sanity limits
-        if (category === 'GPU' && (price < 80 || price > 3500))
+        if (category === 'GPU' && (price < 80 || price > 5000))
             return false;
-        if (category === 'CPU' && (price < 50 || price > 1500))
+        if (category === 'CPU' && (price < 50 || price > 2500))
             return false;
-        if (category === 'RAM' && (price < 20 || price > 600))
+        if (category === 'RAM' && (price < 20 || price > 1000))
             return false;
-        if (category === 'SSD' && (price < 25 || price > 800))
+        if (category === 'SSD' && (price < 25 || price > 1200))
             return false;
         return true;
     }
@@ -863,6 +870,69 @@ CRITICAL RULES:
         return cleanFallback || text;
     }
     /**
+     * Enhancement 1: Rejects accessory listings (cables, protection plans, brackets)
+     */
+    isAccessoryOrIrrelevantTitle(title) {
+        if (!title)
+            return true;
+        const lower = title.toLowerCase();
+        const accessoryKeywords = [
+            'displayport to hdmi', 'hdmi cable', 'displayport cable', 'usb cable', 'audio cable',
+            'power cord', 'protection plan', 'extended warranty', 'asurion', 'office equipment protection',
+            'mounting bracket', 'anti-sag bracket', 'support bracket',
+            'thermal paste', 'computer mouse', 'gaming mouse', 'keyboard',
+            'headset', 'pc case fan', 'vertical mount', 'riser cable', 'sleeve cable'
+        ];
+        return accessoryKeywords.some(kw => lower.includes(kw));
+    }
+    /**
+     * Enhancement 2: Deterministic Price Tag Micro-Parser
+     * Extracts primary Buy Box prices directly from DOM text tags using regex
+     */
+    extractPriceWithRegex(text, retailer) {
+        if (!text)
+            return null;
+        const lower = text.toLowerCase();
+        // 1. Amazon Buy Box Patterns
+        if (retailer === 'Amazon' || lower.includes('amazon.com')) {
+            const buyUsedMatch = text.match(/Used\s*-\s*(?:Like New|Very Good|Good)\s*\$([0-9,]+(?:\.[0-9]{2})?)/i) ||
+                text.match(/Buy Used\s*:\s*\$([0-9,]+(?:\.[0-9]{2})?)/i);
+            if (buyUsedMatch) {
+                const val = parseFloat(buyUsedMatch[1].replace(/,/g, ''));
+                if (val > 0)
+                    return { price: val, isRefurbished: true };
+            }
+            const buyNewMatch = text.match(/Buy New\s*\$([0-9,]+(?:\.[0-9]{2})?)/i) ||
+                text.match(/\$\s*([0-9,]+\.[0-9]{2})\s*FREE delivery/i);
+            if (buyNewMatch) {
+                const val = parseFloat(buyNewMatch[1].replace(/,/g, ''));
+                if (val > 0)
+                    return { price: val, isRefurbished: false };
+            }
+        }
+        // 2. Micro Center Buy Box Patterns
+        if (retailer === 'Micro Center' || lower.includes('microcenter.com')) {
+            const mcTodaysMatch = text.match(/Todays price\s*\$([0-9,]+(?:\.[0-9]{2})?)/i) ||
+                text.match(/BUY IN STORE\s*\$([0-9,]+(?:\.[0-9]{2})?)/i);
+            const isRefurb = lower.includes('(refurbished)') || lower.includes('refurbished');
+            if (mcTodaysMatch) {
+                const val = parseFloat(mcTodaysMatch[1].replace(/,/g, ''));
+                if (val > 0)
+                    return { price: val, isRefurbished: isRefurb };
+            }
+        }
+        // 3. B&H & Newegg Buy Box Patterns
+        if (retailer === 'B&H' || lower.includes('bhphotovideo.com') || retailer === 'Newegg' || lower.includes('newegg.com')) {
+            const bhMatch = text.match(/(?:In Stock|Our Price|Todays Price)\s*\$([0-9,]+(?:\.[0-9]{2})?)/i);
+            if (bhMatch) {
+                const val = parseFloat(bhMatch[1].replace(/,/g, ''));
+                if (val > 0)
+                    return { price: val, isRefurbished: lower.includes('refurbished') };
+            }
+        }
+        return null;
+    }
+    /**
      * Smart Buy Box Window Selector:
      * Finds the exact section of raw text containing the product model and live price tag,
      * bypassing 100,000+ characters of site navigation headers and footer ads.
@@ -889,10 +959,10 @@ CRITICAL RULES:
                 if (windowText.includes(term))
                     score += 3;
             }
-            if (windowText.includes('sponsored') || windowText.includes('seeing this ad')) {
+            if (windowText.includes('sponsored') || windowText.includes('seeing this ad') || windowText.includes('displayport to hdmi') || windowText.includes('protection plan')) {
                 score -= 10;
             }
-            if (windowText.includes('buy in store') || windowText.includes('add to cart') || windowText.includes('todays price') || windowText.includes('our price') || windowText.includes('in stock') || windowText.includes('sold by')) {
+            if (windowText.includes('buy in store') || windowText.includes('add to cart') || windowText.includes('buy new') || windowText.includes('todays price') || windowText.includes('our price') || windowText.includes('in stock') || windowText.includes('sold by')) {
                 score += 5;
             }
             if (windowText.includes('refurbished') || windowText.includes('clearance') || windowText.includes('open box')) {
@@ -920,6 +990,10 @@ CRITICAL RULES:
     doesTitleMatchQuery(title, query) {
         if (!title || !query)
             return false;
+        // Enhancement 1: Automatically reject accessory listings
+        if (this.isAccessoryOrIrrelevantTitle(title)) {
+            return false;
+        }
         const lTitle = title.toLowerCase().replace(/[^a-z0-9]+/g, ' ');
         const lQuery = query.toLowerCase().replace(/[^a-z0-9]+/g, ' ');
         // Extract exact GPU/CPU model numbers (e.g. 4080, 4070, 4060, 5090, 7800, 9800, 990, 980)

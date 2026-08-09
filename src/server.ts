@@ -375,7 +375,37 @@ app.get('/api/agent/run', async (req: Request, res: Response) => {
   return handleDatabaseProxyScrape(query.trim(), res);
 });
 
-// 8. Trigger scheduler tick manually
+// 8. Delete watchlist item endpoint
+app.delete('/api/watchlist/:id', async (req: Request, res: Response) => {
+  const { id } = req.params;
+  if (!id) return res.status(400).json({ error: 'Missing ID parameter' });
+
+  try {
+    const { error } = await supabase.from('watchlist_items').delete().eq('id', id);
+    if (error) return res.status(500).json({ error: error.message });
+    console.log(`[DB Success] Deleted watchlist item "${id}" from watchlist_items table`);
+    return res.json({ success: true, deletedId: id });
+  } catch (err: any) {
+    return res.status(500).json({ error: err?.message || 'Failed to delete watchlist item' });
+  }
+});
+
+// 9. Delete hardware component endpoint
+app.delete('/api/components/:id', async (req: Request, res: Response) => {
+  const { id } = req.params;
+  if (!id) return res.status(400).json({ error: 'Missing ID parameter' });
+
+  try {
+    const { error } = await supabase.from('hardware_components').delete().eq('id', id);
+    if (error) return res.status(500).json({ error: error.message });
+    console.log(`[DB Success] Deleted hardware component "${id}" from hardware_components table`);
+    return res.json({ success: true, deletedId: id });
+  } catch (err: any) {
+    return res.status(500).json({ error: err?.message || 'Failed to delete hardware component' });
+  }
+});
+
+// 10. Trigger scheduler tick manually
 app.post('/api/scheduler/run-now', async (_req: Request, res: Response) => {
   res.json({ message: 'Scheduler tick triggered', timestamp: new Date().toISOString() });
   setImmediate(() => runSchedulerTick());
