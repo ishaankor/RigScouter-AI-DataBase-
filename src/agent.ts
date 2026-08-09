@@ -454,10 +454,23 @@ export class TavilyHardwareAgent {
     originalPrice?: number;
     title: string;
     brand?: string;
+    imageUrl?: string;
     inStock: boolean;
     isRefurbished: boolean;
   } | null> {
-    const groqResult = await this.parseWithGroqLLM(text, query, retailer, category);
+    const trimmedSnippet = this.extractTargetedProductSnippet(text, query);
+    
+    // Deterministic Price Tag Pre-Pass (Fallback if LLMs fail due to rate limits)
+    let fallbackPrice: number | null = null;
+    let fallbackIsRefurbished = false;
+    const regexExtract = this.extractPriceWithRegex(trimmedSnippet, retailer);
+    if (regexExtract && this.isPriceSanityValid(regexExtract.price, query, category)) {
+      console.log(`[Deterministic Buy Box Extract] Found exact ${retailer} price tag: $${regexExtract.price}`);
+      fallbackPrice = regexExtract.price;
+      fallbackIsRefurbished = regexExtract.isRefurbished;
+    }
+
+    const groqResult = await this.parseWithGroqLLM(text, query, retailer, category, trimmedSnippet);
     if (groqResult && groqResult.price) {
       return groqResult;
     }
@@ -467,17 +480,28 @@ export class TavilyHardwareAgent {
       return openRouterResult;
     }
 
+    if (fallbackPrice) {
+      console.log(`[LLM Fallback Used] Both LLMs failed or rate-limited. Falling back to deterministic price $${fallbackPrice} for ${retailer}`);
+      return {
+        price: fallbackPrice,
+        title: query,
+        inStock: true,
+        isRefurbished: fallbackIsRefurbished
+      };
+    }
+
     return null;
   }
 
   /**
    * Groq LLM API Price Extractor with automatic multi-model rotation on HTTP 429
    */
-  private async parseWithGroqLLM(text: string, query: string, retailer: string, category: string): Promise<{
+  private async parseWithGroqLLM(text: string, query: string, retailer: string, category: string, trimmedSnippet: string): Promise<{
     price: number | null;
     originalPrice?: number;
     title: string;
     brand?: string;
+    imageUrl?: string;
     inStock: boolean;
     isRefurbished: boolean;
   } | null> {
@@ -497,13 +521,11 @@ export class TavilyHardwareAgent {
 Your mission is to extract the EXACT current sale price from the provided webpage markdown.
 
 CRITICAL RULES:
-1. PRIMARY DISPLAYED PRICE: Extract the EXACT primary Buy Box sale price displayed to customers on screen (e.g. "$365.22" for "Buy Used: $365.22" or main price tag "$365.22").
-2. DO NOT USE GENERIC LIST PRICES / MSRPs: If the webpage displays an active Buy Box price like "$365.22", output 365.22. Do NOT output a generic launch MSRP like $369.99 when a live price tag is displayed.
-3. BUY USED / RENEWED / OPEN BOX: If the primary Buy Box option displays "Buy Used: $365.22" or "Used - Very Good" or "Open Box", set currentPrice = 365.22 and isRefurbished = true.
-4. IGNORE SPONSORED ADS: Ignore top navigation sponsored ads or "Customers also viewed" carousels (e.g. "MSI RTX 3050 $209.97 Sponsored"). Extract price ONLY for the main item featured in the page title.
-5. CLEARANCE & REFURBISHED: On refurbished, clearance, or open-box items, extract the current discounted sale price, NOT the original launch price.
-6. SALE PRICE vs REGULAR MSRP: If a regular price is struck through ($1,299.00) and a sale price is shown ($1,129.28), set currentPrice = 1129.28 and originalPrice = 1299.00.
-7. EXCLUDE ACCESSORIES: DO NOT extract prices for cables, protection plans, warranties, power cords, or mounting brackets. Extract price ONLY for the main PC component (GPU, CPU, SSD, RAM, Motherboard).
+1. PRIMARY DISPLAYED PRICE: Extract the EXACT primary Buy Box sale price displayed to customers on screen.
+2. DO NOT USE GENERIC LIST PRICES: Output the live buy box price, NOT generic MSRPs.
+3. BUY USED / RENEWED: If the primary Buy Box option displays "Buy Used: $365.22" set currentPrice = 365.22 and isRefurbished = true.
+4. IGNORE SPONSORED ADS: Ignore top navigation sponsored ads or "Customers also viewed" carousels. Extract price ONLY for the main item featured in the page title.
+5. EXCLUDE ACCESSORIES: DO NOT extract prices for cables, protection plans, warranties. Extract price ONLY for the main PC component (GPU, CPU, SSD, RAM, Motherboard).
 6. Output strictly in this JSON format:
 {
   "currentPrice": number or null,
@@ -511,17 +533,9 @@ CRITICAL RULES:
   "inStock": boolean,
   "isRefurbished": boolean,
   "cleanTitle": string,
-  "brand": string
+  "brand": string,
+  "imageUrl": string or null
 }`;
-
-    // Smart Buy Box Window Selector: pinpoints exact price block across huge retailer DOMs
-    const trimmedSnippet = this.extractTargetedProductSnippet(text, query);
-
-    // Deterministic Price Tag Pre-Pass
-    const regexExtract = this.extractPriceWithRegex(trimmedSnippet, retailer);
-    if (regexExtract && this.isPriceSanityValid(regexExtract.price, category, query)) {
-      console.log(`[Deterministic Buy Box Extract] Found exact ${retailer} price tag: $${regexExtract.price}`);
-    }
 
     for (const modelName of GROQ_MODELS) {
       try {
@@ -596,8 +610,13 @@ CRITICAL RULES:
         body: JSON.stringify({
           model: 'meta-llama/llama-3.2-3b-instruct:free',
           messages: [
-            { role: 'system', content: 'Extract PC hardware price JSON only.' },
-            { role: 'user', content: `Item: "${query}" (${category})\nRetailer: "${retailer}"\nContent:\n${text.substring(0, 4000)}\n\nReturn JSON: {"currentPrice": number, "originalPrice": number, "inStock": boolean, "cleanTitle": string, "brand": string}` }
+            { role: 'system', content: `You are a high-precision PC hardware price extraction AI. 
+CRITICAL RULES:
+1. PRIMARY DISPLAYED PRICE: Extract EXACT primary Buy Box sale price.
+2. IGNORE SPONSORED ADS: Ignore sponsored ads or "Customers also viewed" carousels. Extract price ONLY for the main item.
+3. EXCLUDE ACCESSORIES: DO NOT extract prices for cables, protection plans, warranties.
+Output strictly JSON: {"currentPrice": number, "originalPrice": number, "inStock": boolean, "cleanTitle": string, "brand": string, "imageUrl": string}` },
+            { role: 'user', content: `Item: "${query}" (${category})\nRetailer: "${retailer}"\nContent:\n${text.substring(0, 14000)}` }
           ],
           temperature: 0.1
         })
@@ -927,7 +946,7 @@ CRITICAL RULES:
    * bypassing 100,000+ characters of site navigation headers and footer ads.
    */
   private extractTargetedProductSnippet(text: string, query: string): string {
-    if (text.length <= 4500) return text;
+    if (text.length <= 14000) return text;
 
     const lowerText = text.toLowerCase();
     const queryTerms = query
@@ -967,17 +986,18 @@ CRITICAL RULES:
     }
 
     if (bestIndex !== -1 && maxMatchScore > 0) {
-      return text.substring(Math.max(0, bestIndex - 600), Math.min(text.length, bestIndex + 3400));
+      // Widen the window to capture title/images but stay within 14k chars for the free API tier
+      return text.substring(Math.max(0, bestIndex - 10000), Math.min(text.length, bestIndex + 4000));
     }
 
     for (const term of queryTerms) {
       const idx = lowerText.indexOf(term);
       if (idx !== -1) {
-        return text.substring(Math.max(0, idx - 200), Math.min(text.length, idx + 3800));
+        return text.substring(Math.max(0, idx - 4000), Math.min(text.length, idx + 10000));
       }
     }
 
-    return text.substring(0, 4500);
+    return text.substring(0, 14000);
   }
 
   /**
