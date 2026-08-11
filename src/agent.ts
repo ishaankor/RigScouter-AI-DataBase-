@@ -525,7 +525,7 @@ CRITICAL RULES:
 2. DO NOT USE GENERIC LIST PRICES: Output the live buy box price, NOT generic MSRPs.
 3. BUY USED / RENEWED: If the primary Buy Box option displays "Buy Used: $365.22" set currentPrice = 365.22 and isRefurbished = true.
 4. IGNORE SPONSORED ADS: Ignore top navigation sponsored ads or "Customers also viewed" carousels. Extract price ONLY for the main item featured in the page title.
-5. EXCLUDE ACCESSORIES: DO NOT extract prices for cables, protection plans, warranties. Extract price ONLY for the main PC component (GPU, CPU, SSD, RAM, Motherboard).
+5. EXCLUDE ACCESSORIES STRICTLY: DO NOT extract prices for waterblocks, backplates, cables, brackets, or warranties. Extract price ONLY for the main PC component (GPU, CPU, SSD, RAM, Motherboard). If the page is primarily an accessory, return null for currentPrice.
 6. Output strictly in this JSON format:
 {
   "currentPrice": number or null,
@@ -614,7 +614,7 @@ CRITICAL RULES:
 CRITICAL RULES:
 1. PRIMARY DISPLAYED PRICE: Extract EXACT primary Buy Box sale price.
 2. IGNORE SPONSORED ADS: Ignore sponsored ads or "Customers also viewed" carousels. Extract price ONLY for the main item.
-3. EXCLUDE ACCESSORIES: DO NOT extract prices for cables, protection plans, warranties.
+3. EXCLUDE ACCESSORIES STRICTLY: DO NOT extract prices for cables, protection plans, warranties, waterblocks, or brackets.
 Output strictly JSON: {"currentPrice": number, "originalPrice": number, "inStock": boolean, "cleanTitle": string, "brand": string, "imageUrl": string}` },
             { role: 'user', content: `Item: "${query}" (${category})\nRetailer: "${retailer}"\nContent:\n${text.substring(0, 14000)}` }
           ],
@@ -887,7 +887,9 @@ Output strictly JSON: {"currentPrice": number, "originalPrice": number, "inStock
       'power cord', 'protection plan', 'extended warranty', 'asurion', 'office equipment protection',
       'mounting bracket', 'anti-sag bracket', 'support bracket',
       'thermal paste', 'computer mouse', 'gaming mouse', 'keyboard',
-      'headset', 'pc case fan', 'vertical mount', 'riser cable', 'sleeve cable'
+      'headset', 'pc case fan', 'vertical mount', 'riser cable', 'sleeve cable',
+      'water block', 'waterblock', 'heatsink', 'cooling pad', 'cooler bracket', 'backplate',
+      'replacement fan', 'mouse pad', 'mousepad', 'wrist rest'
     ];
     return accessoryKeywords.some(kw => lower.includes(kw));
   }
