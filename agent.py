@@ -204,7 +204,7 @@ class TavilyHardwareAgent:
                     "search_depth": "advanced",
                     "include_domains": [domain_pattern],
                     "include_raw_content": False,
-                    "max_results": 3
+                    "max_results": 10
                 }, timeout=15)
                 
                 if not res.ok:
@@ -244,20 +244,12 @@ class TavilyHardwareAgent:
                 # Sort by estimated price (putting float('inf') at the end)
                 valid_hits.sort(key=lambda x: x['est_price'])
                 
-                # Scrape only the single best candidate to save Firecrawl credits
-                best_candidate = valid_hits[0]
-                offer = await self.firecrawl_extract(best_candidate['url'], retailer_name, category, model_query)
-                if offer:
-                    print(f"✅ [CHEAPEST AVAILABLE {retailer_name.upper()} OFFER] \"${offer['price']}\" -> {offer['title'][:60]}")
-                    return offer
-                    
-                # If first candidate fails extraction, try second
-                if len(valid_hits) > 1:
-                    offer = await self.firecrawl_extract(valid_hits[1]['url'], retailer_name, category, model_query)
+                # Loop through all valid hits until we extract a successful, matching offer
+                for candidate in valid_hits:
+                    offer = await self.firecrawl_extract(candidate['url'], retailer_name, category, model_query)
                     if offer:
                         print(f"✅ [CHEAPEST AVAILABLE {retailer_name.upper()} OFFER] \"${offer['price']}\" -> {offer['title'][:60]}")
                         return offer
-                    
                 return None
             except Exception as e:
                 print(f"[Tavily Search Error] {retailer_name}: {e}")
@@ -365,10 +357,11 @@ class TavilyHardwareAgent:
             except Exception as e:
                 print(f"[BS4 Parse Error] {retailer_name}: {e}")
                 
+            if title and model_query and not self.is_title_match(title, model_query, category):
+                print(f"⚠️ [Title Mismatch] {retailer_name}: \"{title}\" does not match query \"{model_query}\" (Skipping Groq)")
+                return None
+                
             if price and self.is_price_sanity_valid(price, model_query or title or url, category):
-                if title and model_query and not self.is_title_match(title, model_query):
-                    print(f"⚠️ [Title Mismatch] {retailer_name}: \"{title}\" does not match query \"{model_query}\"")
-                    return None
                 print(f"✅ [BS4 Hit] {retailer_name}: Found price ${price:.2f}")
                 return {
                     "retailer": retailer_name,
@@ -382,10 +375,10 @@ class TavilyHardwareAgent:
                 }
                 
             print(f"⚠️ [BS4 Miss] {retailer_name}: Could not find price deterministically. Falling back to Groq LLM...")
-            parsed = await self.parse_with_groq(markdown_content[:8000], model_query or url, retailer_name, category)
+            parsed = await self.parse_with_groq(markdown_content[:5000], model_query or url, retailer_name, category)
             if parsed and parsed.get('price') and self.is_price_sanity_valid(parsed['price'], model_query or url, category):
                 parsed_title = parsed.get('title') or title or url
-                if parsed_title and model_query and not self.is_title_match(parsed_title, model_query):
+                if parsed_title and model_query and not self.is_title_match(parsed_title, model_query, category):
                     print(f"⚠️ [Title Mismatch] {retailer_name}: \"{parsed_title}\" does not match query \"{model_query}\"")
                     return None
                 return {
@@ -417,31 +410,37 @@ class TavilyHardwareAgent:
             "CRITICAL: Ignore prices for 'frequently bought together', 'sponsored items', 'related products', or used/refurbished variants if a new one is available."
         )
         
+        import asyncio
         try:
-            res = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "llama-3.1-8b-instant",
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": f"Extract info from this markdown:\n\n{markdown_content}"}
-                    ],
-                    "response_format": {"type": "json_object"},
-                    "temperature": 0
-                },
-                timeout=15
-            )
-            if res.ok:
-                data = res.json()
-                content = data["choices"][0]["message"]["content"]
-                return json.loads(content)
-            else:
-                print(f"[Groq API Error] {res.status_code} - {res.text}")
-                return None
+            for attempt in range(3):
+                res = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {GROQ_API_KEY}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": "llama-3.1-8b-instant",
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": f"Extract info from this markdown:\n\n{markdown_content}"}
+                        ],
+                        "response_format": {"type": "json_object"},
+                        "temperature": 0
+                    },
+                    timeout=15
+                )
+                if res.ok:
+                    data = res.json()
+                    content = data["choices"][0]["message"]["content"]
+                    return json.loads(content)
+                elif res.status_code == 429:
+                    print(f"[Groq 429] Rate limit hit. Waiting 5 seconds before retry...")
+                    await asyncio.sleep(5)
+                else:
+                    print(f"[Groq API Error] {res.status_code} - {res.text}")
+                    return None
+            return None
         except Exception as e:
             print(f"[Groq Request Error] {e}")
             return None
@@ -457,10 +456,18 @@ class TavilyHardwareAgent:
         if 'bhphotovideo.com' in domain_pattern: return '/c/product/' in lower and not '/accessories' in lower
         return True
 
-    def is_title_match(self, title: str, query: str) -> bool:
+    def is_title_match(self, title: str, query: str, category: str) -> bool:
         if not title or not query: return True
         title_lower = title.lower()
         query_lower = query.lower()
+        
+        if category in ['CPU', 'GPU', 'RAM']:
+            system_keywords = ['laptop', 'desktop', 'workstation', 'prebuilt', 'pc']
+            if not any(k in query_lower for k in system_keywords):
+                title_tokens = set(re.findall(r'\b\w+\b', title_lower))
+                if any(k in title_tokens for k in system_keywords):
+                    return False
+                    
         identifiers = re.findall(r'[a-z0-9]*[0-9][a-z0-9]*', query_lower)
         for identifier in identifiers:
             if identifier not in title_lower:
