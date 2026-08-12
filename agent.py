@@ -306,22 +306,39 @@ class TavilyHardwareAgent:
             # Deterministic Extraction Logic
             try:
                 if retailer_name == 'Amazon':
-                    price_whole = soup.select_one('.a-price-whole')
-                    price_fraction = soup.select_one('.a-price-fraction')
-                    if price_whole:
-                        price_str = price_whole.text.replace(',', '').replace('.', '').strip()
-                        frac = price_fraction.text.strip() if price_fraction else "00"
-                        price = float(f"{price_str}.{frac}")
+                    # Main price is usually in specific buy box containers; avoid carousels
+                    price_container = soup.select_one('#corePriceDisplay_desktop_feature_div .a-price') or \
+                                      soup.select_one('#corePrice_feature_div .a-price') or \
+                                      soup.select_one('#corePrice_desktop .a-price')
+                                      
+                    if not price_container:
+                        candidates = [p for p in soup.select('.a-price') if not p.find_parent(class_='a-carousel')]
+                        price_container = candidates[0] if candidates else soup.select_one('.a-price')
+
+                    if price_container:
+                        price_whole = price_container.select_one('.a-price-whole')
+                        price_fraction = price_container.select_one('.a-price-fraction')
+                        if price_whole:
+                            price_str = price_whole.text.replace(',', '').replace('.', '').strip()
+                            frac = price_fraction.text.strip() if price_fraction else "00"
+                            price = float(f"{price_str}.{frac}")
+                            
                     title_elem = soup.select_one('#productTitle')
                     if title_elem: title = title_elem.text.strip()
                     
                 elif retailer_name == 'Newegg':
-                    price_current = soup.select_one('.price-current strong')
-                    price_sup = soup.select_one('.price-current sup')
-                    if price_current:
-                        price_str = price_current.text.replace(',', '').strip()
-                        frac = price_sup.text.strip() if price_sup else ".00"
-                        price = float(f"{price_str}{frac}")
+                    # Avoid picking up related/sponsored items by ignoring .item-container
+                    main_price_candidates = [p for p in soup.select('.price-current') if not p.find_parent(class_='item-container')]
+                    price_container = main_price_candidates[0] if main_price_candidates else soup.select_one('.price-current')
+                    
+                    if price_container:
+                        price_strong = price_container.select_one('strong')
+                        price_sup = price_container.select_one('sup')
+                        if price_strong:
+                            price_str = price_strong.text.replace(',', '').strip()
+                            frac = price_sup.text.strip() if price_sup else ".00"
+                            price = float(f"{price_str}{frac}")
+                            
                     title_elem = soup.select_one('.product-title')
                     if title_elem: title = title_elem.text.strip()
                     
@@ -380,6 +397,46 @@ class TavilyHardwareAgent:
             print(f"[Firecrawl Error] {e}")
             return None
 
+    async def parse_with_groq(self, markdown_content: str, query: str, retailer: str, category: str) -> dict:
+        if not GROQ_API_KEY:
+            print("[Groq API] Key missing.")
+            return None
+            
+        system_prompt = (
+            "You are a strict JSON extractor. Given the markdown of a product page, extract the core product details. "
+            "Return ONLY valid JSON with keys: price (float), title (string), brand (string, nullable), "
+            "inStock (boolean), originalPrice (float, nullable), isRefurbished (boolean). "
+            f"The user was looking for '{query}'. Focus on the main product price."
+        )
+        
+        try:
+            res = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "llama3-8b-8192",
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"Extract info from this markdown:\n\n{markdown_content}"}
+                    ],
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0
+                },
+                timeout=15
+            )
+            if res.ok:
+                data = res.json()
+                content = data["choices"][0]["message"]["content"]
+                return json.loads(content)
+            else:
+                print(f"[Groq API Error] {res.status_code} - {res.text}")
+                return None
+        except Exception as e:
+            print(f"[Groq Request Error] {e}")
+            return None
 
     def is_valid_direct_product_url(self, url: str, domain_pattern: str) -> bool:
         lower = url.lower()
