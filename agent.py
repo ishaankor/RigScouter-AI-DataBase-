@@ -273,11 +273,30 @@ class TavilyHardwareAgent:
         try:
             # Fetch both HTML (for deterministic BS4) and Markdown (for Groq fallback)
             res = firecrawl_app.scrape_url(url, formats=['html', 'markdown'])
-            if not res or not res.get('html'):
+            
+            if not res:
                 return None
                 
-            html_content = res.get('html', '')
-            markdown_content = res.get('markdown', '')
+            html_content = ""
+            markdown_content = ""
+            
+            if hasattr(res, 'get'):
+                html_content = res.get('html', '')
+                markdown_content = res.get('markdown', '')
+            else:
+                markdown_content = getattr(res, 'markdown', '') or getattr(res, 'page_content', '') or getattr(res, 'text', '')
+                html_content = getattr(res, 'html', '')
+                if not html_content and hasattr(res, 'metadata') and isinstance(res.metadata, dict):
+                    html_content = res.metadata.get('html', '')
+                    if not markdown_content:
+                        markdown_content = res.metadata.get('markdown', '')
+
+            # Fallback if html wasn't specifically found
+            if not html_content:
+                html_content = markdown_content
+                
+            if not html_content:
+                return None
             
             soup = BeautifulSoup(html_content, 'lxml')
             price = None
