@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+requests
+supabase
+python-dotenv
+sse-starlette
+beautifulsoup4
+lxml
+firecrawl-py

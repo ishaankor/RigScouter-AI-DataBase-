@@ -1,11 +1,11 @@
 services:
   - type: web
     name: rigscouter-ai-database
-    env: node
+    env: python
     region: oregon
     plan: free
-    buildCommand: npm install && npm run build
-    startCommand: node dist/server.js
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
     autoDeploy: true
     envVars:
       - key: PORT
