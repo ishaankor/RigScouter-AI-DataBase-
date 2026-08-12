@@ -417,7 +417,7 @@ class TavilyHardwareAgent:
                     "Content-Type": "application/json"
                 },
                 json={
-                    "model": "llama3-8b-8192",
+                    "model": "llama-3.1-8b-instant",
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": f"Extract info from this markdown:\n\n{markdown_content}"}

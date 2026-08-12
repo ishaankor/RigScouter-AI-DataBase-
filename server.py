@@ -39,7 +39,7 @@ async def sse_publisher():
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(sse_publisher())
-    asyncio.create_task(scheduler_loop())
+    # asyncio.create_task(scheduler_loop())
 
 def broadcast_sse(event_name: str, data: dict):
     payload = {
