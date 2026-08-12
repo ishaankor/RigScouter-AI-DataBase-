@@ -366,6 +366,9 @@ class TavilyHardwareAgent:
                 print(f"[BS4 Parse Error] {retailer_name}: {e}")
                 
             if price and self.is_price_sanity_valid(price, model_query or title or url, category):
+                if title and model_query and not self.is_title_match(title, model_query):
+                    print(f"⚠️ [Title Mismatch] {retailer_name}: \"{title}\" does not match query \"{model_query}\"")
+                    return None
                 print(f"✅ [BS4 Hit] {retailer_name}: Found price ${price:.2f}")
                 return {
                     "retailer": retailer_name,
@@ -381,6 +384,10 @@ class TavilyHardwareAgent:
             print(f"⚠️ [BS4 Miss] {retailer_name}: Could not find price deterministically. Falling back to Groq LLM...")
             parsed = await self.parse_with_groq(markdown_content[:8000], model_query or url, retailer_name, category)
             if parsed and parsed.get('price') and self.is_price_sanity_valid(parsed['price'], model_query or url, category):
+                parsed_title = parsed.get('title') or title or url
+                if parsed_title and model_query and not self.is_title_match(parsed_title, model_query):
+                    print(f"⚠️ [Title Mismatch] {retailer_name}: \"{parsed_title}\" does not match query \"{model_query}\"")
+                    return None
                 return {
                     "retailer": retailer_name,
                     "price": parsed['price'],
@@ -406,7 +413,8 @@ class TavilyHardwareAgent:
             "You are a strict JSON extractor. Given the markdown of a product page, extract the core product details. "
             "Return ONLY valid JSON with keys: price (float), title (string), brand (string, nullable), "
             "inStock (boolean), originalPrice (float, nullable), isRefurbished (boolean). "
-            f"The user was looking for '{query}'. Focus on the main product price."
+            f"The user was looking for '{query}'. Extract the price of the MAIN NEW product. "
+            "CRITICAL: Ignore prices for 'frequently bought together', 'sponsored items', 'related products', or used/refurbished variants if a new one is available."
         )
         
         try:
@@ -447,6 +455,16 @@ class TavilyHardwareAgent:
         if 'newegg.com' in domain_pattern: return '/p/' in lower and not '/p/pl' in lower
         if 'bestbuy.com' in domain_pattern: return '/site/' in lower and '.p?' in lower
         if 'bhphotovideo.com' in domain_pattern: return '/c/product/' in lower and not '/accessories' in lower
+        return True
+
+    def is_title_match(self, title: str, query: str) -> bool:
+        if not title or not query: return True
+        title_lower = title.lower()
+        query_lower = query.lower()
+        identifiers = re.findall(r'[a-z0-9]*[0-9][a-z0-9]*', query_lower)
+        for identifier in identifiers:
+            if identifier not in title_lower:
+                return False
         return True
 
     def is_price_sanity_valid(self, price: float, query: str, category: str) -> bool:
