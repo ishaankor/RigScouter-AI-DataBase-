@@ -220,6 +220,11 @@ class TavilyHardwareAgent:
                         
                     clean_url = full_url.replace('/reviews/', '').split('?')[0]
                     content = hit.get('content', '')
+                    title = hit.get('title', '')
+                    
+                    # Pre-filter using Tavily's returned title to save Firecrawl credits
+                    if title and not self.is_title_match(title, model_query, category):
+                        continue
                     
                     # Estimate price from snippet
                     prices = re.findall(r'\$[0-9,]+(?:\.[0-9]{2})?', content)
