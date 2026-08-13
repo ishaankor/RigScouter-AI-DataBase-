@@ -540,37 +540,47 @@ class TavilyHardwareAgent:
         
         user_prompt = f"User searched for: '{query}' (Category: {category})\nProduct Title Found: '{title}'\nDoes this title represent the standalone product being searched for?"
         
-        try:
-            import json
-            import requests
-            res = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "llama-3.1-8b-instant",
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    "response_format": {"type": "json_object"},
-                    "temperature": 0
-                },
-                timeout=5
-            )
-            if res.ok:
-                data = res.json()
-                content = data["choices"][0]["message"]["content"]
-                parsed = json.loads(content)
-                return parsed.get('is_match', False)
-            else:
-                print(f"[Groq Title Match Error]: {res.text}")
+        import asyncio
+        import json
+        import requests
+        
+        for attempt in range(3):
+            try:
+                res = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {GROQ_API_KEY}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": "llama-3.1-8b-instant",
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt}
+                        ],
+                        "response_format": {"type": "json_object"},
+                        "temperature": 0
+                    },
+                    timeout=5
+                )
+                if res.ok:
+                    data = res.json()
+                    content = data["choices"][0]["message"]["content"]
+                    parsed = json.loads(content)
+                    return parsed.get('is_match', False)
+                elif res.status_code == 429:
+                    print(f"[Groq Title Match 429] Rate limit hit. Waiting 5s...")
+                    await asyncio.sleep(5)
+                    continue
+                else:
+                    print(f"[Groq Title Match Error]: {res.text}")
+                    return True
+            except Exception as e:
+                print(f"[Groq Title Match Error]: {e}")
+                if "rate limit" in str(e).lower() or "429" in str(e):
+                    await asyncio.sleep(5)
+                    continue
                 return True
-        except Exception as e:
-            print(f"[Groq Title Match Error]: {e}")
-            return True 
         return True
 
     def is_price_sanity_valid(self, price: float, query: str, category: str) -> bool:
