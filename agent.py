@@ -325,14 +325,22 @@ class TavilyHardwareAgent:
             # Deterministic Extraction Logic
             try:
                 if retailer_name == 'Amazon':
-                    # Main price is usually in specific buy box containers; avoid carousels
+                    # Check for bot/captcha
+                    if 'robot check' in soup.text.lower() or 'enter the characters you see below' in soup.text.lower():
+                        print(f"⚠️ [Blocked] Amazon: Encountered CAPTCHA/Bot Check page.")
+                        return None
+                        
+                    # Check for out of stock first
+                    availability_elem = soup.select_one('#availability')
+                    if availability_elem and ('currently unavailable' in availability_elem.text.lower() or 'out of stock' in availability_elem.text.lower()):
+                        print(f"⚠️ [Out of Stock] Amazon: Item is marked unavailable in BS4.")
+                        return None
+                        
+                    # Main price is usually in specific buy box containers
                     price_container = soup.select_one('#corePriceDisplay_desktop_feature_div .a-price') or \
                                       soup.select_one('#corePrice_feature_div .a-price') or \
-                                      soup.select_one('#corePrice_desktop .a-price')
-                                      
-                    if not price_container:
-                        candidates = [p for p in soup.select('.a-price') if not p.find_parent(class_='a-carousel')]
-                        price_container = candidates[0] if candidates else soup.select_one('.a-price')
+                                      soup.select_one('#corePrice_desktop .a-price') or \
+                                      soup.select_one('#apex_desktop .a-price')
 
                     if price_container:
                         price_whole = price_container.select_one('.a-price-whole')
@@ -467,12 +475,14 @@ class TavilyHardwareAgent:
             
         system_prompt = (
             "You are a strict JSON extractor. Given the markdown of a product page, extract the core product details. "
-            "Return ONLY valid JSON with keys: price (float), title (string), brand (string, nullable), "
+            "Return ONLY valid JSON with keys: price (float, nullable), title (string), brand (string, nullable), "
             "inStock (boolean), originalPrice (float, nullable), isRefurbished (boolean). "
             f"The user was looking for '{query}'. Extract the price of the MAIN product. "
-            "CRITICAL: Ignore prices for 'frequently bought together', 'sponsored items', or 'related products'. "
-            "If the retailer is eBay, reject any listing that implies the item is broken, 'For Parts', 'Not Working', 'Box Only', or 'As Is' (return price: null). "
-            "If the item is listed as Used or Refurbished, set isRefurbished to true."
+            "CRITICAL RULES:\n"
+            "1. Ignore prices for 'frequently bought together', 'sponsored items', or 'related products'.\n"
+            "2. If the text says 'Currently unavailable', 'Out of stock', or 'We don't know when or if this item will be back in stock', you MUST set inStock to false and price to null.\n"
+            "3. If the retailer is eBay, reject any listing that implies the item is broken, 'For Parts', 'Not Working', 'Box Only', or 'As Is' (set price to null).\n"
+            "4. If the item is listed as Used or Refurbished, set isRefurbished to true."
         )
         
         import asyncio
