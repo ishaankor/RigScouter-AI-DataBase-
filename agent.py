@@ -486,7 +486,7 @@ class TavilyHardwareAgent:
         if 'microcenter.com' in domain_pattern: return '/product/' in lower
         if 'amazon.com' in domain_pattern: return '/dp/' in lower or '/gp/product/' in lower
         if 'newegg.com' in domain_pattern: return '/p/' in lower and not '/p/pl' in lower
-        if 'bestbuy.com' in domain_pattern: return '/site/' in lower and '.p?' in lower
+        if 'bestbuy.com' in domain_pattern: return '/site/' in lower and '.p' in lower
         if 'bhphotovideo.com' in domain_pattern: return '/c/product/' in lower and not '/accessories' in lower
         if 'ebay.com' in domain_pattern: return '/itm/' in lower
         return True
