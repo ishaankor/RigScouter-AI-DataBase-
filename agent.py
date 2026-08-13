@@ -497,9 +497,47 @@ class TavilyHardwareAgent:
     def detect_category(self, text: str) -> str:
         lower = text.lower()
         if any(x in lower for x in ['rtx', 'gtx', 'radeon', 'rx', 'gpu']): return 'GPU'
-        if any(x in lower for x in ['ryzen', 'core', 'cpu']): return 'CPU'
-        if any(x in lower for x in ['ram', 'ddr']): return 'RAM'
-        return 'Hardware'
+        if any(x in lower for x in ['ryzen', 'core', 'cpu', 'threadripper', 'epyc', 'intel core', 'amd ryzen']): return 'CPU'
+        if any(x in lower for x in ['ram', 'ddr4', 'ddr5', 'memory']): return 'RAM'
+        if any(x in lower for x in ['motherboard', 'mobo', 'z790', 'b650', 'x670', 'z690', 'b550']): return 'Motherboard'
+        if any(x in lower for x in ['ssd', 'nvme', 'hdd', 'storage', 'samsung 9', 'wd black']): return 'Storage'
+        if any(x in lower for x in ['psu', 'power supply', 'corsair rm']): return 'Power Supply'
+        if any(x in lower for x in ['cooler', 'aio', 'heatsink', 'noctua']): return 'Cooling'
+        
+        if not GROQ_API_KEY:
+            return 'Not compatible (N/A)'
+            
+        system_prompt = (
+            "Classify the following query into ONE of these strict categories: "
+            "GPU, CPU, RAM, Motherboard, Storage, Power Supply, Case, Cooling. "
+            "If it is NOT a PC computer component (e.g. phones, consoles, cars, laptops, random items), return EXACTLY: Not compatible (N/A)"
+        )
+        try:
+            res = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                json={
+                    "model": "llama-3.1-8b-instant",
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"Query: {text}"}
+                    ],
+                    "temperature": 0
+                },
+                timeout=5
+            )
+            if res.ok:
+                category = res.json()["choices"][0]["message"]["content"].strip()
+                valid_categories = ['GPU', 'CPU', 'RAM', 'Motherboard', 'Storage', 'Power Supply', 'Case', 'Cooling']
+                if category in valid_categories:
+                    return category
+                for vc in valid_categories:
+                    if vc.lower() in category.lower():
+                        return vc
+        except Exception:
+            pass
+            
+        return 'Not compatible (N/A)'
 
     def normalize_model(self, text: str, fallback: str) -> str:
         lower = text.lower()
