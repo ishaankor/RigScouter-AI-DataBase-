@@ -12,14 +12,15 @@ from supabase_client import supabase
 
 TAVILY_API_KEYS = [k.strip() for k in os.environ.get("TAVILY_API_KEYS", os.environ.get("TAVILY_API_KEY", "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")).split(',') if k.strip()]
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-FIRECRAWL_API_KEY = os.environ.get("FIRECRAWL_API_KEY", "")
+FIRECRAWL_API_KEYS = [k.strip() for k in os.environ.get("FIRECRAWL_API_KEYS", os.environ.get("FIRECRAWL_API_KEY", "")).split(',') if k.strip()]
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
-firecrawl_app = FirecrawlApp(api_key=FIRECRAWL_API_KEY) if FIRECRAWL_API_KEY else None
+firecrawl_apps = [FirecrawlApp(api_key=key) for key in FIRECRAWL_API_KEYS] if FIRECRAWL_API_KEYS else []
 
 class TavilyHardwareAgent:
     def __init__(self):
         self.current_key_index = 0
+        self.current_firecrawl_index = 0
 
     def get_tavily_key(self):
         return TAVILY_API_KEYS[self.current_key_index % len(TAVILY_API_KEYS)]
@@ -28,6 +29,16 @@ class TavilyHardwareAgent:
         if len(TAVILY_API_KEYS) > 1:
             self.current_key_index = (self.current_key_index + 1) % len(TAVILY_API_KEYS)
             print(f"[Tavily Key Rotated] Active key index: {self.current_key_index + 1}/{len(TAVILY_API_KEYS)}")
+
+    def get_firecrawl_app(self):
+        if not firecrawl_apps:
+            return None
+        return firecrawl_apps[self.current_firecrawl_index % len(firecrawl_apps)]
+
+    def rotate_firecrawl_key(self):
+        if len(firecrawl_apps) > 1:
+            self.current_firecrawl_index = (self.current_firecrawl_index + 1) % len(firecrawl_apps)
+            print(f"[Firecrawl Key Rotated] Active key index: {self.current_firecrawl_index + 1}/{len(firecrawl_apps)}")
 
     async def run(self, prompt: str, emit_fn=None) -> dict:
         clean_prompt = prompt.strip()
@@ -262,14 +273,24 @@ class TavilyHardwareAgent:
         return None
 
     async def firecrawl_extract(self, url: str, retailer_name: str, category: str, model_query: str = None) -> dict:
-        if not firecrawl_app:
+        app = self.get_firecrawl_app()
+        if not app:
             print("[Firecrawl] API key missing")
             return None
             
         print(f"[Firecrawl] Extracting {url} ...")
         try:
-            # Fetch both HTML (for deterministic BS4) and Markdown (for Groq fallback)
-            res = firecrawl_app.scrape_url(url, formats=['html', 'markdown'])
+            try:
+                res = app.scrape_url(url, formats=['html', 'markdown'])
+            except Exception as e:
+                if "Payment" in str(e) or "credits" in str(e) or "401" in str(e) or "402" in str(e):
+                    print(f"[Firecrawl Error] Credit limit reached: {e}")
+                    self.rotate_firecrawl_key()
+                    app = self.get_firecrawl_app()
+                    print(f"[Firecrawl] Retrying {url} with new key ...")
+                    res = app.scrape_url(url, formats=['html', 'markdown'])
+                else:
+                    raise e
             
             if not res:
                 return None
