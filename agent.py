@@ -83,7 +83,8 @@ class TavilyHardwareAgent:
                 {'name': 'Newegg', 'domain': 'newegg.com'},
                 {'name': 'Amazon', 'domain': 'amazon.com'},
                 {'name': 'Best Buy', 'domain': 'bestbuy.com'},
-                {'name': 'B&H', 'domain': 'bhphotovideo.com'}
+                {'name': 'B&H', 'domain': 'bhphotovideo.com'},
+                {'name': 'eBay', 'domain': 'ebay.com'}
             ]
 
             for r in RETAILERS:
@@ -407,6 +408,11 @@ class TavilyHardwareAgent:
                 if parsed_title and model_query and not self.is_title_match(parsed_title, model_query, category):
                     print(f"⚠️ [Title Mismatch] {retailer_name}: \"{parsed_title}\" does not match query \"{model_query}\"")
                     return None
+                    
+                if parsed.get('inStock') is False:
+                    print(f"⚠️ [Out of Stock] {retailer_name}: Item is out of stock (Groq fallback), skipping.")
+                    return None
+                    
                 return {
                     "retailer": retailer_name,
                     "price": parsed['price'],
@@ -432,8 +438,10 @@ class TavilyHardwareAgent:
             "You are a strict JSON extractor. Given the markdown of a product page, extract the core product details. "
             "Return ONLY valid JSON with keys: price (float), title (string), brand (string, nullable), "
             "inStock (boolean), originalPrice (float, nullable), isRefurbished (boolean). "
-            f"The user was looking for '{query}'. Extract the price of the MAIN NEW product. "
-            "CRITICAL: Ignore prices for 'frequently bought together', 'sponsored items', 'related products', or used/refurbished variants if a new one is available."
+            f"The user was looking for '{query}'. Extract the price of the MAIN product. "
+            "CRITICAL: Ignore prices for 'frequently bought together', 'sponsored items', or 'related products'. "
+            "If the retailer is eBay, reject any listing that implies the item is broken, 'For Parts', 'Not Working', 'Box Only', or 'As Is' (return price: null). "
+            "If the item is listed as Used or Refurbished, set isRefurbished to true."
         )
         
         import asyncio
@@ -480,6 +488,7 @@ class TavilyHardwareAgent:
         if 'newegg.com' in domain_pattern: return '/p/' in lower and not '/p/pl' in lower
         if 'bestbuy.com' in domain_pattern: return '/site/' in lower and '.p?' in lower
         if 'bhphotovideo.com' in domain_pattern: return '/c/product/' in lower and not '/accessories' in lower
+        if 'ebay.com' in domain_pattern: return '/itm/' in lower
         return True
 
     def is_title_match(self, title: str, query: str, category: str) -> bool:
@@ -487,6 +496,9 @@ class TavilyHardwareAgent:
         title_lower = title.lower()
         query_lower = query.lower()
         
+        if 'for parts' in title_lower or 'as is' in title_lower or 'read description' in title_lower or 'broken' in title_lower or 'box only' in title_lower:
+            return False
+            
         if category in ['CPU', 'GPU', 'RAM']:
             system_keywords = ['laptop', 'desktop', 'workstation', 'prebuilt', 'pc']
             if not any(k in query_lower for k in system_keywords):
@@ -513,6 +525,7 @@ class TavilyHardwareAgent:
         if 'newegg' in lower: return 'Newegg'
         if 'bestbuy' in lower: return 'Best Buy'
         if 'bhphotovideo' in lower: return 'B&H'
+        if 'ebay' in lower: return 'eBay'
         return 'Amazon'
 
     def detect_category(self, text: str) -> str:
