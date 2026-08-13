@@ -235,7 +235,7 @@ class TavilyHardwareAgent:
                     title = hit.get('title', '')
                     
                     # Pre-filter using Tavily's returned title to save Firecrawl credits
-                    if title and not self.is_title_match(title, model_query, category):
+                    if title and not await self.is_title_match(title, model_query, category):
                         continue
                     
                     # Estimate price from snippet
@@ -415,7 +415,7 @@ class TavilyHardwareAgent:
             except Exception as e:
                 print(f"[BS4 Parse Error] {retailer_name}: {e}")
                 
-            if title and model_query and not self.is_title_match(title, model_query, category):
+            if title and model_query and not await self.is_title_match(title, model_query, category):
                 print(f"⚠️ [Title Mismatch] {retailer_name}: \"{title}\" does not match query \"{model_query}\" (Skipping Groq)")
                 return None
                 
@@ -436,7 +436,7 @@ class TavilyHardwareAgent:
             parsed = await self.parse_with_groq(markdown_content[:5000], model_query or url, retailer_name, category)
             if parsed and parsed.get('price') and self.is_price_sanity_valid(parsed['price'], model_query or url, category):
                 parsed_title = parsed.get('title') or title or url
-                if parsed_title and model_query and not self.is_title_match(parsed_title, model_query, category):
+                if parsed_title and model_query and not await self.is_title_match(parsed_title, model_query, category):
                     print(f"⚠️ [Title Mismatch] {retailer_name}: \"{parsed_title}\" does not match query \"{model_query}\"")
                     return None
                     
@@ -523,25 +523,54 @@ class TavilyHardwareAgent:
         if 'ebay.com' in domain_pattern: return '/itm/' in lower
         return True
 
-    def is_title_match(self, title: str, query: str, category: str) -> bool:
+    async def is_title_match(self, title: str, query: str, category: str) -> bool:
         if not title or not query: return True
-        title_lower = title.lower()
-        query_lower = query.lower()
         
-        if 'for parts' in title_lower or 'as is' in title_lower or 'read description' in title_lower or 'broken' in title_lower or 'box only' in title_lower:
-            return False
-            
-        if category in ['CPU', 'GPU', 'RAM']:
-            system_keywords = ['laptop', 'desktop', 'workstation', 'prebuilt', 'pc']
-            if not any(k in query_lower for k in system_keywords):
-                title_tokens = set(re.findall(r'\b\w+\b', title_lower))
-                if any(k in title_tokens for k in system_keywords):
-                    return False
-                    
-        identifiers = re.findall(r'[a-z0-9]*[0-9][a-z0-9]*', query_lower)
-        for identifier in identifiers:
-            if identifier not in title_lower:
-                return False
+        system_prompt = (
+            "You are a strict product matching assistant. The user wants to buy a specific computer part or electronic. "
+            "Your job is to determine if the product title matches the requested item. "
+            "Return ONLY a JSON object with a single boolean key: 'is_match'. "
+            "Rules:\n"
+            "1. If the user asks for a part (like a CPU or GPU), reject fully pre-built computers/laptops/systems that just contain the part.\n"
+            "2. Reject products listed as 'for parts', 'broken', 'box only', or 'read description'.\n"
+            "3. Reject accessories, waterblocks, or unrelated items.\n"
+            "4. Minor marketing additions (like 'Desktop Processor', 'Gaming OC') are fine if it's the core product.\n"
+            "5. The product must be the EXACT model requested."
+        )
+        
+        user_prompt = f"User searched for: '{query}' (Category: {category})\nProduct Title Found: '{title}'\nDoes this title represent the standalone product being searched for?"
+        
+        try:
+            import json
+            import requests
+            res = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "llama-3.1-8b-instant",
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0
+                },
+                timeout=5
+            )
+            if res.ok:
+                data = res.json()
+                content = data["choices"][0]["message"]["content"]
+                parsed = json.loads(content)
+                return parsed.get('is_match', False)
+            else:
+                print(f"[Groq Title Match Error]: {res.text}")
+                return True
+        except Exception as e:
+            print(f"[Groq Title Match Error]: {e}")
+            return True 
         return True
 
     def is_price_sanity_valid(self, price: float, query: str, category: str) -> bool:
