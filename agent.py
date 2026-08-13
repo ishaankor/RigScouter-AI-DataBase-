@@ -369,10 +369,41 @@ class TavilyHardwareAgent:
                     if title_elem: title = title_elem.text.strip()
                     
                 elif retailer_name == 'Best Buy':
-                    price_elem = soup.select_one('.priceView-customer-price span[aria-hidden="true"]')
-                    if price_elem:
-                        price = float(price_elem.text.replace('$', '').replace(',', '').strip())
-                    title_elem = soup.select_one('.sku-title h1')
+                    # 1. Try JSON-LD first for highly accurate pricing
+                    for script in soup.find_all('script', type='application/ld+json'):
+                        if not script.string: continue
+                        try:
+                            data = __import__('json').loads(script.string)
+                            items = data if isinstance(data, list) else [data]
+                            for item in items:
+                                if item.get('@type') == 'Product' and 'offers' in item:
+                                    offers = item['offers']
+                                    if isinstance(offers, dict) and 'price' in offers:
+                                        price = float(offers['price'])
+                                        break
+                                    elif isinstance(offers, list) and len(offers) > 0 and 'price' in offers[0]:
+                                        price = float(offers[0]['price'])
+                                        break
+                            if price: break
+                        except: pass
+                    
+                    # 2. Fallback to expanded CSS selectors
+                    if not price:
+                        price_candidates = soup.select(
+                            '.priceView-customer-price span[aria-hidden="true"], '
+                            '.priceView-hero-price span[aria-hidden="true"], '
+                            'div[data-testid="customer-price"] span[aria-hidden="true"], '
+                            '.pricing-price span'
+                        )
+                        for p in price_candidates:
+                            text = p.text.replace('$', '').replace(',', '').strip()
+                            try:
+                                if text: 
+                                    price = float(text)
+                                    break
+                            except ValueError: continue
+                            
+                    title_elem = soup.select_one('.sku-title h1, h1[class*="product-title"], h1.heading-5')
                     if title_elem: title = title_elem.text.strip()
                     
                 elif retailer_name == 'B&H':
@@ -481,12 +512,13 @@ class TavilyHardwareAgent:
 
     def is_valid_direct_product_url(self, url: str, domain_pattern: str) -> bool:
         lower = url.lower()
-        if any(x in lower for x in ['/reviews/', '/forum/', '/blog/', 'searchpage.jsp', '/s?k=', '/p/pl']):
+        if any(x in lower for x in ['/reviews/', 'reviews', 'questions', '/forum/', '/blog/', 'searchpage.jsp', '/s?k=', '/p/pl']):
             return False
+            
         if 'microcenter.com' in domain_pattern: return '/product/' in lower
         if 'amazon.com' in domain_pattern: return '/dp/' in lower or '/gp/product/' in lower
         if 'newegg.com' in domain_pattern: return '/p/' in lower and not '/p/pl' in lower
-        if 'bestbuy.com' in domain_pattern: return '/site/' in lower and '.p' in lower
+        if 'bestbuy.com' in domain_pattern: return ('/site/' in lower and '.p' in lower) or '/product/' in lower
         if 'bhphotovideo.com' in domain_pattern: return '/c/product/' in lower and not '/accessories' in lower
         if 'ebay.com' in domain_pattern: return '/itm/' in lower
         return True
