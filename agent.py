@@ -40,10 +40,50 @@ class TavilyHardwareAgent:
             self.current_firecrawl_index = (self.current_firecrawl_index + 1) % len(firecrawl_apps)
             print(f"[Firecrawl Key Rotated] Active key index: {self.current_firecrawl_index + 1}/{len(firecrawl_apps)}")
 
+    async def normalize_query_with_groq(self, query: str) -> str:
+        if not GROQ_API_KEY:
+            return query
+            
+        system_prompt = (
+            "You are an AI that extracts the core, canonical hardware model from messy, SEO-stuffed product titles. "
+            "Strip all marketing fluff (e.g., 'Quad-Core', 'White Edition', 'Graphics Card', 'Processor', 'Desktop'). "
+            "Return ONLY the clean model name. "
+            "Example input: 'ASUS ROG Strix GeForce RTX 4090 OC Edition 24GB GDDR6X' -> Output: 'RTX 4090'. "
+            "Example input: 'Intel Core i9-14900K 3.2 GHz 24-Core LGA 1700' -> Output: 'i9-14900K'. "
+            "Example input: 'AMD Ryzen 9 9950X 16-Core, 32-Thread Unlocked Desktop Processor' -> Output: 'Ryzen 9 9950X'."
+        )
+        
+        try:
+            res = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                json={
+                    "model": "llama-3.1-8b-instant",
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"Title: {query}"}
+                    ],
+                    "temperature": 0
+                },
+                timeout=10
+            )
+            if res.ok:
+                normalized = res.json()["choices"][0]["message"]["content"].strip()
+                return normalized
+        except Exception as e:
+            print(f"[Groq Normalizer Error] {e}")
+            
+        return query
+
     async def run(self, prompt: str, emit_fn=None) -> dict:
         clean_prompt = prompt.strip()
         is_url = clean_prompt.startswith('http://') or clean_prompt.startswith('https://')
         category = self.detect_category(clean_prompt)
+        
+        if not is_url:
+            print(f"[AI Normalizer] Normalizing query: '{clean_prompt}'")
+            clean_prompt = await self.normalize_query_with_groq(clean_prompt)
+            print(f"[AI Normalizer] Result: '{clean_prompt}'")
 
         print(f"\n======================================================")
         print(f"[Hybrid Python Agent] Extracting price for: \"{clean_prompt}\" ({category})")
@@ -87,6 +127,7 @@ class TavilyHardwareAgent:
                 {'name': 'eBay', 'domain': 'ebay.com'}
             ]
 
+            # Launch sequential scraping jobs to avoid hitting Tavily/Firecrawl concurrency limits
             for r in RETAILERS:
                 offer = await self.scrape_retailer_accurate_offer(clean_prompt, r['name'], r['domain'], category)
                 if offer and offer.get('price', 0) > 0:
@@ -102,7 +143,7 @@ class TavilyHardwareAgent:
                             "isRefurbished": offer.get('isRefurbished', False),
                             "timestamp": datetime.now(timezone.utc).isoformat()
                         })
-                time.sleep(1)  # Rate limiting
+                await asyncio.sleep(1.0)  # Rate limiting
 
         # Sort all scraped retailer offers: Available (inStock) items first, then lowest price
         def sort_offers(offer):
@@ -361,6 +402,12 @@ class TavilyHardwareAgent:
                     title_elem = soup.select_one('#productTitle')
                     if title_elem: title = title_elem.text.strip()
                     
+                    # Reject out of stock items explicitly
+                    availability_elem = soup.select_one('#availability')
+                    if availability_elem and ('currently unavailable' in availability_elem.text.lower() or 'out of stock' in availability_elem.text.lower()):
+                        print(f"⚠️ [Out of Stock] Amazon: Currently unavailable.")
+                        return None
+                    
                 elif retailer_name == 'Newegg':
                     # Avoid picking up related/sponsored items by ignoring .item-container
                     main_price_candidates = [p for p in soup.select('.price-current') if not p.find_parent(class_='item-container')]
@@ -376,6 +423,12 @@ class TavilyHardwareAgent:
                             
                     title_elem = soup.select_one('.product-title')
                     if title_elem: title = title_elem.text.strip()
+                    
+                    # Reject out of stock items explicitly
+                    inventory_elem = soup.select_one('.product-inventory')
+                    if inventory_elem and 'out of stock' in inventory_elem.text.lower():
+                        print(f"⚠️ [Out of Stock] Newegg: Out of stock.")
+                        return None
                     
                     
                 elif retailer_name == 'Best Buy':
@@ -417,12 +470,24 @@ class TavilyHardwareAgent:
                     title_elem = soup.select_one('.sku-title h1, h1[class*="product-title"], h1.heading-5, h1[class*="text-5"]')
                     if title_elem: title = title_elem.text.strip()
                     
+                    # Reject out of stock items explicitly
+                    add_to_cart_btn = soup.select_one('.add-to-cart-button, button[data-button-state]')
+                    if add_to_cart_btn and ('sold_out' in add_to_cart_btn.get('data-button-state', '').lower() or 'sold out' in add_to_cart_btn.text.lower()):
+                        print(f"⚠️ [Out of Stock] Best Buy: Sold out.")
+                        return None
+                    
                 elif retailer_name == 'B&H':
                     price_elem = soup.select_one('[data-selenium="pricingPrice"]')
                     if price_elem:
                         price = float(price_elem.text.replace('$', '').replace(',', '').strip())
                     title_elem = soup.select_one('[data-selenium="productTitle"]')
                     if title_elem: title = title_elem.text.strip()
+                    
+                    # Reject out of stock / no longer available explicitly
+                    availability_elem = soup.select_one('.shippingAvail_yL7x0I4P, [data-selenium="stockStatus"]')
+                    if availability_elem and ('no longer available' in availability_elem.text.lower() or 'discontinued' in availability_elem.text.lower()):
+                        print(f"⚠️ [Out of Stock] B&H: No longer available.")
+                        return None
                     
                 elif retailer_name == 'eBay':
                     # Extract main price from eBay buy box
@@ -436,6 +501,12 @@ class TavilyHardwareAgent:
                     # Extract title
                     title_elem = soup.select_one('.x-item-title__mainTitle span.ux-textspans') or soup.select_one('.x-item-title__mainTitle')
                     if title_elem: title = title_elem.text.strip()
+                    
+                    # Reject ended/out of stock items explicitly
+                    ended_msg = soup.select_one('.x-ended-item-msg, .msg-error, .ux-notice')
+                    if ended_msg and ('ended' in ended_msg.text.lower() or 'out of stock' in ended_msg.text.lower()):
+                        print(f"⚠️ [Out of Stock] eBay: Listing ended or out of stock.")
+                        return None
                     
                     # Extract condition (Used vs New) to set is_refurbished roughly
                     condition_elem = soup.select_one('.x-item-condition-text span.ux-textspans') or soup.select_one('.x-item-condition-text')
@@ -467,9 +538,11 @@ class TavilyHardwareAgent:
                         title = title_elem.text.strip()
                         
                     # Check stock status
-                    inventory_elem = soup.select_one('.inventoryCnt')
-                    if inventory_elem and 'sold out' in inventory_elem.text.lower():
-                        in_stock = False
+                    inventory_elem = soup.select_one('.inventoryCnt, .out-of-stock, .unavailable')
+                    inventory_text = inventory_elem.text.lower() if inventory_elem else soup.get_text().lower()
+                    if 'sold out' in inventory_text or 'no longer carried' in inventory_text or 'not available' in inventory_text:
+                        print(f"⚠️ [Out of Stock] Micro Center: Sold out or no longer carried.")
+                        return None
             except Exception as e:
                 print(f"[BS4 Parse Error] {retailer_name}: {e}")
                 
@@ -490,29 +563,7 @@ class TavilyHardwareAgent:
                     "isRefurbished": is_refurbished
                 }
                 
-            print(f"⚠️ [BS4 Miss] {retailer_name}: Could not find price deterministically. Falling back to Groq LLM...")
-            parsed = await self.parse_with_groq(markdown_content[:5000], model_query or url, retailer_name, category)
-            if parsed and parsed.get('price') and self.is_price_sanity_valid(parsed['price'], model_query or url, category):
-                parsed_title = parsed.get('title') or title or url
-                if parsed_title and model_query and not await self.is_title_match(parsed_title, model_query, category):
-                    print(f"⚠️ [Title Mismatch] {retailer_name}: \"{parsed_title}\" does not match query \"{model_query}\"")
-                    return None
-                    
-                if parsed.get('inStock') is False:
-                    print(f"⚠️ [Out of Stock] {retailer_name}: Item is out of stock (Groq fallback), skipping.")
-                    return None
-                    
-                return {
-                    "retailer": retailer_name,
-                    "price": parsed['price'],
-                    "originalPrice": parsed.get('originalPrice'),
-                    "title": parsed.get('title') or model_query or url,
-                    "brand": parsed.get('brand'),
-                    "url": url,
-                    "inStock": parsed.get('inStock', True),
-                    "isRefurbished": parsed.get('isRefurbished', False),
-                }
-                
+            print(f"⚠️ [BS4 Miss] {retailer_name}: Could not find price deterministically. Dropping to prevent hallucinations.")
             return None
         except Exception as e:
             print(f"[Firecrawl Error] {e}")
