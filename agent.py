@@ -133,6 +133,41 @@ class TavilyHardwareAgent:
                 offer = await self.scrape_retailer_accurate_offer(clean_prompt, r['name'], r['domain'], category)
                 if offer and offer.get('price', 0) > 0:
                     state["scrapedOffers"].append(offer)
+                    
+                    try:
+                        offer_model_group = self.normalize_model(offer['title'], clean_prompt)
+                        offer_component_id = f"comp-{re.sub(r'[^a-z0-9]+', '-', offer_model_group.lower())}-{re.sub(r'[^a-z0-9]+', '-', offer['retailer'].lower())}"
+
+                        offer_msrp = offer.get('originalPrice') if offer.get('originalPrice') and offer.get('originalPrice') > offer['price'] else offer['price']
+                        offer_deal_score = min(100, max(50, round(50 + ((offer_msrp - offer['price']) / offer_msrp) * 100))) if offer_msrp > offer['price'] else 50
+
+                        supabase.table('hardware_components').upsert({
+                            "id": offer_component_id,
+                            "name": offer['title'],
+                            "category": category,
+                            "brand": offer.get('brand') or offer['title'].split(' ')[0] or 'Hardware',
+                            "model": offer_model_group,
+                            "specs": json.dumps({
+                                "AgentSummary": "Live Scraping...",
+                                "InStock": offer['inStock'],
+                                "IsRefurbished": offer.get('isRefurbished', False),
+                                "OriginalPrice": offer.get('originalPrice'),
+                                "ScrapedAt": datetime.now(timezone.utc).isoformat()
+                            }),
+                            "msrp": offer_msrp,
+                            "current_price": offer['price'],
+                            "lowest_price_90d": offer['price'],
+                            "retailer": offer['retailer'],
+                            "product_url": offer['url'],
+                            "image_url": offer.get('imageUrl', 'https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=600&q=80'),
+                            "rating": offer.get('rating'),
+                            "deal_score": offer_deal_score,
+                            "updated_at": datetime.now(timezone.utc).isoformat()
+                        }).execute()
+                        print(f"[DB Persist Success] Saved \"{offer['retailer']}\" offer: \"{offer['title']}\" (${offer['price']:.2f}) to hardware_components")
+                    except Exception as e:
+                        print(f"[Agent Incremental Persistence Error]: {e}")
+                        
                     if emit_fn:
                         emit_fn('retailer_found', {
                             "query": clean_prompt,
@@ -190,43 +225,7 @@ class TavilyHardwareAgent:
                     state["priceChange"] = 'new'
 
                 component_id = f"agent-{re.sub(r'[^a-z0-9]+', '-', clean_prompt.lower())}-{re.sub(r'[^a-z0-9]+', '-', state['bestOffer']['retailer'].lower())}"
-
-                for offer in state["scrapedOffers"]:
-                    offer_model_group = self.normalize_model(offer['title'], clean_prompt)
-                    offer_component_id = f"comp-{re.sub(r'[^a-z0-9]+', '-', offer_model_group.lower())}-{re.sub(r'[^a-z0-9]+', '-', offer['retailer'].lower())}"
-
-                    offer_msrp = offer.get('originalPrice') if offer.get('originalPrice') and offer.get('originalPrice') > offer['price'] else offer['price']
-                    
-                    offer_deal_score = min(100, max(50, round(50 + ((offer_msrp - offer['price']) / offer_msrp) * 100))) if offer_msrp > offer['price'] else 50
-
-                    supabase.table('hardware_components').upsert({
-                        "id": offer_component_id,
-                        "name": offer['title'],
-                        "category": category,
-                        "brand": offer.get('brand') or offer['title'].split(' ')[0] or 'Hardware',
-                        "model": offer_model_group,
-                        "specs": json.dumps({
-                            "AgentSummary": state["summary"],
-                            "RetailerOffers": state["scrapedOffers"],
-                            "InStock": offer['inStock'],
-                            "IsRefurbished": offer.get('isRefurbished', False),
-                            "OriginalPrice": offer.get('originalPrice'),
-                            "PreviousPrice": previous_price,
-                            "PriceChange": state.get("priceChange"),
-                            "ScrapedAt": datetime.now(timezone.utc).isoformat()
-                        }),
-                        "msrp": offer_msrp,
-                        "current_price": offer['price'],
-                        "lowest_price_90d": offer['price'],
-                        "retailer": offer['retailer'],
-                        "product_url": offer['url'],
-                        "image_url": offer.get('imageUrl', 'https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=600&q=80'),
-                        "rating": offer.get('rating'),
-                        "deal_score": offer_deal_score,
-                        "updated_at": datetime.now(timezone.utc).isoformat()
-                    }).execute()
-                    
-                    print(f"[DB Persist Success] Saved \"{offer['retailer']}\" offer: \"{offer['title']}\" (${offer['price']:.2f}) to hardware_components")
+                
             except Exception as e:
                 print(f"[Agent Persistence Error]: {e}")
 
@@ -411,9 +410,18 @@ class TavilyHardwareAgent:
                     
                 elif retailer_name == 'Newegg':
                     # Avoid picking up related/sponsored items by ignoring .item-container
-                    main_price_candidates = [p for p in soup.select('.price-current') if not p.find_parent(class_='item-container')]
-                    price_container = main_price_candidates[0] if main_price_candidates else soup.select_one('.price-current')
+                    # Newegg mutates class names like .price-current_2026
+                    price_elements = soup.select('[class^="price-current"]')
+                    main_price_candidates = [p for p in price_elements if p.text.strip() and not p.find_parent(class_='item-container')]
+                    price_container = main_price_candidates[0] if main_price_candidates else None
                     
+                    if not price_container:
+                        # Fallback
+                        for p in price_elements:
+                            if p.text.strip():
+                                price_container = p
+                                break
+                                
                     if price_container:
                         price_strong = price_container.select_one('strong')
                         price_sup = price_container.select_one('sup')
@@ -523,10 +531,25 @@ class TavilyHardwareAgent:
                             
                 elif retailer_name == 'Micro Center':
                     # Extract price
-                    price_elem = soup.select_one('#pricing') or soup.select_one('#pricing2')
-                    if price_elem and price_elem.get('content'):
-                        try: price = float(price_elem['content'])
+                    price = 0
+                    # Try OpenGraph price first (Micro Center often puts it here)
+                    og_price = soup.select_one('meta[property="og:price:amount"]') or soup.select_one('meta[itemprop="price"]')
+                    if og_price and og_price.get('content'):
+                        try: price = float(og_price['content'].replace('$', '').replace(',', ''))
                         except ValueError: pass
+                    
+                    if not price:
+                        price_elem = soup.select_one('#pricing') or soup.select_one('#pricing2')
+                        if price_elem and price_elem.get('content'):
+                            try: price = float(price_elem['content'])
+                            except ValueError: pass
+                            
+                    if not price:
+                        # Fallback to data-price on the main title if available
+                        data_price_elem = soup.select_one('.ProductLink_' + soup.select_one('[data-id]')['data-id']) if soup.select_one('[data-id]') else None
+                        if data_price_elem and data_price_elem.get('data-price'):
+                            try: price = float(data_price_elem['data-price'])
+                            except ValueError: pass
                     
                     # Extract title
                     title_elem = soup.select_one('.ProductLink_' + soup.select_one('[data-id]')['data-id']) if soup.select_one('[data-id]') else None
@@ -538,12 +561,13 @@ class TavilyHardwareAgent:
                     elif title_elem:
                         title = title_elem.text.strip()
                         
-                    # Check stock status
-                    inventory_elem = soup.select_one('.inventoryCnt, .out-of-stock, .unavailable')
-                    inventory_text = inventory_elem.text.lower() if inventory_elem else soup.get_text().lower()
-                    if 'sold out' in inventory_text or 'no longer carried' in inventory_text or 'not available' in inventory_text:
-                        print(f"⚠️ [Out of Stock] Micro Center: Sold out or no longer carried.")
-                        return None
+                    # Check stock status (ONLY in the specific inventory element to avoid false positives)
+                    inventory_elem = soup.select_one('.inventoryCnt, .out-of-stock, .unavailable, .availabilityTrunc')
+                    if inventory_elem:
+                        inventory_text = inventory_elem.text.lower()
+                        if 'sold out' in inventory_text or 'no longer carried' in inventory_text or 'not available' in inventory_text:
+                            print(f"⚠️ [Out of Stock] Micro Center: Sold out or no longer carried.")
+                            return None
             except Exception as e:
                 print(f"[BS4 Parse Error] {retailer_name}: {e}")
                 
