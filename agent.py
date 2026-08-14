@@ -314,6 +314,13 @@ class TavilyHardwareAgent:
             if not html_content:
                 html_content = markdown_content
                 
+            try:
+                with open(f"scratch/dump_{retailer_name.replace(' ', '_')}.html", "w") as f:
+                    f.write(html_content)
+                with open(f"scratch/dump_{retailer_name.replace(' ', '_')}.md", "w") as f:
+                    f.write(markdown_content)
+            except: pass
+                
             if not html_content:
                 return None
             
@@ -321,6 +328,7 @@ class TavilyHardwareAgent:
             price = None
             title = None
             in_stock = True
+            is_refurbished = False
             
             # Deterministic Extraction Logic
             try:
@@ -369,12 +377,6 @@ class TavilyHardwareAgent:
                     title_elem = soup.select_one('.product-title')
                     if title_elem: title = title_elem.text.strip()
                     
-                elif retailer_name == 'Micro Center':
-                    price_elem = soup.select_one('span[itemprop="price"]') or soup.select_one('.price')
-                    if price_elem:
-                        price = float(price_elem.text.replace('$', '').replace(',', '').strip())
-                    title_elem = soup.select_one('h1 span[data-name="default"]') or soup.select_one('h1')
-                    if title_elem: title = title_elem.text.strip()
                     
                 elif retailer_name == 'Best Buy':
                     # 1. Try JSON-LD first for highly accurate pricing
@@ -401,6 +403,7 @@ class TavilyHardwareAgent:
                             '.priceView-customer-price span[aria-hidden="true"], '
                             '.priceView-hero-price span[aria-hidden="true"], '
                             'div[data-testid="customer-price"] span[aria-hidden="true"], '
+                            'div[data-testid="price-block-customer-price"] span[aria-hidden="true"], '
                             '.pricing-price span'
                         )
                         for p in price_candidates:
@@ -411,7 +414,7 @@ class TavilyHardwareAgent:
                                     break
                             except ValueError: continue
                             
-                    title_elem = soup.select_one('.sku-title h1, h1[class*="product-title"], h1.heading-5')
+                    title_elem = soup.select_one('.sku-title h1, h1[class*="product-title"], h1.heading-5, h1[class*="text-5"]')
                     if title_elem: title = title_elem.text.strip()
                     
                 elif retailer_name == 'B&H':
@@ -420,6 +423,53 @@ class TavilyHardwareAgent:
                         price = float(price_elem.text.replace('$', '').replace(',', '').strip())
                     title_elem = soup.select_one('[data-selenium="productTitle"]')
                     if title_elem: title = title_elem.text.strip()
+                    
+                elif retailer_name == 'eBay':
+                    # Extract main price from eBay buy box
+                    price_elem = soup.select_one('.x-price-primary span.ux-textspans') or soup.select_one('.x-price-primary')
+                    if price_elem:
+                        # e.g., "US $350.00" -> "350.00"
+                        price_text = price_elem.text.replace('US', '').replace('$', '').replace(',', '').strip()
+                        try: price = float(price_text)
+                        except ValueError: pass
+                    
+                    # Extract title
+                    title_elem = soup.select_one('.x-item-title__mainTitle span.ux-textspans') or soup.select_one('.x-item-title__mainTitle')
+                    if title_elem: title = title_elem.text.strip()
+                    
+                    # Extract condition (Used vs New) to set is_refurbished roughly
+                    condition_elem = soup.select_one('.x-item-condition-text span.ux-textspans') or soup.select_one('.x-item-condition-text')
+                    if condition_elem:
+                        cond_text = condition_elem.text.lower()
+                        if 'used' in cond_text or 'refurbished' in cond_text or 'parts' in cond_text or 'as is' in cond_text:
+                            is_refurbished = True
+                            
+                        # Reject broken items instantly
+                        if 'for parts' in cond_text or 'not working' in cond_text or 'box only' in cond_text or 'as is' in cond_text:
+                            print(f"⚠️ [Rejected] eBay: Item is marked as broken/parts ({condition_elem.text}).")
+                            return None
+                            
+                elif retailer_name == 'Micro Center':
+                    # Extract price
+                    price_elem = soup.select_one('#pricing') or soup.select_one('#pricing2')
+                    if price_elem and price_elem.get('content'):
+                        try: price = float(price_elem['content'])
+                        except ValueError: pass
+                    
+                    # Extract title
+                    title_elem = soup.select_one('.ProductLink_' + soup.select_one('[data-id]')['data-id']) if soup.select_one('[data-id]') else None
+                    if not title_elem:
+                        title_elem = soup.select_one('[data-name]')
+                        
+                    if title_elem and title_elem.get('data-name'):
+                        title = title_elem['data-name'].strip()
+                    elif title_elem:
+                        title = title_elem.text.strip()
+                        
+                    # Check stock status
+                    inventory_elem = soup.select_one('.inventoryCnt')
+                    if inventory_elem and 'sold out' in inventory_elem.text.lower():
+                        in_stock = False
             except Exception as e:
                 print(f"[BS4 Parse Error] {retailer_name}: {e}")
                 
@@ -437,7 +487,7 @@ class TavilyHardwareAgent:
                     "brand": None,
                     "url": url,
                     "inStock": in_stock,
-                    "isRefurbished": False
+                    "isRefurbished": is_refurbished
                 }
                 
             print(f"⚠️ [BS4 Miss] {retailer_name}: Could not find price deterministically. Falling back to Groq LLM...")
