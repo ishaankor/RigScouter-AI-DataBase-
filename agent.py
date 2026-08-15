@@ -49,10 +49,12 @@ class TavilyHardwareAgent:
             "You are an AI that extracts the core, canonical hardware model from messy, SEO-stuffed product titles. "
             "Strip all marketing fluff (e.g., 'Quad-Core', 'White Edition', 'Graphics Card', 'Processor', 'Desktop'). "
             "CRITICAL: Do NOT strip capacities! You MUST preserve sizes like '2TB', '1TB', '850W', '1000W', '16GB', '32GB' if they exist in the input. "
+            "If the user's input is a broad chipset, family, or series (e.g. 'X870', 'B650', 'Ryzen 5', 'Core i7', 'RTX 4070') without a specific brand or model suffix, return EXACTLY: GENERIC_QUERY_ERROR "
             "Return ONLY the clean model name without any surrounding quotes. "
             "Example input: ASUS ROG Strix GeForce RTX 4090 OC Edition 24GB GDDR6X -> Output: RTX 4090 24GB "
             "Example input: Intel Core i9-14900K 3.2 GHz 24-Core LGA 1700 -> Output: i9-14900K "
-            "Example input: Crucial T700 2TB Gen5 NVMe M.2 SSD -> Output: T700 2TB"
+            "Example input: Crucial T700 2TB Gen5 NVMe M.2 SSD -> Output: T700 2TB "
+            "Example input: X870 -> Output: GENERIC_QUERY_ERROR"
         )
         
         try:
@@ -87,10 +89,6 @@ class TavilyHardwareAgent:
             clean_prompt = await self.normalize_query_with_groq(clean_prompt)
             print(f"[AI Normalizer] Result: '{clean_prompt}'")
 
-        print(f"\n======================================================")
-        print(f"[Hybrid Python Agent] Extracting price for: \"{clean_prompt}\" ({category})")
-        print(f"======================================================\n")
-
         if emit_fn:
             emit_fn('agent_start', {'query': clean_prompt, 'category': category, 'timestamp': datetime.now(timezone.utc).isoformat()})
 
@@ -100,6 +98,25 @@ class TavilyHardwareAgent:
             "scrapedOffers": [],
             "summary": ""
         }
+
+        if clean_prompt == 'GENERIC_QUERY_ERROR':
+            print(f"[Generic Query Rejected] \"{prompt.strip()}\"")
+            state["summary"] = f"Your search '{prompt.strip()}' is too broad (e.g. a general chipset or product family). Please search for a specific model (e.g. 'ASUS ROG Strix X870-A') for accurate pricing."
+            if emit_fn:
+                emit_fn('agent_complete', {
+                    "query": prompt.strip(),
+                    "category": category,
+                    "bestOffer": None,
+                    "allOffers": [],
+                    "summary": state["summary"],
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                })
+            return state
+
+        print(f"\n======================================================")
+        print(f"[Hybrid Python Agent] Extracting price for: \"{clean_prompt}\" ({category})")
+        print(f"======================================================\n")
+
 
         if category == 'Not compatible (N/A)' and not is_url:
             print(f"[Non-PC Part Query Rejected] \"{clean_prompt}\" is Not compatible (N/A)")
