@@ -48,10 +48,11 @@ class TavilyHardwareAgent:
         system_prompt = (
             "You are an AI that extracts the core, canonical hardware model from messy, SEO-stuffed product titles. "
             "Strip all marketing fluff (e.g., 'Quad-Core', 'White Edition', 'Graphics Card', 'Processor', 'Desktop'). "
-            "Return ONLY the clean model name. "
-            "Example input: 'ASUS ROG Strix GeForce RTX 4090 OC Edition 24GB GDDR6X' -> Output: 'RTX 4090'. "
-            "Example input: 'Intel Core i9-14900K 3.2 GHz 24-Core LGA 1700' -> Output: 'i9-14900K'. "
-            "Example input: 'AMD Ryzen 9 9950X 16-Core, 32-Thread Unlocked Desktop Processor' -> Output: 'Ryzen 9 9950X'."
+            "CRITICAL: Do NOT strip capacities! You MUST preserve sizes like '2TB', '1TB', '850W', '1000W', '16GB', '32GB' if they exist in the input. "
+            "Return ONLY the clean model name without any surrounding quotes. "
+            "Example input: ASUS ROG Strix GeForce RTX 4090 OC Edition 24GB GDDR6X -> Output: RTX 4090 24GB "
+            "Example input: Intel Core i9-14900K 3.2 GHz 24-Core LGA 1700 -> Output: i9-14900K "
+            "Example input: Crucial T700 2TB Gen5 NVMe M.2 SSD -> Output: T700 2TB"
         )
         
         try:
@@ -69,7 +70,7 @@ class TavilyHardwareAgent:
                 timeout=10
             )
             if res.ok:
-                normalized = res.json()["choices"][0]["message"]["content"].strip()
+                normalized = res.json()["choices"][0]["message"]["content"].strip().strip("'").strip('"')
                 return normalized
         except Exception as e:
             print(f"[Groq Normalizer Error] {e}")
@@ -79,7 +80,7 @@ class TavilyHardwareAgent:
     async def run(self, prompt: str, emit_fn=None) -> dict:
         clean_prompt = prompt.strip()
         is_url = clean_prompt.startswith('http://') or clean_prompt.startswith('https://')
-        category = self.detect_category(clean_prompt)
+        category = await self.detect_category(clean_prompt)
         
         if not is_url:
             print(f"[AI Normalizer] Normalizing query: '{clean_prompt}'")
@@ -159,7 +160,7 @@ class TavilyHardwareAgent:
                             "lowest_price_90d": offer['price'],
                             "retailer": offer['retailer'],
                             "product_url": offer['url'],
-                            "image_url": offer.get('imageUrl', 'https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=600&q=80'),
+                            "image_url": offer.get('imageUrl') or "https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=600&q=80",
                             "rating": offer.get('rating'),
                             "deal_score": offer_deal_score,
                             "updated_at": datetime.now(timezone.utc).isoformat()
@@ -264,20 +265,25 @@ class TavilyHardwareAgent:
                     raise Exception(f"Tavily search failed: {res.text}")
                     
                 data = res.json()
-                valid_hits = []
+                results = data.get('results', [])
                 
-                for hit in data.get('results', []):
+                # Batch filter all titles to save Groq API calls (prevents 429 rate limits)
+                titles_to_check = [r.get('title', '') for r in results]
+                match_results = await self.filter_matching_titles(titles_to_check, model_query, category)
+
+                valid_hits = []
+                for i, hit in enumerate(results):
+                    # Check match result
+                    if i < len(match_results) and not match_results[i]:
+                        print(f"⚠️ [Tavily Title Mismatch] Skipping: {hit.get('title')}")
+                        continue
+
                     full_url = hit.get('url', '')
                     if not self.is_valid_direct_product_url(full_url, domain_pattern):
                         continue
                         
                     clean_url = full_url.replace('/reviews/', '').split('?')[0]
                     content = hit.get('content', '')
-                    title = hit.get('title', '')
-                    
-                    # Pre-filter using Tavily's returned title to save Firecrawl credits
-                    if title and not await self.is_title_match(title, model_query, category):
-                        continue
                     
                     # Estimate price from snippet
                     prices = re.findall(r'\$[0-9,]+(?:\.[0-9]{2})?', content)
@@ -368,8 +374,16 @@ class TavilyHardwareAgent:
             soup = BeautifulSoup(html_content, 'lxml')
             price = None
             title = None
+            image_url = None
             in_stock = True
             is_refurbished = False
+            
+            try:
+                og_image = soup.find('meta', property='og:image')
+                if og_image and og_image.get('content'):
+                    image_url = og_image.get('content')
+            except:
+                pass
             
             # Deterministic Extraction Logic
             try:
@@ -385,8 +399,16 @@ class TavilyHardwareAgent:
                         print(f"⚠️ [Out of Stock] Amazon: Item is marked unavailable in BS4.")
                         return None
                         
+                    # Check for Used/Warehouse deals explicitly featured in the buybox
+                    used_price_container = soup.select_one('#usedBuySection .a-price') or \
+                                           soup.select_one('#olp-upd-new-used .a-color-price')
+                    
+                    if used_price_container:
+                        is_refurbished = True
+
                     # Main price is usually in specific buy box containers
-                    price_container = soup.select_one('#corePriceDisplay_desktop_feature_div .a-price') or \
+                    price_container = used_price_container or \
+                                      soup.select_one('#corePriceDisplay_desktop_feature_div .a-price') or \
                                       soup.select_one('#corePrice_feature_div .a-price') or \
                                       soup.select_one('#corePrice_desktop .a-price') or \
                                       soup.select_one('#apex_desktop .a-price')
@@ -571,9 +593,12 @@ class TavilyHardwareAgent:
             except Exception as e:
                 print(f"[BS4 Parse Error] {retailer_name}: {e}")
                 
-            if title and model_query and not await self.is_title_match(title, model_query, category):
-                print(f"⚠️ [Title Mismatch] {retailer_name}: \"{title}\" does not match query \"{model_query}\" (Skipping Groq)")
-                return None
+            # If title is extracted, we can do a single-item check if not already performed via batch
+            if title and model_query:
+                is_match = (await self.filter_matching_titles([title], model_query, category))[0]
+                if not is_match:
+                    print(f"⚠️ [Title Mismatch] {retailer_name}: \"{title}\" does not match query \"{model_query}\"")
+                    return None
                 
             if price and self.is_price_sanity_valid(price, model_query or title or url, category):
                 print(f"✅ [BS4 Hit] {retailer_name}: Found price ${price:.2f}")
@@ -584,11 +609,30 @@ class TavilyHardwareAgent:
                     "title": title or model_query or url,
                     "brand": None,
                     "url": url,
+                    "imageUrl": image_url,
                     "inStock": in_stock,
                     "isRefurbished": is_refurbished
                 }
                 
-            print(f"⚠️ [BS4 Miss] {retailer_name}: Could not find price deterministically. Dropping to prevent hallucinations.")
+            print(f"⚠️ [BS4 Miss] {retailer_name}: Falling back to AI extraction...")
+            groq_data = await self.parse_with_groq(markdown_content, model_query, retailer_name, category)
+            if groq_data and groq_data.get('price'):
+                if self.is_price_sanity_valid(groq_data['price'], model_query or title or url, category):
+                    print(f"✅ [Groq Fallback Hit] {retailer_name}: Found price ${groq_data['price']:.2f}")
+                    return {
+                        "retailer": retailer_name,
+                        "price": groq_data['price'],
+                        "originalPrice": groq_data.get('originalPrice'),
+                        "title": groq_data.get('title') or title or model_query or url,
+                        "brand": groq_data.get('brand'),
+                        "url": url,
+                        "imageUrl": image_url,
+                        "inStock": groq_data.get('inStock', in_stock),
+                        "isRefurbished": groq_data.get('isRefurbished', is_refurbished)
+                    }
+                else:
+                    print(f"⚠️ [Groq Hallucination] {retailer_name}: Extracted price ${groq_data['price']:.2f} failed sanity check.")
+                    
             return None
         except Exception as e:
             print(f"[Firecrawl Error] {e}")
@@ -659,13 +703,13 @@ class TavilyHardwareAgent:
         if 'ebay.com' in domain_pattern: return '/itm/' in lower
         return True
 
-    async def is_title_match(self, title: str, query: str, category: str) -> bool:
-        if not title or not query: return True
+    async def filter_matching_titles(self, titles: list[str], query: str, category: str) -> list[bool]:
+        if not titles or not query: return [True] * len(titles)
         
         system_prompt = (
             "You are a strict product matching assistant. The user wants to buy a specific computer part or electronic. "
-            "Your job is to determine if the product title matches the requested item. "
-            "Return ONLY a JSON object with a single boolean key: 'is_match'. "
+            "Your job is to determine if the product titles match the requested item. "
+            "Return ONLY a JSON object with a single key 'matches' which is an array of booleans corresponding to the input titles in order. "
             "Rules:\n"
             "1. If the user asks for a part (like a CPU or GPU), reject fully pre-built computers/laptops/systems that just contain the part.\n"
             "2. Reject products listed as 'for parts', 'broken', 'box only', or 'read description'.\n"
@@ -674,7 +718,8 @@ class TavilyHardwareAgent:
             "5. The product must be the EXACT model requested."
         )
         
-        user_prompt = f"User searched for: '{query}' (Category: {category})\nProduct Title Found: '{title}'\nDoes this title represent the standalone product being searched for?"
+        titles_str = "\n".join([f"{i}. {t}" for i, t in enumerate(titles)])
+        user_prompt = f"User searched for: '{query}' (Category: {category})\nProduct Titles Found:\n{titles_str}\nDo these titles represent the standalone product being searched for?"
         
         import asyncio
         import json
@@ -702,23 +747,25 @@ class TavilyHardwareAgent:
                 if res.ok:
                     data = res.json()
                     content = data["choices"][0]["message"]["content"]
-                    parsed = json.loads(content)
-                    return parsed.get('is_match', False)
+                    try:
+                        matches = json.loads(content).get('matches', [])
+                        # Ensure we return a list of exactly the right length
+                        if isinstance(matches, list) and len(matches) == len(titles):
+                            return matches
+                        elif isinstance(matches, list):
+                            return matches + [True] * max(0, len(titles) - len(matches))
+                    except:
+                        pass
                 elif res.status_code == 429:
                     print(f"[Groq Title Match 429] Rate limit hit. Waiting 5s...")
                     await asyncio.sleep(5)
-                    continue
-                else:
-                    print(f"[Groq Title Match Error]: {res.text}")
-                    return True
             except Exception as e:
-                print(f"[Groq Title Match Error]: {e}")
+                print(f"[Groq Match Error] {e}")
                 if "rate limit" in str(e).lower() or "429" in str(e):
                     await asyncio.sleep(5)
                     continue
-                return True
-        return True
-
+                return [True] * len(titles)
+        return [True] * len(titles)
     def is_price_sanity_valid(self, price: float, query: str, category: str) -> bool:
         if not price or price <= 0: return False
         lower = query.lower()
@@ -735,7 +782,7 @@ class TavilyHardwareAgent:
         if 'ebay' in lower: return 'eBay'
         return 'Amazon'
 
-    def detect_category(self, text: str) -> str:
+    async def detect_category(self, text: str) -> str:
         lower = text.lower()
         if any(x in lower for x in ['rtx', 'gtx', 'radeon', 'rx', 'gpu']): return 'GPU'
         if any(x in lower for x in ['ryzen', 'core', 'cpu', 'threadripper', 'epyc', 'intel core', 'amd ryzen']): return 'CPU'
@@ -748,10 +795,27 @@ class TavilyHardwareAgent:
         if not GROQ_API_KEY:
             return 'Not compatible (N/A)'
             
+        tavily_snippet = ""
+        try:
+            res = requests.post('https://api.tavily.com/search', json={
+                "api_key": self.get_tavily_key(),
+                "query": text + " pc component",
+                "search_depth": "basic",
+                "max_results": 1
+            }, timeout=5)
+            if res.ok:
+                results = res.json().get('results', [])
+                if results:
+                    tavily_snippet = results[0].get('content', '')
+        except Exception as e:
+            print(f"[Tavily Category Snippet Error] {e}")
+            pass
+            
         system_prompt = (
             "Classify the following query into ONE of these strict categories: "
             "GPU, CPU, RAM, Motherboard, Storage, Power Supply, Case, Cooling. "
-            "If it is NOT a PC computer component (e.g. phones, consoles, cars, laptops, random items), return EXACTLY: Not compatible (N/A)"
+            "If it is NOT a PC computer component (e.g. phones, consoles, cars, laptops, random items), return EXACTLY: Not compatible (N/A). "
+            "Use the provided web search snippet context to help you accurately classify the item if it's ambiguous."
         )
         try:
             res = requests.post(
@@ -761,7 +825,7 @@ class TavilyHardwareAgent:
                     "model": "llama-3.1-8b-instant",
                     "messages": [
                         {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": f"Query: {text}"}
+                        {"role": "user", "content": f"Query: {text}\n\nSearch Context: {tavily_snippet}"}
                     ],
                     "temperature": 0
                 },
