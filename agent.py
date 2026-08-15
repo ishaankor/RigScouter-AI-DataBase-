@@ -146,58 +146,63 @@ class TavilyHardwareAgent:
                 {'name': 'eBay', 'domain': 'ebay.com'}
             ]
 
-            # Launch sequential scraping jobs to avoid hitting Tavily/Firecrawl concurrency limits
-            for r in RETAILERS:
-                offer = await self.scrape_retailer_accurate_offer(clean_prompt, r['name'], r['domain'], category)
-                if offer and offer.get('price', 0) > 0:
-                    state["scrapedOffers"].append(offer)
-                    
-                    try:
-                        offer_model_group = self.normalize_model(offer['title'], clean_prompt)
-                        offer_component_id = f"comp-{re.sub(r'[^a-z0-9]+', '-', offer_model_group.lower())}-{re.sub(r'[^a-z0-9]+', '-', offer['retailer'].lower())}"
+            # Launch concurrent scraping jobs using a semaphore to avoid hitting Tavily/Firecrawl concurrency limits too hard
+            sem = asyncio.Semaphore(3)
 
-                        offer_msrp = offer.get('originalPrice') if offer.get('originalPrice') and offer.get('originalPrice') > offer['price'] else offer['price']
-                        offer_deal_score = min(100, max(50, round(50 + ((offer_msrp - offer['price']) / offer_msrp) * 100))) if offer_msrp > offer['price'] else 50
-
-                        supabase.table('hardware_components').upsert({
-                            "id": offer_component_id,
-                            "name": offer['title'],
-                            "category": category,
-                            "brand": offer.get('brand') or offer['title'].split(' ')[0] or 'Hardware',
-                            "model": offer_model_group,
-                            "specs": json.dumps({
-                                "AgentSummary": "Live Scraping...",
-                                "InStock": offer['inStock'],
-                                "IsRefurbished": offer.get('isRefurbished', False),
-                                "OriginalPrice": offer.get('originalPrice'),
-                                "ScrapedAt": datetime.now(timezone.utc).isoformat()
-                            }),
-                            "msrp": offer_msrp,
-                            "current_price": offer['price'],
-                            "lowest_price_90d": offer['price'],
-                            "retailer": offer['retailer'],
-                            "product_url": offer['url'],
-                            "image_url": offer.get('imageUrl') or "https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=600&q=80",
-                            "rating": offer.get('rating'),
-                            "deal_score": offer_deal_score,
-                            "updated_at": datetime.now(timezone.utc).isoformat()
-                        }).execute()
-                        print(f"[DB Persist Success] Saved \"{offer['retailer']}\" offer: \"{offer['title']}\" (${offer['price']:.2f}) to hardware_components")
-                    except Exception as e:
-                        print(f"[Agent Incremental Persistence Error]: {e}")
+            async def scrape_and_persist(r):
+                async with sem:
+                    offer = await self.scrape_retailer_accurate_offer(clean_prompt, r['name'], r['domain'], category)
+                    if offer and offer.get('price', 0) > 0:
+                        state["scrapedOffers"].append(offer)
                         
-                    if emit_fn:
-                        emit_fn('retailer_found', {
-                            "query": clean_prompt,
-                            "retailer": offer['retailer'],
-                            "price": offer['price'],
-                            "title": offer['title'],
-                            "url": offer['url'],
-                            "inStock": offer['inStock'],
-                            "isRefurbished": offer.get('isRefurbished', False),
-                            "timestamp": datetime.now(timezone.utc).isoformat()
-                        })
-                await asyncio.sleep(1.0)  # Rate limiting
+                        try:
+                            offer_model_group = self.normalize_model(offer['title'], clean_prompt)
+                            offer_component_id = f"comp-{re.sub(r'[^a-z0-9]+', '-', offer_model_group.lower())}-{re.sub(r'[^a-z0-9]+', '-', offer['retailer'].lower())}"
+
+                            offer_msrp = offer.get('originalPrice') if offer.get('originalPrice') and offer.get('originalPrice') > offer['price'] else offer['price']
+                            offer_deal_score = min(100, max(50, round(50 + ((offer_msrp - offer['price']) / offer_msrp) * 100))) if offer_msrp > offer['price'] else 50
+
+                            supabase.table('hardware_components').upsert({
+                                "id": offer_component_id,
+                                "name": offer['title'],
+                                "category": category,
+                                "brand": offer.get('brand') or offer['title'].split(' ')[0] or 'Hardware',
+                                "model": offer_model_group,
+                                "specs": json.dumps({
+                                    "AgentSummary": "Live Scraping...",
+                                    "InStock": offer['inStock'],
+                                    "IsRefurbished": offer.get('isRefurbished', False),
+                                    "OriginalPrice": offer.get('originalPrice'),
+                                    "ScrapedAt": datetime.now(timezone.utc).isoformat()
+                                }),
+                                "msrp": offer_msrp,
+                                "current_price": offer['price'],
+                                "lowest_price_90d": offer['price'],
+                                "retailer": offer['retailer'],
+                                "product_url": offer['url'],
+                                "image_url": offer.get('imageUrl') or "https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=600&q=80",
+                                "rating": offer.get('rating'),
+                                "deal_score": offer_deal_score,
+                                "updated_at": datetime.now(timezone.utc).isoformat()
+                            }).execute()
+                            print(f"[DB Persist Success] Saved \"{offer['retailer']}\" offer: \"{offer['title']}\" (${offer['price']:.2f}) to hardware_components")
+                        except Exception as e:
+                            print(f"[Agent Incremental Persistence Error]: {e}")
+                            
+                        if emit_fn:
+                            emit_fn('retailer_found', {
+                                "query": clean_prompt,
+                                "retailer": offer['retailer'],
+                                "price": offer['price'],
+                                "title": offer['title'],
+                                "url": offer['url'],
+                                "inStock": offer['inStock'],
+                                "isRefurbished": offer.get('isRefurbished', False),
+                                "timestamp": datetime.now(timezone.utc).isoformat()
+                            })
+
+            tasks = [scrape_and_persist(r) for r in RETAILERS]
+            await asyncio.gather(*tasks)
 
         # Sort all scraped retailer offers: Available (inStock) items first, then lowest price
         def sort_offers(offer):
@@ -348,8 +353,9 @@ class TavilyHardwareAgent:
             try:
                 res = app.scrape_url(url, formats=['html', 'markdown'])
             except Exception as e:
-                if "Payment" in str(e) or "credits" in str(e) or "401" in str(e) or "402" in str(e):
-                    print(f"[Firecrawl Error] Credit limit reached: {e}")
+                error_str = str(e).lower()
+                if "payment" in error_str or "credits" in error_str or "401" in error_str or "402" in error_str or "rate limit" in error_str or "429" in error_str:
+                    print(f"[Firecrawl Error] Credit/Rate limit reached: {e}")
                     self.rotate_firecrawl_key()
                     app = self.get_firecrawl_app()
                     print(f"[Firecrawl] Retrying {url} with new key ...")
