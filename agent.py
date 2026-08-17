@@ -544,6 +544,15 @@ class TavilyHardwareAgent:
                             items = data if isinstance(data, list) else [data]
                             for item in items:
                                 if item.get('@type') == 'Product' and 'offers' in item:
+                                    item_name = item.get('name', '').lower()
+                                    if model_query and item_name:
+                                        import re
+                                        clean_q_words = re.sub(r'[^a-z0-9\s]', '', model_query.lower()).split()
+                                        longest_word = max(clean_q_words, key=len) if clean_q_words else ""
+                                        clean_item_name = re.sub(r'[^a-z0-9]', '', item_name)
+                                        if longest_word and longest_word not in clean_item_name:
+                                            continue
+                                            
                                     offers = item['offers']
                                     if isinstance(offers, dict) and 'price' in offers:
                                         price = float(offers['price'])
@@ -777,68 +786,37 @@ class TavilyHardwareAgent:
         return True
 
     async def filter_matching_titles(self, titles: list[str], query: str, category: str) -> list[bool]:
-        if not titles or not query: return [True] * len(titles)
+        import re
+        results = []
+        clean_q_words = re.sub(r'[^a-z0-9\s]', '', query.lower()).split()
+        longest_word = max(clean_q_words, key=len) if clean_q_words else ""
         
-        system_prompt = (
-            "You are a strict product matching assistant. The user wants to buy a specific computer part or electronic. "
-            "Your job is to determine if the product titles match the requested item. "
-            "Return ONLY a JSON object with a single key 'matches' which is an array of booleans corresponding to the input titles in order. "
-            "Rules:\n"
-            "1. If the user asks for a part (like a CPU or GPU), reject fully pre-built computers/laptops/systems that just contain the part.\n"
-            "2. Reject products listed as 'for parts', 'broken', 'box only', or 'read description'.\n"
-            "3. Reject accessories, waterblocks, or unrelated items.\n"
-            "4. Minor marketing additions (like 'Desktop Processor', 'Gaming OC') are fine if it's the core product.\n"
-            "5. The product must be the EXACT model requested (e.g., 'RTX 4070' must NOT match 'RTX 4070 Ti'). However, third-party partner variations (e.g. ASUS, MSI, ASRock, Gigabyte, Sparkle) ARE valid matches for the base model."
-        )
-        
-        titles_str = "\n".join([f"{i}. {t}" for i, t in enumerate(titles)])
-        user_prompt = f"User searched for: '{query}' (Category: {category})\nProduct Titles Found:\n{titles_str}\nDo these titles represent the standalone product being searched for?"
-        
-        import asyncio
-        import json
-        import requests
-        
-        for attempt in range(3):
-            try:
-                res = requests.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {GROQ_API_KEY}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": "groq/compound-mini",
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt}
-                        ],
-                        "response_format": {"type": "json_object"},
-                        "temperature": 0
-                    },
-                    timeout=5
-                )
-                if res.ok:
-                    data = res.json()
-                    content = data["choices"][0]["message"]["content"]
-                    try:
-                        matches = json.loads(content).get('matches', [])
-                        # Ensure we return a list of exactly the right length
-                        if isinstance(matches, list) and len(matches) == len(titles):
-                            return matches
-                        elif isinstance(matches, list):
-                            return matches + [True] * max(0, len(titles) - len(matches))
-                    except:
-                        pass
-                elif res.status_code == 429:
-                    print(f"[Groq Title Match 429] Rate limit hit. Waiting 5s...")
-                    await asyncio.sleep(5)
-            except Exception as e:
-                print(f"[Groq Match Error] {e}")
-                if "rate limit" in str(e).lower() or "429" in str(e):
-                    await asyncio.sleep(5)
+        for t in titles:
+            lower_t = t.lower()
+            clean_t = re.sub(r'[^a-z0-9]', '', lower_t)
+            
+            # Rule 1: Must contain the core model keyword
+            if longest_word and longest_word not in clean_t:
+                results.append(False)
+                continue
+                
+            # Rule 2: Reject broken or empty items
+            bad_keywords = ['for parts', 'broken', 'box only', 'read description', 'empty box', 'waterblock', 'only box', 'cooler only', 'heatsink only']
+            if any(b in lower_t for b in bad_keywords):
+                results.append(False)
+                continue
+                
+            # Rule 3: Reject full prebuilts if looking for raw components
+            if category in ['GPU', 'CPU', 'Motherboard', 'RAM']:
+                pc_keywords = ['desktop pc', 'gaming pc', 'gaming desktop', 'laptop', 'prebuilt', 'built pc', 'computer system']
+                if any(p in lower_t for p in pc_keywords):
+                    results.append(False)
                     continue
-                return [True] * len(titles)
-        return [True] * len(titles)
+                    
+            results.append(True)
+            
+        return results
+
     def is_price_sanity_valid(self, price: float, query: str, category: str) -> bool:
         if not price or price <= 0: return False
         lower = query.lower()
