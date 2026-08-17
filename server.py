@@ -252,7 +252,7 @@ async def get_watchlist():
     except Exception as e:
         return {"error": str(e)}
 
-async def handle_database_proxy_scrape(target_query: str):
+async def handle_database_proxy_scrape(target_query: str, user_id: str = None, pending_id: str = None):
     try:
         clean_query = target_query.strip()
         
@@ -297,7 +297,7 @@ async def handle_database_proxy_scrape(target_query: str):
 
         # Step B: Scrape
         print(f"[DB Miss] \"{clean_query}\" missing from DB. Executing Agent to scrape & add to database...")
-        agent_result = await agent.run(clean_query, agent_sse_emitter)
+        agent_result = await agent.run(clean_query, agent_sse_emitter, user_id, pending_id)
         best_offer = agent_result.get('bestOffer')
         
         if best_offer and best_offer.get('price'):
@@ -338,9 +338,11 @@ async def handle_database_proxy_scrape(target_query: str):
 async def post_scrape(request: Request):
     body = await request.json()
     query = body.get('query') or body.get('prompt') or body.get('url')
+    user_id = body.get('userId')
+    pending_id = body.get('pendingId')
     if not query:
         return {"error": "Provide valid search query or URL in request body"}
-    return await handle_database_proxy_scrape(query)
+    return await handle_database_proxy_scrape(query, user_id, pending_id)
 
 @app.get("/api/scrape")
 async def get_scrape(query: str = None, q: str = None):
@@ -353,9 +355,11 @@ async def get_scrape(query: str = None, q: str = None):
 async def post_agent_run(request: Request):
     body = await request.json()
     query = body.get('query') or body.get('prompt') or body.get('url')
+    user_id = body.get('userId')
+    pending_id = body.get('pendingId')
     if not query:
         return {"error": "Provide valid search query or URL in request body"}
-    return await handle_database_proxy_scrape(query)
+    return await handle_database_proxy_scrape(query, user_id, pending_id)
 
 @app.get("/api/agent/run")
 async def get_agent_run(query: str = None, q: str = None):

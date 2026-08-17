@@ -121,7 +121,7 @@ class TavilyHardwareAgent:
             
         return {"model": query, "category": "Not compatible (N/A)"}
 
-    async def run(self, prompt: str, emit_fn=None) -> dict:
+    async def run(self, prompt: str, emit_fn=None, user_id: str = None, pending_id: str = None) -> dict:
         clean_prompt = prompt.strip()
         is_url = clean_prompt.startswith('http://') or clean_prompt.startswith('https://')
         
@@ -233,6 +233,25 @@ class TavilyHardwareAgent:
                                 "updated_at": datetime.now(timezone.utc).isoformat()
                             }).execute()
                             print(f"[DB Persist Success] Saved \"{offer['retailer']}\" offer: \"{offer['title']}\" (${offer['price']:.2f}) to hardware_components")
+                            
+                            # Also persist directly to the user's watchlist if triggered by a user
+                            if user_id and pending_id:
+                                try:
+                                    supabase.table('watchlist_items').upsert({
+                                        "id": f"{pending_id}-{offer['retailer'].lower().replace(' ', '-')}",
+                                        "user_id": user_id,
+                                        "component_name": clean_prompt,
+                                        "category": category,
+                                        "target_price": offer['price'],
+                                        "current_price": offer['price'],
+                                        "retailer": offer['retailer'],
+                                        "product_url": offer['url'],
+                                        "image_url": offer.get('imageUrl') or "https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=600&q=80",
+                                        "in_stock": offer['inStock'],
+                                        "added_at": datetime.now(timezone.utc).isoformat()
+                                    }).execute()
+                                except Exception as wl_e:
+                                    print(f"[Watchlist Persist Error]: {wl_e}")
                         except Exception as e:
                             print(f"[Agent Incremental Persistence Error]: {e}")
                             
