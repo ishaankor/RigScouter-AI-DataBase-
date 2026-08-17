@@ -51,13 +51,14 @@ class TavilyHardwareAgent:
             "For 'model': Strip marketing fluff (e.g., 'Quad-Core', 'White Edition', 'Graphics Card', 'Desktop'). "
             "CRITICAL: Do NOT strip capacities like '2TB', '850W', '16GB'. "
             "If the input is a broad chipset or family (e.g. 'X870', 'B650', 'Ryzen 5', 'RTX 4070') without a specific brand/model, set 'model' EXACTLY to 'GENERIC_QUERY_ERROR'. "
-            "For 'category': Classify the item into ONE of these EXACT strings: GPU, CPU, RAM, Motherboard, Storage, Power Supply, Case, Cooling. "
-            "If the item is NOT a PC component, set 'category' EXACTLY to 'Not compatible (N/A)'. "
+            "For 'category': Classify the item into ONE of these EXACT strings: GPU, CPU, RAM, Motherboard, Storage, Power Supply, Case, Cooling, Monitor, Peripherals, Networking. "
+            "If the item is NOT a computer component or peripheral, set 'category' EXACTLY to 'Not compatible (N/A)'. "
             "Examples:\n"
             "Input: ASUS ROG Strix GeForce RTX 4090 OC Edition 24GB -> {\"model\": \"RTX 4090 24GB\", \"category\": \"GPU\"}\n"
             "Input: Intel Core i9-14900K 3.2 GHz 24-Core -> {\"model\": \"i9-14900K\", \"category\": \"CPU\"}\n"
             "Input: Crucial T700 2TB Gen5 NVMe M.2 SSD -> {\"model\": \"T700 2TB\", \"category\": \"Storage\"}\n"
             "Input: ASUS Z890 Motherboard -> {\"model\": \"ASUS Z890\", \"category\": \"Motherboard\"}\n"
+            "Input: MSI PRO MP273L 27\" IPS Monitor -> {\"model\": \"PRO MP273L\", \"category\": \"Monitor\"}\n"
             "Input: iPhone 15 Pro Max -> {\"model\": \"iPhone 15 Pro Max\", \"category\": \"Not compatible (N/A)\"}\n"
         )
         
@@ -66,7 +67,7 @@ class TavilyHardwareAgent:
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                 json={
-                    "model": "llama-3.1-8b-instant",
+                    "model": "groq/compound-mini",
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": f"Title: {query}"}
@@ -77,7 +78,43 @@ class TavilyHardwareAgent:
                 timeout=10
             )
             if res.ok:
-                data = __import__('json').loads(res.json()["choices"][0]["message"]["content"])
+                raw_content = res.json()["choices"][0]["message"]["content"]
+                print(f"[DEBUG Groq Analyzer] Raw JSON response: {raw_content}")
+                data = __import__('json').loads(raw_content)
+                
+                # Smart context fallback: if it's considered Not compatible, it might just be an obscure part number. Do a quick Tavily search to give the LLM context.
+                if data.get('category') == 'Not compatible (N/A)' and self.get_tavily_key():
+                    try:
+                        print(f"[AI Analyzer] '{query}' marked Not compatible. Fetching web context...")
+                        tavily_res = requests.post('https://api.tavily.com/search', json={
+                            "api_key": self.get_tavily_key(),
+                            "query": f"{query} specs computer",
+                            "search_depth": "basic",
+                            "max_results": 1
+                        }, timeout=3)
+                        if tavily_res.ok:
+                            results = tavily_res.json().get('results', [])
+                            snippet = results[0].get('content', '') if results else ''
+                            if snippet:
+                                res2 = requests.post(
+                                    "https://api.groq.com/openai/v1/chat/completions",
+                                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                                    json={
+                                        "model": "groq/compound-mini",
+                                        "messages": [
+                                            {"role": "system", "content": system_prompt + "\nUse the provided web search snippet context to help you accurately classify the item if it's ambiguous."},
+                                            {"role": "user", "content": f"Title: {query}\n\nSearch Context: {snippet}"}
+                                        ],
+                                        "response_format": {"type": "json_object"},
+                                        "temperature": 0
+                                    },
+                                    timeout=5
+                                )
+                                if res2.ok:
+                                    data = __import__('json').loads(res2.json()["choices"][0]["message"]["content"])
+                    except Exception as e:
+                        print(f"[Tavily Fallback Error] {e}")
+
                 return data
         except Exception as e:
             print(f"[Groq Analyzer Error] {e}")
@@ -701,7 +738,7 @@ class TavilyHardwareAgent:
                         "Content-Type": "application/json"
                     },
                     json={
-                        "model": "llama-3.1-8b-instant",
+                        "model": "groq/compound-mini",
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": f"Extract info from this markdown:\n\n{markdown_content}"}
@@ -770,7 +807,7 @@ class TavilyHardwareAgent:
                         "Content-Type": "application/json"
                     },
                     json={
-                        "model": "llama-3.1-8b-instant",
+                        "model": "groq/compound-mini",
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_prompt}
@@ -824,8 +861,8 @@ class TavilyHardwareAgent:
             
         system_prompt = (
             "Classify the following query or URL into ONE of these strict categories: "
-            "GPU, CPU, RAM, Motherboard, Storage, Power Supply, Case, Cooling. "
-            "If it is NOT a PC computer component, return EXACTLY: Not compatible (N/A). "
+            "GPU, CPU, RAM, Motherboard, Storage, Power Supply, Case, Cooling, Monitor, Peripherals, Networking. "
+            "If it is NOT a computer component or peripheral, return EXACTLY: Not compatible (N/A). "
             "Return ONLY the category name. Do not include any other text."
         )
         try:
@@ -833,7 +870,7 @@ class TavilyHardwareAgent:
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                 json={
-                    "model": "llama-3.1-8b-instant",
+                    "model": "groq/compound-mini",
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": f"Query: {text}"}
@@ -844,7 +881,7 @@ class TavilyHardwareAgent:
             )
             if res.ok:
                 category = res.json()["choices"][0]["message"]["content"].strip()
-                valid_categories = ['GPU', 'CPU', 'RAM', 'Motherboard', 'Storage', 'Power Supply', 'Case', 'Cooling']
+                valid_categories = ['GPU', 'CPU', 'RAM', 'Motherboard', 'Storage', 'Power Supply', 'Case', 'Cooling', 'Monitor', 'Peripherals', 'Networking']
                 if category in valid_categories:
                     return category
                 for vc in valid_categories:
