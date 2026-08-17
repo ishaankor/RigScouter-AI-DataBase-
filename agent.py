@@ -90,7 +90,7 @@ class TavilyHardwareAgent:
             print(f"[AI Normalizer] Result: '{clean_prompt}'")
 
         if emit_fn:
-            emit_fn('agent_start', {'query': clean_prompt, 'category': category, 'timestamp': datetime.now(timezone.utc).isoformat()})
+            emit_fn('agent_start', {'query': clean_prompt, 'original_query': prompt.strip(), 'category': category, 'timestamp': datetime.now(timezone.utc).isoformat()})
 
         state = {
             "userQuery": clean_prompt,
@@ -105,6 +105,7 @@ class TavilyHardwareAgent:
             if emit_fn:
                 emit_fn('agent_complete', {
                     "query": prompt.strip(),
+                    "original_query": prompt.strip(),
                     "category": category,
                     "bestOffer": None,
                     "allOffers": [],
@@ -124,6 +125,7 @@ class TavilyHardwareAgent:
             if emit_fn:
                 emit_fn('agent_complete', {
                     "query": clean_prompt,
+                    "original_query": prompt.strip(),
                     "category": 'Not compatible (N/A)',
                     "bestOffer": None,
                     "allOffers": [],
@@ -192,6 +194,7 @@ class TavilyHardwareAgent:
                         if emit_fn:
                             emit_fn('retailer_found', {
                                 "query": clean_prompt,
+                                "original_query": prompt.strip(),
                                 "retailer": offer['retailer'],
                                 "price": offer['price'],
                                 "title": offer['title'],
@@ -230,6 +233,7 @@ class TavilyHardwareAgent:
                         if emit_fn:
                             emit_fn('price_drop', {
                                 "query": clean_prompt,
+                                "original_query": prompt.strip(),
                                 "retailer": state["bestOffer"]['retailer'],
                                 "previousPrice": previous_price,
                                 "newPrice": state["bestOffer"]['price'],
@@ -255,6 +259,7 @@ class TavilyHardwareAgent:
         if emit_fn:
             emit_fn('agent_complete', {
                 "query": clean_prompt,
+                "original_query": prompt.strip(),
                 "bestOffer": state.get("bestOffer"),
                 "allOffers": state["scrapedOffers"],
                 "priceChange": state.get("priceChange"),
@@ -738,7 +743,7 @@ class TavilyHardwareAgent:
             "2. Reject products listed as 'for parts', 'broken', 'box only', or 'read description'.\n"
             "3. Reject accessories, waterblocks, or unrelated items.\n"
             "4. Minor marketing additions (like 'Desktop Processor', 'Gaming OC') are fine if it's the core product.\n"
-            "5. The product must be the EXACT model requested."
+            "5. The product must be the EXACT model requested (e.g., 'RTX 4070' must NOT match 'RTX 4070 Ti'). However, third-party partner variations (e.g. ASUS, MSI, ASRock, Gigabyte, Sparkle) ARE valid matches for the base model."
         )
         
         titles_str = "\n".join([f"{i}. {t}" for i, t in enumerate(titles)])
@@ -810,7 +815,7 @@ class TavilyHardwareAgent:
         if any(x in lower for x in ['rtx', 'gtx', 'radeon', 'rx', 'gpu']): return 'GPU'
         if any(x in lower for x in ['ryzen', 'core', 'cpu', 'threadripper', 'epyc', 'intel core', 'amd ryzen']): return 'CPU'
         if any(x in lower for x in ['ram', 'ddr4', 'ddr5', 'memory']): return 'RAM'
-        if any(x in lower for x in ['motherboard', 'mobo', 'z790', 'b650', 'x670', 'z690', 'b550']): return 'Motherboard'
+        if any(x in lower for x in ['motherboard', 'mobo', 'z790', 'b650', 'x670', 'z690', 'b550', 'z890', 'x870', 'b850']): return 'Motherboard'
         if any(x in lower for x in ['ssd', 'nvme', 'hdd', 'storage', 'samsung 9', 'wd black']): return 'Storage'
         if any(x in lower for x in ['psu', 'power supply', 'corsair rm']): return 'Power Supply'
         if any(x in lower for x in ['cooler', 'aio', 'heatsink', 'noctua']): return 'Cooling'
