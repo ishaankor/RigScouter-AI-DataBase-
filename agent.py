@@ -3,6 +3,7 @@ import json
 import time
 import asyncio
 import requests
+import httpx
 from datetime import datetime, timezone
 import random
 import re
@@ -63,56 +64,57 @@ class TavilyHardwareAgent:
         )
         
         try:
-            res = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                json={
-                    "model": "groq/compound-mini",
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": f"Title: {query}"}
-                    ],
-                    "response_format": {"type": "json_object"},
-                    "temperature": 0
-                },
-                timeout=10
-            )
-            if res.ok:
-                raw_content = res.json()["choices"][0]["message"]["content"]
-                print(f"[DEBUG Groq Analyzer] Raw JSON response: {raw_content}")
-                data = __import__('json').loads(raw_content)
-                
-                # Smart context fallback: if it's considered Not compatible, it might just be an obscure part number. Do a quick Tavily search to give the LLM context.
-                if data.get('category') == 'Not compatible (N/A)' and self.get_tavily_key():
-                    try:
-                        print(f"[AI Analyzer] '{query}' marked Not compatible. Fetching web context...")
-                        tavily_res = requests.post('https://api.tavily.com/search', json={
-                            "api_key": self.get_tavily_key(),
-                            "query": f"{query} specs computer",
-                            "search_depth": "basic",
-                            "max_results": 1
-                        }, timeout=3)
-                        if tavily_res.ok:
-                            results = tavily_res.json().get('results', [])
-                            snippet = results[0].get('content', '') if results else ''
-                            if snippet:
-                                res2 = requests.post(
-                                    "https://api.groq.com/openai/v1/chat/completions",
-                                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                                    json={
-                                        "model": "groq/compound-mini",
-                                        "messages": [
-                                            {"role": "system", "content": system_prompt + "\nUse the provided web search snippet context to help you accurately classify the item if it's ambiguous."},
-                                            {"role": "user", "content": f"Title: {query}\n\nSearch Context: {snippet}"}
-                                        ],
-                                        "response_format": {"type": "json_object"},
-                                        "temperature": 0
-                                    },
-                                    timeout=5
-                                )
-                                if res2.ok:
-                                    data = __import__('json').loads(res2.json()["choices"][0]["message"]["content"])
-                    except Exception as e:
+            async with httpx.AsyncClient() as client:
+                res = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                    json={
+                        "model": "groq/compound-mini",
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": f"Title: {query}"}
+                        ],
+                        "response_format": {"type": "json_object"},
+                        "temperature": 0
+                    },
+                    timeout=10.0
+                )
+                if res.status_code == 200:
+                    raw_content = res.json()["choices"][0]["message"]["content"]
+                    print(f"[DEBUG Groq Analyzer] Raw JSON response: {raw_content}")
+                    data = __import__('json').loads(raw_content)
+                    
+                    # Smart context fallback: if it's considered Not compatible, it might just be an obscure part number. Do a quick Tavily search to give the LLM context.
+                    if data.get('category') == 'Not compatible (N/A)' and self.get_tavily_key():
+                        try:
+                            print(f"[AI Analyzer] '{query}' marked Not compatible. Fetching web context...")
+                            tavily_res = await client.post('https://api.tavily.com/search', json={
+                                "api_key": self.get_tavily_key(),
+                                "query": f"{query} specs computer",
+                                "search_depth": "basic",
+                                "max_results": 1
+                            }, timeout=3.0)
+                            if tavily_res.status_code == 200:
+                                results = tavily_res.json().get('results', [])
+                                snippet = results[0].get('content', '') if results else ''
+                                if snippet:
+                                    res2 = await client.post(
+                                        "https://api.groq.com/openai/v1/chat/completions",
+                                        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                                        json={
+                                            "model": "groq/compound-mini",
+                                            "messages": [
+                                                {"role": "system", "content": system_prompt + "\nUse the provided web search snippet context to help you accurately classify the item if it's ambiguous."},
+                                                {"role": "user", "content": f"Title: {query}\n\nSearch Context: {snippet}"}
+                                            ],
+                                            "response_format": {"type": "json_object"},
+                                            "temperature": 0
+                                        },
+                                        timeout=5.0
+                                    )
+                                    if res2.status_code == 200:
+                                        data = __import__('json').loads(res2.json()["choices"][0]["message"]["content"])
+                        except Exception as e:
                         print(f"[Tavily Fallback Error] {e}")
 
                 return data
@@ -209,7 +211,7 @@ class TavilyHardwareAgent:
                             offer_msrp = offer.get('originalPrice') if offer.get('originalPrice') and offer.get('originalPrice') > offer['price'] else offer['price']
                             offer_deal_score = min(100, max(50, round(50 + ((offer_msrp - offer['price']) / offer_msrp) * 100))) if offer_msrp > offer['price'] else 50
 
-                            supabase.table('hardware_components').upsert({
+                            query1 = supabase.table('hardware_components').upsert({
                                 "id": offer_component_id,
                                 "name": offer['title'],
                                 "category": category,
@@ -231,13 +233,14 @@ class TavilyHardwareAgent:
                                 "rating": offer.get('rating'),
                                 "deal_score": offer_deal_score,
                                 "updated_at": datetime.now(timezone.utc).isoformat()
-                            }).execute()
+                            })
+                            await asyncio.to_thread(query1.execute)
                             print(f"[DB Persist Success] Saved \"{offer['retailer']}\" offer: \"{offer['title']}\" (${offer['price']:.2f}) to hardware_components")
                             
                             # Also persist directly to the user's watchlist if triggered by a user
                             if user_id and pending_id:
                                 try:
-                                    supabase.table('watchlist_items').upsert({
+                                    query2 = supabase.table('watchlist_items').upsert({
                                         "id": f"{pending_id}-{offer['retailer'].lower().replace(' ', '-')}",
                                         "user_id": user_id,
                                         "component_name": clean_prompt,
@@ -249,7 +252,8 @@ class TavilyHardwareAgent:
                                         "image_url": offer.get('imageUrl') or "https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=600&q=80",
                                         "in_stock": offer['inStock'],
                                         "added_at": datetime.now(timezone.utc).isoformat()
-                                    }).execute()
+                                    })
+                                    await asyncio.to_thread(query2.execute)
                                 except Exception as wl_e:
                                     print(f"[Watchlist Persist Error]: {wl_e}")
                         except Exception as e:
@@ -286,7 +290,8 @@ class TavilyHardwareAgent:
 
         if state.get("bestOffer"):
             try:
-                res = supabase.table('hardware_components').select('current_price').ilike('model', f"%{clean_prompt}%").order('updated_at', desc=True).limit(1).execute()
+                query = supabase.table('hardware_components').select('current_price').ilike('model', f"%{clean_prompt}%").order('updated_at', desc=True).limit(1)
+                res = await asyncio.to_thread(query.execute)
                 previous_price = res.data[0]['current_price'] if res.data else None
 
                 if previous_price is not None:
@@ -343,16 +348,17 @@ class TavilyHardwareAgent:
         for attempt in range(len(TAVILY_API_KEYS)):
             try:
                 # 1. Search with Tavily to get URLs (NO raw_content)
-                res = requests.post('https://api.tavily.com/search', json={
-                    "api_key": self.get_tavily_key(),
-                    "query": f"buy {model_query} price",
-                    "search_depth": "advanced",
-                    "include_domains": [domain_pattern],
-                    "include_raw_content": False,
-                    "max_results": 10
-                }, timeout=15)
+                async with httpx.AsyncClient() as client:
+                    res = await client.post('https://api.tavily.com/search', json={
+                        "api_key": self.get_tavily_key(),
+                        "query": f"buy {model_query} price",
+                        "search_depth": "advanced",
+                        "include_domains": [domain_pattern],
+                        "include_raw_content": False,
+                        "max_results": 10
+                    }, timeout=15.0)
                 
-                if not res.ok:
+                if res.status_code != 200:
                     raise Exception(f"Tavily search failed: {res.text}")
                     
                 data = res.json()
@@ -420,7 +426,7 @@ class TavilyHardwareAgent:
         print(f"[Firecrawl] Extracting {url} ...")
         try:
             try:
-                res = app.scrape_url(url, formats=['html', 'markdown'])
+                res = await asyncio.to_thread(lambda: app.scrape_url(url, formats=['html', 'markdown']))
             except Exception as e:
                 error_str = str(e).lower()
                 if "payment" in error_str or "credits" in error_str or "401" in error_str or "402" in error_str or "rate limit" in error_str or "429" in error_str:
@@ -428,7 +434,7 @@ class TavilyHardwareAgent:
                     self.rotate_firecrawl_key()
                     app = self.get_firecrawl_app()
                     print(f"[Firecrawl] Retrying {url} with new key ...")
-                    res = app.scrape_url(url, formats=['html', 'markdown'])
+                    res = await asyncio.to_thread(lambda: app.scrape_url(url, formats=['html', 'markdown']))
                 else:
                     raise e
             
@@ -759,24 +765,25 @@ class TavilyHardwareAgent:
         import asyncio
         try:
             for attempt in range(3):
-                res = requests.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {GROQ_API_KEY}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": "groq/compound-mini",
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": f"Extract info from this markdown:\n\n{markdown_content}"}
-                        ],
-                        "response_format": {"type": "json_object"},
-                        "temperature": 0
-                    },
-                    timeout=15
-                )
-                if res.ok:
+                async with httpx.AsyncClient() as client:
+                    res = await client.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {GROQ_API_KEY}",
+                            "Content-Type": "application/json"
+                        },
+                        json={
+                            "model": "groq/compound-mini",
+                            "messages": [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": f"Extract info from this markdown:\n\n{markdown_content}"}
+                            ],
+                            "response_format": {"type": "json_object"},
+                            "temperature": 0
+                        },
+                        timeout=15.0
+                    )
+                if res.status_code == 200:
                     data = res.json()
                     content = data["choices"][0]["message"]["content"]
                     return json.loads(content)
@@ -863,20 +870,21 @@ class TavilyHardwareAgent:
             "Return ONLY the category name. Do not include any other text."
         )
         try:
-            res = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                json={
-                    "model": "groq/compound-mini",
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": f"Query: {text}"}
-                    ],
-                    "temperature": 0
-                },
-                timeout=5
-            )
-            if res.ok:
+            async with httpx.AsyncClient() as client:
+                res = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                    json={
+                        "model": "groq/compound-mini",
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": f"Query: {text}"}
+                        ],
+                        "temperature": 0
+                    },
+                    timeout=5.0
+                )
+            if res.status_code == 200:
                 category = res.json()["choices"][0]["message"]["content"].strip()
                 valid_categories = ['GPU', 'CPU', 'RAM', 'Motherboard', 'Storage', 'Power Supply', 'Case', 'Cooling', 'Monitor', 'Peripherals', 'Networking']
                 if category in valid_categories:

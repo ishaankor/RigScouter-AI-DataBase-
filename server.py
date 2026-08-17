@@ -199,7 +199,8 @@ async def get_components(category: str = None, q: str = None):
             # Using raw postgrest filtering
             query = query.or_(f"name.ilike.%{q}%,model.ilike.%{q}%,brand.ilike.%{q}%")
             
-        res = query.order('updated_at', desc=True).limit(50).execute()
+        query_obj = query.order('updated_at', desc=True).limit(50)
+        res = await asyncio.to_thread(query_obj.execute)
         
         formatted = []
         for item in res.data:
@@ -227,7 +228,8 @@ async def get_components(category: str = None, q: str = None):
 @app.get("/api/watchlist")
 async def get_watchlist():
     try:
-        res = supabase.table('watchlist_items').select('*').order('added_at', desc=True).execute()
+        query = supabase.table('watchlist_items').select('*').order('added_at', desc=True)
+        res = await asyncio.to_thread(query.execute)
         formatted = []
         for item in res.data:
             formatted.append({
@@ -257,9 +259,10 @@ async def handle_database_proxy_scrape(target_query: str, user_id: str = None, p
         clean_query = target_query.strip()
         
         # Step A: Check DB
-        res = supabase.table('hardware_components').select('*') \
+        query = supabase.table('hardware_components').select('*') \
             .or_(f"name.ilike.%{clean_query}%,model.ilike.%{clean_query}%,product_url.ilike.%{clean_query}%") \
-            .order('updated_at', desc=True).limit(1).execute()
+            .order('updated_at', desc=True).limit(1)
+        res = await asyncio.to_thread(query.execute)
             
         if res.data and len(res.data) > 0:
             match = res.data[0]
@@ -371,7 +374,8 @@ async def get_agent_run(query: str = None, q: str = None):
 @app.delete("/api/watchlist/{id}")
 async def delete_watchlist(id: str):
     try:
-        res = supabase.table('watchlist_items').delete().eq('id', id).execute()
+        query = supabase.table('watchlist_items').delete().eq('id', id)
+        res = await asyncio.to_thread(query.execute)
         return {"success": True, "deletedId": id}
     except Exception as e:
         return {"error": str(e)}
@@ -379,7 +383,8 @@ async def delete_watchlist(id: str):
 @app.delete("/api/components/{id}")
 async def delete_component(id: str):
     try:
-        res = supabase.table('hardware_components').delete().eq('id', id).execute()
+        query = supabase.table('hardware_components').delete().eq('id', id)
+        res = await asyncio.to_thread(query.execute)
         return {"success": True, "deletedId": id}
     except Exception as e:
         return {"error": str(e)}
