@@ -115,7 +115,7 @@ class TavilyHardwareAgent:
                                     if res2.status_code == 200:
                                         data = __import__('json').loads(res2.json()["choices"][0]["message"]["content"])
                         except Exception as e:
-                        print(f"[Tavily Fallback Error] {e}")
+                            print(f"[Tavily Fallback Error] {e}")
 
                 return data
         except Exception as e:
