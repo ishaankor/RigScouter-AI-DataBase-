@@ -41,20 +41,24 @@ class TavilyHardwareAgent:
             self.current_firecrawl_index = (self.current_firecrawl_index + 1) % len(firecrawl_apps)
             print(f"[Firecrawl Key Rotated] Active key index: {self.current_firecrawl_index + 1}/{len(firecrawl_apps)}")
 
-    async def normalize_query_with_groq(self, query: str) -> str:
+    async def analyze_query_with_groq(self, query: str) -> dict:
         if not GROQ_API_KEY:
-            return query
+            return {"model": query, "category": "Not compatible (N/A)"}
             
         system_prompt = (
-            "You are an AI that extracts the core, canonical hardware model from messy, SEO-stuffed product titles. "
-            "Strip all marketing fluff (e.g., 'Quad-Core', 'White Edition', 'Graphics Card', 'Processor', 'Desktop'). "
-            "CRITICAL: Do NOT strip capacities! You MUST preserve sizes like '2TB', '1TB', '850W', '1000W', '16GB', '32GB' if they exist in the input. "
-            "If the user's input is a broad chipset, family, or series (e.g. 'X870', 'B650', 'Ryzen 5', 'Core i7', 'RTX 4070') without a specific brand or model suffix, return EXACTLY: GENERIC_QUERY_ERROR "
-            "Return ONLY the clean model name without any surrounding quotes. "
-            "Example input: ASUS ROG Strix GeForce RTX 4090 OC Edition 24GB GDDR6X -> Output: RTX 4090 24GB "
-            "Example input: Intel Core i9-14900K 3.2 GHz 24-Core LGA 1700 -> Output: i9-14900K "
-            "Example input: Crucial T700 2TB Gen5 NVMe M.2 SSD -> Output: T700 2TB "
-            "Example input: X870 -> Output: GENERIC_QUERY_ERROR"
+            "You are an AI that extracts the core, canonical hardware model from messy product titles, and classifies the component into a strict category. "
+            "Return ONLY a JSON object with two keys: 'model' and 'category'. "
+            "For 'model': Strip marketing fluff (e.g., 'Quad-Core', 'White Edition', 'Graphics Card', 'Desktop'). "
+            "CRITICAL: Do NOT strip capacities like '2TB', '850W', '16GB'. "
+            "If the input is a broad chipset or family (e.g. 'X870', 'B650', 'Ryzen 5', 'RTX 4070') without a specific brand/model, set 'model' EXACTLY to 'GENERIC_QUERY_ERROR'. "
+            "For 'category': Classify the item into ONE of these EXACT strings: GPU, CPU, RAM, Motherboard, Storage, Power Supply, Case, Cooling. "
+            "If the item is NOT a PC component, set 'category' EXACTLY to 'Not compatible (N/A)'. "
+            "Examples:\n"
+            "Input: ASUS ROG Strix GeForce RTX 4090 OC Edition 24GB -> {\"model\": \"RTX 4090 24GB\", \"category\": \"GPU\"}\n"
+            "Input: Intel Core i9-14900K 3.2 GHz 24-Core -> {\"model\": \"i9-14900K\", \"category\": \"CPU\"}\n"
+            "Input: Crucial T700 2TB Gen5 NVMe M.2 SSD -> {\"model\": \"T700 2TB\", \"category\": \"Storage\"}\n"
+            "Input: ASUS Z890 Motherboard -> {\"model\": \"ASUS Z890\", \"category\": \"Motherboard\"}\n"
+            "Input: iPhone 15 Pro Max -> {\"model\": \"iPhone 15 Pro Max\", \"category\": \"Not compatible (N/A)\"}\n"
         )
         
         try:
@@ -67,27 +71,31 @@ class TavilyHardwareAgent:
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": f"Title: {query}"}
                     ],
+                    "response_format": {"type": "json_object"},
                     "temperature": 0
                 },
                 timeout=10
             )
             if res.ok:
-                normalized = res.json()["choices"][0]["message"]["content"].strip().strip("'").strip('"')
-                return normalized
+                data = __import__('json').loads(res.json()["choices"][0]["message"]["content"])
+                return data
         except Exception as e:
-            print(f"[Groq Normalizer Error] {e}")
+            print(f"[Groq Analyzer Error] {e}")
             
-        return query
+        return {"model": query, "category": "Not compatible (N/A)"}
 
     async def run(self, prompt: str, emit_fn=None) -> dict:
         clean_prompt = prompt.strip()
         is_url = clean_prompt.startswith('http://') or clean_prompt.startswith('https://')
-        category = await self.detect_category(clean_prompt)
         
         if not is_url:
-            print(f"[AI Normalizer] Normalizing query: '{clean_prompt}'")
-            clean_prompt = await self.normalize_query_with_groq(clean_prompt)
-            print(f"[AI Normalizer] Result: '{clean_prompt}'")
+            print(f"[AI Analyzer] Normalizing and categorizing query: '{clean_prompt}'")
+            result = await self.analyze_query_with_groq(clean_prompt)
+            clean_prompt = result.get('model', clean_prompt)
+            category = result.get('category', 'Not compatible (N/A)')
+            print(f"[AI Analyzer] Result: '{clean_prompt}' ({category})")
+        else:
+            category = await self.detect_category(clean_prompt)
 
         if emit_fn:
             emit_fn('agent_start', {'query': clean_prompt, 'original_query': prompt.strip(), 'category': category, 'timestamp': datetime.now(timezone.utc).isoformat()})
@@ -811,39 +819,14 @@ class TavilyHardwareAgent:
         return 'Amazon'
 
     async def detect_category(self, text: str) -> str:
-        lower = text.lower()
-        if any(x in lower for x in ['rtx', 'gtx', 'radeon', 'rx', 'gpu']): return 'GPU'
-        if any(x in lower for x in ['ryzen', 'core', 'cpu', 'threadripper', 'epyc', 'intel core', 'amd ryzen']): return 'CPU'
-        if any(x in lower for x in ['ram', 'ddr4', 'ddr5', 'memory']): return 'RAM'
-        if any(x in lower for x in ['motherboard', 'mobo', 'z790', 'b650', 'x670', 'z690', 'b550', 'z890', 'x870', 'b850']): return 'Motherboard'
-        if any(x in lower for x in ['ssd', 'nvme', 'hdd', 'storage', 'samsung 9', 'wd black']): return 'Storage'
-        if any(x in lower for x in ['psu', 'power supply', 'corsair rm']): return 'Power Supply'
-        if any(x in lower for x in ['cooler', 'aio', 'heatsink', 'noctua']): return 'Cooling'
-        
         if not GROQ_API_KEY:
             return 'Not compatible (N/A)'
             
-        tavily_snippet = ""
-        try:
-            res = requests.post('https://api.tavily.com/search', json={
-                "api_key": self.get_tavily_key(),
-                "query": text + " pc component",
-                "search_depth": "basic",
-                "max_results": 1
-            }, timeout=5)
-            if res.ok:
-                results = res.json().get('results', [])
-                if results:
-                    tavily_snippet = results[0].get('content', '')
-        except Exception as e:
-            print(f"[Tavily Category Snippet Error] {e}")
-            pass
-            
         system_prompt = (
-            "Classify the following query into ONE of these strict categories: "
+            "Classify the following query or URL into ONE of these strict categories: "
             "GPU, CPU, RAM, Motherboard, Storage, Power Supply, Case, Cooling. "
-            "If it is NOT a PC computer component (e.g. phones, consoles, cars, laptops, random items), return EXACTLY: Not compatible (N/A). "
-            "Use the provided web search snippet context to help you accurately classify the item if it's ambiguous."
+            "If it is NOT a PC computer component, return EXACTLY: Not compatible (N/A). "
+            "Return ONLY the category name. Do not include any other text."
         )
         try:
             res = requests.post(
@@ -853,7 +836,7 @@ class TavilyHardwareAgent:
                     "model": "llama-3.1-8b-instant",
                     "messages": [
                         {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": f"Query: {text}\n\nSearch Context: {tavily_snippet}"}
+                        {"role": "user", "content": f"Query: {text}"}
                     ],
                     "temperature": 0
                 },
@@ -867,7 +850,8 @@ class TavilyHardwareAgent:
                 for vc in valid_categories:
                     if vc.lower() in category.lower():
                         return vc
-        except Exception:
+        except Exception as e:
+            print(f"[Groq Category Detect Error] {e}")
             pass
             
         return 'Not compatible (N/A)'
