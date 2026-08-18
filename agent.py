@@ -299,7 +299,6 @@ class TavilyHardwareAgent:
                                         "product_url": offer['url'],
                                         "image_url": offer.get('imageUrl') or "https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=600&q=80",
                                         "in_stock": offer['inStock'],
-                                        "added_at": datetime.now(timezone.utc).isoformat()
                                     })
                                     await asyncio.to_thread(query2.execute)
                                 except Exception as wl_e:
@@ -478,11 +477,10 @@ class TavilyHardwareAgent:
             except Exception as e:
                 error_str = str(e).lower()
                 if "payment" in error_str or "credits" in error_str or "401" in error_str or "402" in error_str or "rate limit" in error_str or "429" in error_str:
-                    print(f"[Firecrawl Error] Credit/Rate limit reached: {e}")
-                    self.rotate_firecrawl_key()
-                    app = self.get_firecrawl_app()
-                    print(f"[Firecrawl] Retrying {url} with new key ...")
-                    res = await asyncio.to_thread(lambda: app.scrape_url(url, formats=['html', 'markdown']))
+                    # Don't retry on rate-limit — all keys share the same plan limit.
+                    # Return None so the caller skips this candidate and moves on.
+                    print(f"[Firecrawl] Rate/credit limit — skipping {url}")
+                    return None
                 else:
                     raise e
             
@@ -810,38 +808,35 @@ class TavilyHardwareAgent:
             "4. If the item is listed as Used or Refurbished, set isRefurbished to true."
         )
         
-        import asyncio
         try:
-            for attempt in range(3):
-                async with httpx.AsyncClient() as client:
-                    res = await client.post(
-                        "https://api.groq.com/openai/v1/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {GROQ_API_KEY}",
-                            "Content-Type": "application/json"
-                        },
-                        json={
-                            "model": "groq/compound-mini",
-                            "messages": [
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": f"Extract info from this markdown:\n\n{markdown_content}"}
-                            ],
-                            "response_format": {"type": "json_object"},
-                            "temperature": 0
-                        },
-                        timeout=15.0
-                    )
-                if res.status_code == 200:
-                    data = res.json()
-                    content = data["choices"][0]["message"]["content"]
-                    return json.loads(content)
-                elif res.status_code == 429:
-                    print(f"[Groq 429] Rate limit hit. Waiting 5 seconds before retry...")
-                    await asyncio.sleep(5)
-                else:
-                    print(f"[Groq API Error] {res.status_code} - {res.text}")
-                    return None
-            return None
+            async with httpx.AsyncClient() as client:
+                res = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {GROQ_API_KEY}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": "llama-3.1-8b-instant",
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": f"Extract info from this markdown:\n\n{markdown_content[:6000]}"}
+                        ],
+                        "response_format": {"type": "json_object"},
+                        "temperature": 0
+                    },
+                    timeout=15.0
+                )
+            if res.status_code == 200:
+                data = res.json()
+                content = data["choices"][0]["message"]["content"]
+                return json.loads(content)
+            elif res.status_code == 429:
+                print(f"[Groq 429] Rate limit on AI fallback — skipping {retailer}")
+                return None
+            else:
+                print(f"[Groq API Error] {res.status_code} - {res.text[:100]}")
+                return None
         except Exception as e:
             print(f"[Groq Request Error] {e}")
             return None
