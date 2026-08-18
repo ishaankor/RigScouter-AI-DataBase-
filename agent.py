@@ -42,34 +42,80 @@ class TavilyHardwareAgent:
             self.current_firecrawl_index = (self.current_firecrawl_index + 1) % len(firecrawl_apps)
             print(f"[Firecrawl Key Rotated] Active key index: {self.current_firecrawl_index + 1}/{len(firecrawl_apps)}")
 
+    # --------------------------------------------------------
+    # FAST REGEX PRE-FILTER
+    # Classifies obvious hardware queries without any LLM call.
+    # Only truly ambiguous queries reach Groq.
+    # --------------------------------------------------------
+    _REGEX_RULES = [
+        # GPU — RTX / GTX / RX / Arc
+        (re.compile(r'\b(geforce\s+)?(rtx|gtx)\s*\d{3,4}(?:\s*(super|ti|xt))?\b', re.I), 'GPU'),
+        (re.compile(r'\b(radeon\s+)?rx\s*\d{3,4}(?:\s*(xt|xtx|gre))?\b', re.I), 'GPU'),
+        (re.compile(r'\barc\s+[ab]\d{3,4}\b', re.I), 'GPU'),
+        # CPU
+        (re.compile(r'\b(ryzen\s*[3579]|threadripper)\s+\d{4,5}[a-z0-9]*\b', re.I), 'CPU'),
+        (re.compile(r'\b(core\s+)?(i[3579]|ultra\s*\d+)-\d{4,6}[a-z]*\b', re.I), 'CPU'),
+        # RAM
+        (re.compile(r'\b\d+gb\s+(ddr[45]|so-?dimm)\b', re.I), 'RAM'),
+        (re.compile(r'\bddr[45]-\d{4,5}\b', re.I), 'RAM'),
+        # Storage
+        (re.compile(r'\b\d+(tb|gb)\s+(nvme|ssd|hdd|m\.2)\b', re.I), 'Storage'),
+        (re.compile(r'\b(nvme|ssd)\s+\d+(tb|gb)\b', re.I), 'Storage'),
+        # PSU
+        (re.compile(r'\b\d{3,4}w\s+(psu|power\s+supply|modular)\b', re.I), 'Power Supply'),
+        # Motherboard
+        (re.compile(r'\b(z\d{3}|b\d{3}|x\d{3}|a\d{3})\s*(e|f|p|m|a|plus|pro|max|wifi)?\s*(motherboard|atx|matx|itx)\b', re.I), 'Motherboard'),
+    ]
+
+    def _fast_classify(self, query: str) -> dict | None:
+        """Return classification instantly if the query matches a known hardware pattern."""
+        text = query.strip()
+        for pattern, category in self._REGEX_RULES:
+            if pattern.search(text):
+                print(f"[Fast Classify] '{text}' → {category} (regex)")
+                return {"model": text, "category": category}
+        return None
+
     async def analyze_query_with_groq(self, query: str) -> dict:
+        # Try regex first — zero tokens, zero latency.
+        fast = self._fast_classify(query)
+        if fast:
+            return fast
+
         if not GROQ_API_KEY:
             return {"model": query, "category": "Not compatible (N/A)"}
-            
+
         system_prompt = (
             "You are an AI that extracts the core, canonical hardware model from messy product titles, and classifies the component into a strict category. "
             "Return ONLY a JSON object with two keys: 'model' and 'category'. "
             "For 'model': Strip marketing fluff (e.g., 'Quad-Core', 'White Edition', 'Graphics Card', 'Desktop'). "
             "CRITICAL: Do NOT strip capacities like '2TB', '850W', '16GB'. "
-            "If the input is a broad chipset or family (e.g. 'X870', 'B650', 'Ryzen 5', 'RTX 4070') without a specific brand/model, set 'model' EXACTLY to 'GENERIC_QUERY_ERROR'. "
+            "Only set 'model' to EXACTLY 'GENERIC_QUERY_ERROR' if the query is a broad product LINE or CHIPSET FAMILY with no specific model number "
+            "(e.g. 'RTX 40 series', 'Ryzen 5000 series', 'X870 chipset', 'DDR5 RAM', 'NVMe SSD'). "
+            "IMPORTANT: 'RTX 4070', 'RTX 5050', 'RX 7900 XT', 'i9-14900K', 'Ryzen 7 7800X3D' are all SPECIFIC models — do NOT return GENERIC_QUERY_ERROR for these. "
             "For 'category': Classify the item into ONE of these EXACT strings: GPU, CPU, RAM, Motherboard, Storage, Power Supply, Case, Cooling, Monitor, Peripherals, Networking. "
             "If the item is NOT a computer component or peripheral, set 'category' EXACTLY to 'Not compatible (N/A)'. "
             "Examples:\n"
-            "Input: ASUS ROG Strix GeForce RTX 4090 OC Edition 24GB -> {\"model\": \"RTX 4090 24GB\", \"category\": \"GPU\"}\n"
+            "Input: ASUS ROG Strix GeForce RTX 4090 OC Edition 24GB -> {\"model\": \"RTX 4090\", \"category\": \"GPU\"}\n"
+            "Input: RTX 5050 -> {\"model\": \"RTX 5050\", \"category\": \"GPU\"}\n"
+            "Input: RTX 4070 -> {\"model\": \"RTX 4070\", \"category\": \"GPU\"}\n"
+            "Input: GeForce RTX 5050 -> {\"model\": \"RTX 5050\", \"category\": \"GPU\"}\n"
             "Input: Intel Core i9-14900K 3.2 GHz 24-Core -> {\"model\": \"i9-14900K\", \"category\": \"CPU\"}\n"
             "Input: Crucial T700 2TB Gen5 NVMe M.2 SSD -> {\"model\": \"T700 2TB\", \"category\": \"Storage\"}\n"
             "Input: ASUS Z890 Motherboard -> {\"model\": \"ASUS Z890\", \"category\": \"Motherboard\"}\n"
             "Input: MSI PRO MP273L 27\" IPS Monitor -> {\"model\": \"PRO MP273L\", \"category\": \"Monitor\"}\n"
+            "Input: RTX 40 series -> {\"model\": \"GENERIC_QUERY_ERROR\", \"category\": \"GPU\"}\n"
+            "Input: Ryzen 5 -> {\"model\": \"GENERIC_QUERY_ERROR\", \"category\": \"CPU\"}\n"
             "Input: iPhone 15 Pro Max -> {\"model\": \"iPhone 15 Pro Max\", \"category\": \"Not compatible (N/A)\"}\n"
         )
-        
+
         try:
             async with httpx.AsyncClient() as client:
                 res = await client.post(
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                     json={
-                        "model": "groq/compound-mini",
+                        "model": "llama-3.1-8b-instant",
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": f"Title: {query}"}
@@ -82,9 +128,9 @@ class TavilyHardwareAgent:
                 if res.status_code == 200:
                     raw_content = res.json()["choices"][0]["message"]["content"]
                     print(f"[DEBUG Groq Analyzer] Raw JSON response: {raw_content}")
-                    data = __import__('json').loads(raw_content)
-                    
-                    # Smart context fallback: if it's considered Not compatible, it might just be an obscure part number. Do a quick Tavily search to give the LLM context.
+                    data = json.loads(raw_content)
+
+                    # Smart context fallback: if it's considered Not compatible, it might just be an obscure part number.
                     if data.get('category') == 'Not compatible (N/A)' and self.get_tavily_key():
                         try:
                             print(f"[AI Analyzer] '{query}' marked Not compatible. Fetching web context...")
@@ -102,7 +148,7 @@ class TavilyHardwareAgent:
                                         "https://api.groq.com/openai/v1/chat/completions",
                                         headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                                         json={
-                                            "model": "groq/compound-mini",
+                                            "model": "llama-3.1-8b-instant",
                                             "messages": [
                                                 {"role": "system", "content": system_prompt + "\nUse the provided web search snippet context to help you accurately classify the item if it's ambiguous."},
                                                 {"role": "user", "content": f"Title: {query}\n\nSearch Context: {snippet}"}
@@ -113,14 +159,16 @@ class TavilyHardwareAgent:
                                         timeout=5.0
                                     )
                                     if res2.status_code == 200:
-                                        data = __import__('json').loads(res2.json()["choices"][0]["message"]["content"])
+                                        data = json.loads(res2.json()["choices"][0]["message"]["content"])
                         except Exception as e:
                             print(f"[Tavily Fallback Error] {e}")
 
-                return data
+                    return data
+                else:
+                    print(f"[Groq Analyzer] HTTP {res.status_code}: {res.text[:200]}")
         except Exception as e:
             print(f"[Groq Analyzer Error] {e}")
-            
+
         return {"model": query, "category": "Not compatible (N/A)"}
 
     async def run(self, prompt: str, emit_fn=None, user_id: str = None, pending_id: str = None) -> dict:
