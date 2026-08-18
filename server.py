@@ -254,16 +254,34 @@ async def get_watchlist():
     except Exception as e:
         return {"error": str(e)}
 
+async def _run_scrape_in_background(
+    clean_query: str,
+    user_id: str = None,
+    pending_id: str = None,
+):
+    """Fire-and-forget: run the agent and push all events via SSE."""
+    try:
+        print(f"[BG Scrape] Starting: \"{clean_query}\"")
+        await agent.run(clean_query, agent_sse_emitter, user_id, pending_id)
+    except Exception as e:
+        print(f"[BG Scrape Error] \"{clean_query}\": {e}")
+        broadcast_sse("agent_error", {
+            "query": clean_query,
+            "error": str(e),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+
 async def handle_database_proxy_scrape(target_query: str, user_id: str = None, pending_id: str = None):
     try:
         clean_query = target_query.strip()
-        
-        # Step A: Check DB
-        query = supabase.table('hardware_components').select('*') \
+
+        # Step A: Check DB cache — return instantly if we have a fresh result.
+        db_query = supabase.table('hardware_components').select('*') \
             .or_(f"name.ilike.%{clean_query}%,model.ilike.%{clean_query}%,product_url.ilike.%{clean_query}%") \
             .order('updated_at', desc=True).limit(1)
-        res = await asyncio.to_thread(query.execute)
-            
+        res = await asyncio.to_thread(db_query.execute)
+
         if res.data and len(res.data) > 0:
             match = res.data[0]
             print(f"[DB Match Hit] Returning \"{match['name']}\" (${match['current_price']}) from Supabase DB")
@@ -298,43 +316,24 @@ async def handle_database_proxy_scrape(target_query: str, user_id: str = None, p
                 }
             }
 
-        # Step B: Scrape
+        # Step B: DB miss — kick off a background scrape and return immediately.
+        # Results arrive asynchronously via SSE (agent_start / retailer_found /
+        # agent_complete events), so the HTTP connection is freed right away.
         print(f"[DB Miss] \"{clean_query}\" missing from DB. Executing Agent to scrape & add to database...")
-        agent_result = await agent.run(clean_query, agent_sse_emitter, user_id, pending_id)
-        best_offer = agent_result.get('bestOffer')
-        
-        if best_offer and best_offer.get('price'):
-            return {
-                "source": 'agent_scraped_and_saved_to_db',
-                "query": clean_query,
-                "scrapedAt": datetime.now(timezone.utc).isoformat(),
-                "bestOffer": best_offer,
-                "component": {
-                    "id": f"agent-{int(datetime.now().timestamp() * 1000)}",
-                    "name": best_offer.get('title', clean_query),
-                    "category": agent_result.get('category', 'GPU'),
-                    "brand": best_offer.get('brand', best_offer.get('title', 'Hardware').split(' ')[0]),
-                    "model": clean_query,
-                    "specs": {},
-                    "msrp": best_offer.get('originalPrice') or round(best_offer['price'] * 1.12, 2),
-                    "currentPrice": best_offer['price'],
-                    "lowestPrice90d": round(best_offer['price'] * 0.96, 2),
-                    "retailer": best_offer.get('retailer', 'Micro Center'),
-                    "productUrl": best_offer.get('url', f"https://www.amazon.com/s?k={clean_query}"),
-                    "imageUrl": 'https://images.unsplash.com/photo-1587202372775-e229f172b9d7?auto=format&fit=crop&w=600&q=80',
-                    "rating": 4.8,
-                    "dealScore": 90
-                }
-            }
+        asyncio.create_task(
+            _run_scrape_in_background(clean_query, user_id, pending_id)
+        )
 
         return {
-            "found": False,
+            "source": "agent_scraping",
             "query": clean_query,
-            "component": None,
-            "notice": f"Could not retrieve live price for \"{clean_query}\""
+            "message": "Scrape started. Results will arrive via SSE (agent_complete event).",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+
     except Exception as e:
         print("[Backend Proxy Error]:", str(e))
+        import traceback; traceback.print_exc()
         return {"error": str(e)}
 
 @app.post("/api/scrape")
