@@ -477,8 +477,12 @@ class TavilyHardwareAgent:
                     clean_url = full_url.replace('/reviews/', '').split('?')[0]
                     content = hit.get('content', '')
                     
+                    # Strip shipping fees, delivery charges, and monthly financing costs before price extraction
+                    clean_content = re.sub(r'(?:shipping|delivery|handling|postage|est\.?\s*shipping|import\s*charges)[:\s]*\$[0-9,]+(?:\.[0-9]{2})?', '', content, flags=re.I)
+                    clean_content = re.sub(r'\$[0-9,]+(?:\.[0-9]{2})?\s*(?:shipping|delivery|handling|postage|per\s*month|/\s*mo)', '', clean_content, flags=re.I)
+                    
                     # Estimate price from snippet
-                    prices = re.findall(r'\$[0-9,]+(?:\.[0-9]{2})?', content)
+                    prices = re.findall(r'\$[0-9,]+(?:\.[0-9]{2})?', clean_content)
                     est_price = float('inf')
                     if prices:
                         try:
@@ -875,9 +879,10 @@ class TavilyHardwareAgent:
             f"The user was looking for '{query}'. Extract the price of the MAIN product. "
             "CRITICAL RULES:\n"
             "1. Ignore prices for 'frequently bought together', 'sponsored items', or 'related products'.\n"
-            "2. If the text says 'Currently unavailable', 'Out of stock', or 'We don't know when or if this item will be back in stock', you MUST set inStock to false and price to null.\n"
-            "3. If the retailer is eBay, reject any listing that implies the item is broken, 'For Parts', 'Not Working', 'Box Only', or 'As Is' (set price to null).\n"
-            "4. If the item is listed as Used or Refurbished, set isRefurbished to true."
+            "2. Never extract shipping costs, delivery fees, import charges, taxes, or financing options (e.g. '$5.80 shipping' or '$20/month'). Extract ONLY the actual buy-it-now / purchase price of the item itself.\n"
+            "3. If the text says 'Currently unavailable', 'Out of stock', or 'We don't know when or if this item will be back in stock', you MUST set inStock to false and price to null.\n"
+            "4. If the retailer is eBay, reject any listing that implies the item is broken, 'For Parts', 'Not Working', 'Box Only', or 'As Is' (set price to null).\n"
+            "5. If the item is listed as Used or Refurbished, set isRefurbished to true."
         )
         
         try:
@@ -929,26 +934,32 @@ class TavilyHardwareAgent:
     async def filter_matching_titles(self, titles: list[str], query: str, category: str) -> list[bool]:
         import re
         results = []
-        clean_q_words = re.sub(r'[^a-z0-9\s]', '', query.lower()).split()
-        longest_word = max(clean_q_words, key=len) if clean_q_words else ""
+        clean_q_words = [w for w in re.sub(r'[^a-z0-9\s]', '', query.lower()).split() if len(w) > 2]
         
         for t in titles:
             lower_t = t.lower()
             clean_t = re.sub(r'[^a-z0-9]', '', lower_t)
             
-            # Rule 1: Must contain the core model keyword
-            if longest_word and longest_word not in clean_t:
+            # Rule 1: Must contain core query model identifiers
+            model_tokens = [w for w in clean_q_words if re.search(r'\d', w) or len(w) >= 4]
+            if model_tokens and not any(m in clean_t for m in model_tokens):
                 results.append(False)
                 continue
                 
-            # Rule 2: Reject broken or empty items
-            bad_keywords = ['for parts', 'broken', 'box only', 'read description', 'empty box', 'waterblock', 'only box', 'cooler only', 'heatsink only']
+            # Rule 2: Reject accessories, replacements, parts, boxes, or misleading listings
+            bad_keywords = [
+                'for parts', 'broken', 'box only', 'read description', 'empty box', 
+                'waterblock', 'only box', 'cooler only', 'heatsink only', 'thermal paste',
+                'sticker', 'badge', 'decal', 'packaging only', 'manual only', 'cable only',
+                'bracket only', 'screws only', 'mounting kit', 'keycap', 'replacement fan',
+                'backplate only', 'not working', 'as is', 'dummy', 'poster', 'case badge'
+            ]
             if any(b in lower_t for b in bad_keywords):
                 results.append(False)
                 continue
                 
-            # Rule 3: Reject full prebuilts if looking for raw components
-            if category in ['GPU', 'CPU', 'Motherboard', 'RAM']:
+            # Rule 3: Reject prebuilts if looking for raw components
+            if category in ['GPU', 'CPU', 'Motherboard', 'RAM', 'Storage', 'Power Supply']:
                 pc_keywords = ['desktop pc', 'gaming pc', 'gaming desktop', 'laptop', 'prebuilt', 'built pc', 'computer system']
                 if any(p in lower_t for p in pc_keywords):
                     results.append(False)
@@ -959,10 +970,28 @@ class TavilyHardwareAgent:
         return results
 
     def is_price_sanity_valid(self, price: float, query: str, category: str) -> bool:
-        if not price or price <= 0: return False
-        lower = query.lower()
-        if '4070 super' in lower: return 450 <= price <= 950
-        if category == 'GPU' and (price < 80 or price > 5000): return False
+        if not price or price <= 0:
+            return False
+
+        # Category-level realistic price floors & ceilings for modern standalone computer hardware
+        CATEGORY_PRICE_BOUNDS = {
+            'GPU': (50.0, 5000.0),
+            'CPU': (35.0, 3000.0),
+            'Motherboard': (35.0, 1500.0),
+            'RAM': (15.0, 1200.0),
+            'Storage': (15.0, 1500.0),
+            'Power Supply': (25.0, 1000.0),
+            'Case': (25.0, 800.0),
+            'Cooling': (10.0, 600.0),
+            'Monitor': (40.0, 3500.0),
+            'Peripherals': (5.0, 800.0),
+            'Networking': (10.0, 1000.0),
+        }
+
+        min_bound, max_bound = CATEGORY_PRICE_BOUNDS.get(category, (5.0, 10000.0))
+        if price < min_bound or price > max_bound:
+            return False
+
         return True
 
     def detect_retailer(self, text: str) -> str:
@@ -1014,7 +1043,8 @@ class TavilyHardwareAgent:
         return 'Not compatible (N/A)'
 
     def normalize_model(self, text: str, fallback: str) -> str:
-        lower = text.lower()
-        if '4070 super' in lower: return 'RTX 4070 Super'
-        if '7800x3d' in lower: return 'Ryzen 7 7800X3D'
-        return fallback or text
+        if fallback and len(fallback.strip()) > 2:
+            return fallback.strip()
+        clean = re.sub(r'^(asus|msi|gigabyte|zotac|evga|sapphire|xfx|pny|powercolor|asrock|intel|amd|nvidia|corsair|g\.skill|samsung|crucial|western digital|wd)\s+', '', text, flags=re.I)
+        clean = re.sub(r'\s+(graphics card|video card|processor|desktop processor|cpu|gpu|ddr4|ddr5|ram|nvme|ssd|motherboard|power supply|edition|oc|gaming).*$', '', clean, flags=re.I).strip()
+        return clean or text

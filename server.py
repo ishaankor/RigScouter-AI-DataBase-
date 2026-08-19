@@ -55,21 +55,42 @@ def broadcast_sse(event_name: str, data: dict):
 def agent_sse_emitter(event_name: str, data: dict):
     broadcast_sse(event_name, data)
 
-# ─── Parts Queue: the daily scheduler scrapes these continuously to update prices
-PARTS_QUEUE = [
-    'RTX 4060',
+# ─── Dynamic Parts Queue: fetched from live watchlist & component database ───
+DEFAULT_PARTS_CATALOG = [
     'RTX 4070 Super',
-    'RTX 4070 Ti Super',
-    'RX 7800 XT',
-    'GTX 1080 Ti',
     'Ryzen 7 7800X3D',
+    'RTX 4060',
+    'RX 7800 XT',
     'Intel i5-14600K',
     'Ryzen 5 7600X',
     'Corsair Vengeance DDR5 32GB',
     'G.Skill Trident Z5 DDR5',
-    'Samsung 990 Pro 1TB',
+    'Samsung 990 Pro 2TB',
     'WD Black SN850X 1TB',
 ]
+
+async def get_dynamic_parts_queue() -> list[str]:
+    """Dynamically fetches active user-monitored watchlist items and trending components."""
+    try:
+        wl_res = await asyncio.to_thread(
+            supabase.table('watchlist_items').select('component_name').limit(50).execute
+        )
+        parts = [r['component_name'] for r in (wl_res.data or []) if r.get('component_name')]
+
+        hw_res = await asyncio.to_thread(
+            supabase.table('hardware_components').select('model, name').order('deal_score', desc=True).limit(25).execute
+        )
+        for r in (hw_res.data or []):
+            item_name = r.get('model') or r.get('name')
+            if item_name and item_name not in parts:
+                parts.append(item_name)
+
+        if parts:
+            return parts
+    except Exception as e:
+        print(f"[Dynamic Parts Queue Notice]: {e}")
+
+    return DEFAULT_PARTS_CATALOG
 
 # ─── Scheduler State ──────────────────────────────────────────────────────────
 scheduler_state = {
@@ -85,11 +106,12 @@ async def run_scheduler_tick():
         return
 
     scheduler_state["schedulerRunning"] = True
-    part = PARTS_QUEUE[scheduler_state["schedulerQueueIndex"] % len(PARTS_QUEUE)]
+    queue = await get_dynamic_parts_queue()
+    part = queue[scheduler_state["schedulerQueueIndex"] % len(queue)]
     scheduler_state["schedulerQueueIndex"] += 1
     scheduler_state["lastSchedulerRun"] = datetime.now(timezone.utc).isoformat()
 
-    print(f"\n[Scheduler] ⏱ Auto-updating daily prices for: \"{part}\" ({scheduler_state['schedulerQueueIndex']}/{len(PARTS_QUEUE)})")
+    print(f"\n[Scheduler] ⏱ Auto-updating daily prices for: \"{part}\" ({scheduler_state['schedulerQueueIndex']}/{len(queue)})")
     broadcast_sse('scheduler_tick', {
         "query": part,
         "queueIndex": scheduler_state["schedulerQueueIndex"],
@@ -109,7 +131,7 @@ async def run_scheduler_tick():
         scheduler_state["schedulerRunning"] = False
 
 async def scheduler_loop():
-    print(f"[Scheduler] Starting daily price updater — scraping every {SCHEDULER_INTERVAL_SECONDS / 60} minutes")
+    print(f"[Scheduler] Starting dynamic price updater — scraping every {SCHEDULER_INTERVAL_SECONDS / 60} minutes")
     await asyncio.sleep(5)
     await run_scheduler_tick()
     while True:
@@ -120,13 +142,15 @@ async def scheduler_loop():
 
 @app.get("/")
 async def root():
+    queue = await get_dynamic_parts_queue()
     return {
         "status": "ok",
         "service": "RigScouter-AI Backend Proxy & Autonomous Tavily Agent",
         "databaseConnected": True,
         "schedulerActive": True,
         "intervalMinutes": SCHEDULER_INTERVAL_SECONDS / 60,
-        "nextScheduledPart": PARTS_QUEUE[scheduler_state["schedulerQueueIndex"] % len(PARTS_QUEUE)],
+        "nextScheduledPart": queue[scheduler_state["schedulerQueueIndex"] % len(queue)],
+        "trackedCount": len(queue),
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
@@ -140,13 +164,14 @@ async def health():
 
 @app.get("/api/status")
 async def api_status():
+    queue = await get_dynamic_parts_queue()
     return {
         "schedulerRunning": scheduler_state["schedulerRunning"],
         "lastSchedulerRun": scheduler_state["lastSchedulerRun"],
         "schedulerQueueIndex": scheduler_state["schedulerQueueIndex"],
-        "nextPart": PARTS_QUEUE[scheduler_state["schedulerQueueIndex"] % len(PARTS_QUEUE)],
-        "partsQueue": PARTS_QUEUE,
-        "totalParts": len(PARTS_QUEUE),
+        "nextPart": queue[scheduler_state["schedulerQueueIndex"] % len(queue)],
+        "partsQueue": queue,
+        "totalParts": len(queue),
         "intervalMinutes": SCHEDULER_INTERVAL_SECONDS / 60,
         "connectedSseClients": len(sse_clients),
         "timestamp": datetime.now(timezone.utc).isoformat()
