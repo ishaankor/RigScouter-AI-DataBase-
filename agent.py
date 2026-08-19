@@ -86,12 +86,22 @@ class TavilyHardwareAgent:
     ]
 
     def _fast_classify(self, query: str) -> dict | None:
-        """Return classification instantly if the query matches a known hardware pattern."""
+        """Return classification instantly if the query matches a known hardware pattern.
+
+        Returns just the MATCHED hardware token (e.g. "RTX 4090"), not the whole
+        raw input string — otherwise a messy title like "ASUS ROG Strix GeForce
+        RTX 4090 OC Edition 24GB" would be sent to retailers verbatim as the
+        search query, drastically cutting down on how many listings can match it.
+        """
         text = query.strip()
         for pattern, category in self._REGEX_RULES:
-            if pattern.search(text):
-                print(f"[Fast Classify] '{text}' → {category} (regex)")
-                return {"model": text, "category": category}
+            match = pattern.search(text)
+            if match:
+                extracted = match.group(0).strip()
+                # Collapse internal whitespace from the match (e.g. "RTX   4090" -> "RTX 4090")
+                extracted = re.sub(r'\s+', ' ', extracted)
+                print(f"[Fast Classify] '{text}' → '{extracted}' / {category} (regex)")
+                return {"model": extracted, "category": category}
         return None
 
     async def analyze_query_with_groq(self, query: str) -> dict:
@@ -619,19 +629,23 @@ class TavilyHardwareAgent:
                         print(f"⚠️ [Out of Stock] Amazon: Item is marked unavailable in BS4.")
                         return None
                         
-                    # Check for Used/Warehouse deals explicitly featured in the buybox
-                    used_price_container = soup.select_one('#usedBuySection .a-price') or \
-                                           soup.select_one('#olp-upd-new-used .a-color-price')
-                    
-                    if used_price_container:
-                        is_refurbished = True
-
-                    # Main price is usually in specific buy box containers
-                    price_container = used_price_container or \
-                                      soup.select_one('#corePriceDisplay_desktop_feature_div .a-price') or \
+                    # Main price MUST come from the actual new-item buybox first. Nearly every
+                    # popular Amazon listing also has a "used/warehouse" offers section on the
+                    # page even when the primary listing is new — treating that section as a
+                    # priority source (old behavior) silently substituted a used price for the
+                    # new one on a huge fraction of listings. Only fall back to the used price
+                    # if no new-item buybox price exists at all.
+                    price_container = soup.select_one('#corePriceDisplay_desktop_feature_div .a-price') or \
                                       soup.select_one('#corePrice_feature_div .a-price') or \
                                       soup.select_one('#corePrice_desktop .a-price') or \
                                       soup.select_one('#apex_desktop .a-price')
+
+                    if not price_container:
+                        used_price_container = soup.select_one('#usedBuySection .a-price') or \
+                                               soup.select_one('#olp-upd-new-used .a-color-price')
+                        if used_price_container:
+                            price_container = used_price_container
+                            is_refurbished = True
 
                     if price_container:
                         price_whole = price_container.select_one('.a-price-whole')
@@ -694,10 +708,13 @@ class TavilyHardwareAgent:
                                     item_name = item.get('name', '').lower()
                                     if model_query and item_name:
                                         import re
-                                        clean_q_words = re.sub(r'[^a-z0-9\s]', '', model_query.lower()).split()
-                                        longest_word = max(clean_q_words, key=len) if clean_q_words else ""
+                                        clean_q_words = [w for w in re.sub(r'[^a-z0-9\s]', '', model_query.lower()).split() if len(w) > 2]
+                                        digit_tokens = [w for w in clean_q_words if re.search(r'\d', w)]
                                         clean_item_name = re.sub(r'[^a-z0-9]', '', item_name)
-                                        if longest_word and longest_word not in clean_item_name:
+                                        # Require ALL digit-bearing tokens (model numbers/capacities), not just
+                                        # the single "longest word" — that heuristic let e.g. "RTX 4070" match a
+                                        # JSON-LD entry for "RTX 4090" whenever some other longer word matched.
+                                        if digit_tokens and not all(d in clean_item_name for d in digit_tokens):
                                             continue
                                             
                                     offers = item['offers']
@@ -828,6 +845,16 @@ class TavilyHardwareAgent:
                 if not is_match:
                     print(f"⚠️ [Title Mismatch] {retailer_name}: \"{title}\" does not match query \"{model_query}\"")
                     return None
+            elif model_query:
+                # No title could be scraped (selector drift, unusual page layout, etc). The old
+                # code fell straight through to accepting whatever price it found, with zero
+                # verification that the page was even for the right product. Validate against
+                # a slice of the raw page text instead of blindly trusting the price.
+                page_text_sample = (markdown_content or html_content or '')[:3000]
+                is_match = (await self.filter_matching_titles([page_text_sample], model_query, category))[0]
+                if not is_match:
+                    print(f"⚠️ [No Title — Content Mismatch] {retailer_name}: page content doesn't confirm \"{model_query}\"")
+                    return None
                 
             if price and self.is_price_sanity_valid(price, model_query or title or url, category):
                 print(f"✅ [BS4 Hit] {retailer_name}: Found price ${price:.2f}")
@@ -940,9 +967,20 @@ class TavilyHardwareAgent:
             lower_t = t.lower()
             clean_t = re.sub(r'[^a-z0-9]', '', lower_t)
             
-            # Rule 1: Must contain core query model identifiers
-            model_tokens = [w for w in clean_q_words if re.search(r'\d', w) or len(w) >= 4]
-            if model_tokens and not any(m in clean_t for m in model_tokens):
+            # Rule 1: Must contain core query model identifiers.
+            # Digit-bearing tokens (model numbers, capacities, wattages — "4090", "24gb",
+            # "14900k") are the actual identifying part of a hardware query. Requiring only
+            # ANY ONE of these (the old behavior) let "RTX 4070" match a listing for
+            # "RTX 4090 24GB" purely because "24gb" happened to appear in both. Require ALL
+            # digit-bearing tokens to be present so distinct SKUs in the same product line
+            # can't be confused with each other.
+            digit_tokens = [w for w in clean_q_words if re.search(r'\d', w)]
+            word_tokens = [w for w in clean_q_words if len(w) >= 4 and not re.search(r'\d', w)]
+
+            if digit_tokens and not all(d in clean_t for d in digit_tokens):
+                results.append(False)
+                continue
+            if not digit_tokens and word_tokens and not any(w in clean_t for w in word_tokens):
                 results.append(False)
                 continue
                 
