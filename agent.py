@@ -313,29 +313,6 @@ class TavilyHardwareAgent:
                             })
                             await asyncio.to_thread(query1.execute)
                             print(f"[DB Persist Success] Saved \"{offer['retailer']}\" offer: \"{offer['title']}\" (${offer['price']:.2f}) to hardware_components")
-                            
-                            # Also persist directly to the user's watchlist if triggered by a user
-                            if user_id and pending_id:
-                                try:
-                                    wl_row = {
-                                        "component_id": offer_component_id,
-                                        "component_name": offer['title'] or clean_prompt,
-                                        "category": category,
-                                        "target_price": round(offer['price'] * 0.9, 2),
-                                        "previous_price_24h": round(offer['price'] * 1.05, 2),
-                                        "previous_price_7d": round(offer['price'] * 1.08, 2),
-                                        "previous_price_30d": round(offer['price'] * 1.12, 2),
-                                        "all_time_low": offer['price'],
-                                    }
-                                    if user_id:
-                                        wl_row["user_id"] = user_id
-
-                                    res2 = await asyncio.to_thread(
-                                        supabase.table('watchlist_items').insert(wl_row).execute
-                                    )
-                                    print(f"[Watchlist Persist Success] Added '{offer['retailer']}' offer to watchlist_items")
-                                except Exception as wl_e:
-                                    print(f"[Watchlist Persist Notice]: {wl_e}")
                         except Exception as e:
                             print(f"[Agent Incremental Persistence Error]: {e}")
                             
@@ -367,6 +344,44 @@ class TavilyHardwareAgent:
             state["summary"] = f"Evaluated {len(state['scrapedOffers'])} live retailer listings. Cheapest available offer: ${state['bestOffer']['price']:.2f} at {state['bestOffer']['retailer']} ({stock_status})."
         else:
             state["summary"] = f"No live prices found across retailers for \"{clean_prompt}\"."
+
+        # Single consolidated user watchlist entry
+        if user_id and pending_id and state.get("bestOffer"):
+            try:
+                best = state["bestOffer"]
+                primary_comp_id = f"comp-{re.sub(r'[^a-z0-9]+', '-', clean_prompt.lower())}"
+                wl_row = {
+                    "component_id": primary_comp_id,
+                    "component_name": best.get('title') or clean_prompt,
+                    "category": category,
+                    "target_price": round(best['price'] * 0.9, 2),
+                    "previous_price_24h": round(best['price'] * 1.05, 2),
+                    "previous_price_7d": round(best['price'] * 1.08, 2),
+                    "previous_price_30d": round(best['price'] * 1.12, 2),
+                    "all_time_low": best['price'],
+                }
+                if user_id:
+                    wl_row["user_id"] = user_id
+
+                # Check if this user already has an entry for this clean_prompt / component_id
+                existing_check = supabase.table('watchlist_items').select('id').eq('component_id', primary_comp_id)
+                if user_id:
+                    existing_check = existing_check.eq('user_id', user_id)
+                existing_res = await asyncio.to_thread(existing_check.execute)
+
+                if existing_res.data and len(existing_res.data) > 0:
+                    target_id = existing_res.data[0]['id']
+                    await asyncio.to_thread(
+                        supabase.table('watchlist_items').update(wl_row).eq('id', target_id).execute
+                    )
+                    print(f"[Watchlist Persist Success] Updated single entry for '{clean_prompt}' in watchlist_items")
+                else:
+                    await asyncio.to_thread(
+                        supabase.table('watchlist_items').insert(wl_row).execute
+                    )
+                    print(f"[Watchlist Persist Success] Created single entry for '{clean_prompt}' in watchlist_items")
+            except Exception as wl_e:
+                print(f"[Watchlist Persist Notice]: {wl_e}")
 
         if state.get("bestOffer"):
             try:

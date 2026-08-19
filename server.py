@@ -374,13 +374,16 @@ async def get_agent_run(query: str = None, q: str = None):
 async def delete_watchlist(id: str):
     import re
     try:
-        # Only hit watchlist_items if id looks like a UUID
         if re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', id, re.I):
             query = supabase.table('watchlist_items').delete().eq('id', id)
             await asyncio.to_thread(query.execute)
         else:
-            # Legacy string id (w-*): delete matching hardware_components row if present
-            hw_query = supabase.table('hardware_components').delete().eq('id', id.replace('w-', 'comp-', 1))
+            comp_id = id.replace('w-', 'comp-', 1) if id.startswith('w-') else id
+            # Delete from watchlist_items by component_id
+            wl_query = supabase.table('watchlist_items').delete().ilike('component_id', f"%{comp_id.replace('comp-', '')}%")
+            await asyncio.to_thread(wl_query.execute)
+            # Also clean up any hardware_components entry if it was user-specific
+            hw_query = supabase.table('hardware_components').delete().eq('id', comp_id)
             await asyncio.to_thread(hw_query.execute)
         return {"success": True, "deletedId": id}
     except Exception as e:
