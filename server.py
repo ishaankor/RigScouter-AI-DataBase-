@@ -228,7 +228,7 @@ async def get_components(category: str = None, q: str = None):
 @app.get("/api/watchlist")
 async def get_watchlist():
     try:
-        query = supabase.table('watchlist_items').select('*').order('added_at', desc=True)
+        query = supabase.table('watchlist_items').select('*').order('id', desc=True)
         res = await asyncio.to_thread(query.execute)
         formatted = []
         for item in res.data:
@@ -372,9 +372,16 @@ async def get_agent_run(query: str = None, q: str = None):
 
 @app.delete("/api/watchlist/{id}")
 async def delete_watchlist(id: str):
+    import re
     try:
-        query = supabase.table('watchlist_items').delete().eq('id', id)
-        res = await asyncio.to_thread(query.execute)
+        # Only hit watchlist_items if id looks like a UUID
+        if re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', id, re.I):
+            query = supabase.table('watchlist_items').delete().eq('id', id)
+            await asyncio.to_thread(query.execute)
+        else:
+            # Legacy string id (w-*): delete matching hardware_components row if present
+            hw_query = supabase.table('hardware_components').delete().eq('id', id.replace('w-', 'comp-', 1))
+            await asyncio.to_thread(hw_query.execute)
         return {"success": True, "deletedId": id}
     except Exception as e:
         return {"error": str(e)}

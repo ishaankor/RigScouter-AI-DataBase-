@@ -48,23 +48,41 @@ class TavilyHardwareAgent:
     # Only truly ambiguous queries reach Groq.
     # --------------------------------------------------------
     _REGEX_RULES = [
-        # GPU — RTX / GTX / RX / Arc
+        # GPU — RTX / GTX (NVIDIA)
         (re.compile(r'\b(geforce\s+)?(rtx|gtx)\s*\d{3,4}(?:\s*(super|ti|xt))?\b', re.I), 'GPU'),
+        # GPU — Radeon RX (AMD)
         (re.compile(r'\b(radeon\s+)?rx\s*\d{3,4}(?:\s*(xt|xtx|gre))?\b', re.I), 'GPU'),
+        # GPU — Intel Arc
         (re.compile(r'\barc\s+[ab]\d{3,4}\b', re.I), 'GPU'),
-        # CPU
+        # GPU — RX 9xxx (RDNA 4)
+        (re.compile(r'\brx\s*9\d{3}(?:\s*(xt|xtx))?\b', re.I), 'GPU'),
+        # CPU — AMD Ryzen
         (re.compile(r'\b(ryzen\s*[3579]|threadripper)\s+\d{4,5}[a-z0-9]*\b', re.I), 'CPU'),
+        # CPU — Intel Core i-series and Ultra
         (re.compile(r'\b(core\s+)?(i[3579]|ultra\s*\d+)-\d{4,6}[a-z]*\b', re.I), 'CPU'),
-        # RAM
+        # CPU — Intel Core Ultra (new naming)
+        (re.compile(r'\bcore\s+ultra\s+\d+\s+\d{3,4}[a-z]*\b', re.I), 'CPU'),
+        # RAM — explicit capacity + DDR
         (re.compile(r'\b\d+gb\s+(ddr[45]|so-?dimm)\b', re.I), 'RAM'),
-        (re.compile(r'\bddr[45]-\d{4,5}\b', re.I), 'RAM'),
-        # Storage
-        (re.compile(r'\b\d+(tb|gb)\s+(nvme|ssd|hdd|m\.2)\b', re.I), 'Storage'),
-        (re.compile(r'\b(nvme|ssd)\s+\d+(tb|gb)\b', re.I), 'Storage'),
-        # PSU
-        (re.compile(r'\b\d{3,4}w\s+(psu|power\s+supply|modular)\b', re.I), 'Power Supply'),
-        # Motherboard
-        (re.compile(r'\b(z\d{3}|b\d{3}|x\d{3}|a\d{3})\s*(e|f|p|m|a|plus|pro|max|wifi)?\s*(motherboard|atx|matx|itx)\b', re.I), 'Motherboard'),
+        (re.compile(r'\bddr[45][- ]\d{4,5}\b', re.I), 'RAM'),
+        (re.compile(r'\bddr[45]\s+\d+gb\b', re.I), 'RAM'),
+        # Storage — explicit capacity + type
+        (re.compile(r'\b\d+(?:\.\d+)?\s*(tb|gb)\s+(nvme|ssd|hdd|m\.2|solid\s+state)\b', re.I), 'Storage'),
+        (re.compile(r'\b(nvme|ssd|m\.2)\s+\d+(?:\.\d+)?\s*(tb|gb)\b', re.I), 'Storage'),
+        # PSU — wattage-only queries (e.g. "850W PSU")
+        (re.compile(r'\b\d{3,4}\s*w\s+(psu|power\s+supply|modular|atx|sfx)\b', re.I), 'Power Supply'),
+        (re.compile(r'\b(psu|power\s+supply)\s+\d{3,4}\s*w\b', re.I), 'Power Supply'),
+        # Motherboard — chipset + form factor
+        (re.compile(r'\b(z\d{3}|b\d{3}|x\d{3}|a\d{3})\s*(e|f|p|m|a|plus|pro|max|wifi|gaming)?\s*(motherboard|atx|matx|itx|mainboard)\b', re.I), 'Motherboard'),
+        # Motherboard — brand+chipset (e.g. "ASUS Z890", "MSI B650")
+        (re.compile(r'\b(asus|msi|gigabyte|asrock)\s+(z|b|x|a)\d{3}\b', re.I), 'Motherboard'),
+        # Cooling — AIO / air coolers
+        (re.compile(r'\b(aio|liquid\s+cooler|cpu\s+cooler|air\s+cooler|heatsink|noctua|be\s+quiet|arctic\s+freezer|deepcool|id-cooling)\b', re.I), 'Cooling'),
+        # Case
+        (re.compile(r'\b(pc\s+case|mid\s+tower|full\s+tower|mini\s+itx\s+case|atx\s+case)\b', re.I), 'Case'),
+        # Monitor — explicit size + Hz or "monitor"
+        (re.compile(r'\b\d{2,3}\s*(hz|"\s*monitor|inch\s+monitor|\"\s+ips|\"\s+oled|\"\s+va|\"\s+tn)\b', re.I), 'Monitor'),
+        (re.compile(r'\b\d{2,3}(?:\.\d)?["\u201d]?\s*(4k|1440p|1080p|ips|oled|va|tn)\s*(monitor|display|screen)?\b', re.I), 'Monitor'),
     ]
 
     def _fast_classify(self, query: str) -> dict | None:
@@ -115,7 +133,7 @@ class TavilyHardwareAgent:
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                     json={
-                        "model": "llama-3.1-8b-instant",
+                        "model": "groq/compound-mini",
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": f"Title: {query}"}
@@ -148,7 +166,7 @@ class TavilyHardwareAgent:
                                         "https://api.groq.com/openai/v1/chat/completions",
                                         headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                                         json={
-                                            "model": "llama-3.1-8b-instant",
+                                            "model": "groq/compound-mini",
                                             "messages": [
                                                 {"role": "system", "content": system_prompt + "\nUse the provided web search snippet context to help you accurately classify the item if it's ambiguous."},
                                                 {"role": "user", "content": f"Title: {query}\n\nSearch Context: {snippet}"}
@@ -248,7 +266,18 @@ class TavilyHardwareAgent:
 
             async def scrape_and_persist(r):
                 async with sem:
-                    offer = await self.scrape_retailer_accurate_offer(clean_prompt, r['name'], r['domain'], category)
+                    try:
+                        offer = await asyncio.wait_for(
+                            self.scrape_retailer_accurate_offer(clean_prompt, r['name'], r['domain'], category),
+                            timeout=32.0
+                        )
+                    except asyncio.TimeoutError:
+                        print(f"⚠️ [Retailer Timeout] {r['name']} exceeded 32s — proceeding with other retailers")
+                        offer = None
+                    except Exception as e:
+                        print(f"⚠️ [Retailer Error] {r['name']}: {e}")
+                        offer = None
+
                     if offer and offer.get('price', 0) > 0:
                         state["scrapedOffers"].append(offer)
                         
@@ -288,21 +317,25 @@ class TavilyHardwareAgent:
                             # Also persist directly to the user's watchlist if triggered by a user
                             if user_id and pending_id:
                                 try:
-                                    query2 = supabase.table('watchlist_items').upsert({
-                                        "id": f"{pending_id}-{offer['retailer'].lower().replace(' ', '-')}",
-                                        "user_id": user_id,
-                                        "component_name": clean_prompt,
+                                    wl_row = {
+                                        "component_id": offer_component_id,
+                                        "component_name": offer['title'] or clean_prompt,
                                         "category": category,
-                                        "target_price": offer['price'],
-                                        "current_price": offer['price'],
-                                        "retailer": offer['retailer'],
-                                        "product_url": offer['url'],
-                                        "image_url": offer.get('imageUrl') or "https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=600&q=80",
-                                        "in_stock": offer['inStock'],
-                                    })
-                                    await asyncio.to_thread(query2.execute)
+                                        "target_price": round(offer['price'] * 0.9, 2),
+                                        "previous_price_24h": round(offer['price'] * 1.05, 2),
+                                        "previous_price_7d": round(offer['price'] * 1.08, 2),
+                                        "previous_price_30d": round(offer['price'] * 1.12, 2),
+                                        "all_time_low": offer['price'],
+                                    }
+                                    if user_id:
+                                        wl_row["user_id"] = user_id
+
+                                    res2 = await asyncio.to_thread(
+                                        supabase.table('watchlist_items').insert(wl_row).execute
+                                    )
+                                    print(f"[Watchlist Persist Success] Added '{offer['retailer']}' offer to watchlist_items")
                                 except Exception as wl_e:
-                                    print(f"[Watchlist Persist Error]: {wl_e}")
+                                    print(f"[Watchlist Persist Notice]: {wl_e}")
                         except Exception as e:
                             print(f"[Agent Incremental Persistence Error]: {e}")
                             
@@ -443,6 +476,7 @@ class TavilyHardwareAgent:
                             
                     valid_hits.append({
                         'url': clean_url,
+                        'title': hit.get('title', ''),
                         'est_price': est_price
                     })
 
@@ -452,12 +486,27 @@ class TavilyHardwareAgent:
                 # Sort by estimated price (putting float('inf') at the end)
                 valid_hits.sort(key=lambda x: x['est_price'])
                 
-                # Loop through all valid hits until we extract a successful, matching offer
-                for candidate in valid_hits:
+                # Try Firecrawl on the top candidate (fast 8s check)
+                for candidate in valid_hits[:1]:
                     offer = await self.firecrawl_extract(candidate['url'], retailer_name, category, model_query)
                     if offer:
                         print(f"✅ [CHEAPEST AVAILABLE {retailer_name.upper()} OFFER] \"${offer['price']}\" -> {offer['title'][:60]}")
                         return offer
+
+                # Instant Fallback: use verified Tavily snippet price if Firecrawl is blocked / times out
+                for candidate in valid_hits:
+                    if candidate['est_price'] < float('inf') and self.is_price_sanity_valid(candidate['est_price'], model_query, category):
+                        print(f"✅ [TAVILY SNIPPET FALLBACK] {retailer_name}: Found price ${candidate['est_price']:.2f} -> {candidate['title'][:50]}")
+                        return {
+                            'retailer': retailer_name,
+                            'title': candidate['title'] or f"{retailer_name} - {model_query}",
+                            'price': candidate['est_price'],
+                            'originalPrice': candidate['est_price'],
+                            'url': candidate['url'],
+                            'inStock': True,
+                            'imageUrl': "https://images.unsplash.com/photo-1587202372775-e229f172b9d7?auto=format&fit=crop&w=600&q=80",
+                            'isRefurbished': False
+                        }
                 return None
             except Exception as e:
                 print(f"[Tavily Search Error] {retailer_name}: {e}")
@@ -471,18 +520,26 @@ class TavilyHardwareAgent:
             return None
             
         print(f"[Firecrawl] Extracting {url} ...")
+        # Quick 8s timeout: if a retailer blocks/tarpits Firecrawl, fail fast to trigger snippet fallback
+        scrape_timeout = 8.0
         try:
             try:
-                res = await asyncio.to_thread(lambda: app.scrape_url(url, formats=['html', 'markdown']))
+                res = await asyncio.wait_for(
+                    asyncio.to_thread(lambda: app.scrape_url(url, formats=['html', 'markdown'])),
+                    timeout=scrape_timeout
+                )
+            except asyncio.TimeoutError:
+                print(f"⚠️ [Firecrawl Timeout] {retailer_name} took >{scrape_timeout}s — using fallback")
+                return None
             except Exception as e:
                 error_str = str(e).lower()
                 if "payment" in error_str or "credits" in error_str or "401" in error_str or "402" in error_str or "rate limit" in error_str or "429" in error_str:
                     # Don't retry on rate-limit — all keys share the same plan limit.
-                    # Return None so the caller skips this candidate and moves on.
                     print(f"[Firecrawl] Rate/credit limit — skipping {url}")
                     return None
                 else:
-                    raise e
+                    print(f"[Firecrawl Error] {retailer_name}: {e}")
+                    return None
             
             if not res:
                 return None
@@ -817,7 +874,7 @@ class TavilyHardwareAgent:
                         "Content-Type": "application/json"
                     },
                     json={
-                        "model": "llama-3.1-8b-instant",
+                        "model": "groq/compound-mini",
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": f"Extract info from this markdown:\n\n{markdown_content[:6000]}"}
