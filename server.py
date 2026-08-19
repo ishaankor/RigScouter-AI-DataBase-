@@ -184,6 +184,8 @@ async def stream(request: Request):
     
     async def event_generator():
         try:
+            queue = await get_dynamic_parts_queue()
+            next_part = queue[scheduler_state["schedulerQueueIndex"] % len(queue)] if queue else "N/A"
             # Initial connection event
             yield {
                 "event": "connected",
@@ -191,8 +193,8 @@ async def stream(request: Request):
                     "message": "Connected to RigScouter-AI live price feed",
                     "schedulerRunning": scheduler_state["schedulerRunning"],
                     "lastSchedulerRun": scheduler_state["lastSchedulerRun"],
-                    "nextPart": PARTS_QUEUE[scheduler_state["schedulerQueueIndex"] % len(PARTS_QUEUE)],
-                    "totalTracked": len(PARTS_QUEUE),
+                    "nextPart": next_part,
+                    "totalTracked": len(queue),
                     "timestamp": datetime.now(timezone.utc).isoformat()
                 })
             }
