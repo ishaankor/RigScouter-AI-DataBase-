@@ -478,12 +478,64 @@ class TavilyHardwareAgent:
     async def extract_direct_page(self, url: str, retailer_name: str, category: str, model_query: str = None) -> dict:
         return await self.firecrawl_extract(url, retailer_name, category, model_query)
 
+    def extract_clean_snippet_price(self, text: str, model_query: str, category: str) -> float:
+        if not text:
+            return float("inf")
+
+        # Split into distinct sentences / clauses without breaking decimal numbers
+        clauses = re.split(r'(?:\.(?!\d)|[\n;\|•·–—])', text)
+        valid_prices = []
+
+        NOISE_KEYWORDS = [
+            'plan', 'warranty', 'protection', 'geek squad', 'applecare', 'care pack',
+            '/mo', '/month', 'per month', 'monthly', 'a month', 'financing', 'payments',
+            'save', 'saving', 'discount', 'was', 'list price', 'retail price',
+            'shipping', 'delivery', 'handling', 'postage', 'fee', 'trade-in', 'trade in'
+        ]
+
+        for clause in clauses:
+            lower_clause = clause.lower().strip()
+            # If the clause mentions warranty/financing/shipping/discounts, skip all prices inside it
+            if any(re.search(r'\b' + re.escape(w) + r'\b', lower_clause) for w in NOISE_KEYWORDS):
+                continue
+
+            matches = re.findall(r'\$([0-9,]+(?:\.[0-9]{2})?)', clause)
+            for m in matches:
+                try:
+                    val = float(m.replace(',', ''))
+                    if val > 0 and self.is_price_sanity_valid(val, model_query, category):
+                        valid_prices.append(val)
+                except:
+                    pass
+
+        if not valid_prices:
+            return float("inf")
+
+        # Dynamic tier-aware sanity floor for hardware
+        tier_floor = 10.0
+        lower_m = model_query.lower()
+        if category == "CPU":
+            if any(k in lower_m for k in ["ryzen 9", "9900", "9950", "7900", "7950", "i9", "ultra 9", "ultra 7", "7800x3d", "9800x3d", "9900x3d"]):
+                tier_floor = 250.0
+            elif any(k in lower_m for k in ["ryzen 7", "ryzen 5", "i7", "i5", "ultra 5"]):
+                tier_floor = 120.0
+        elif category == "GPU":
+            if any(k in lower_m for k in ["4090", "4080", "5090", "5080", "7900", "5070 ti"]):
+                tier_floor = 600.0
+            elif any(k in lower_m for k in ["4070", "5070", "7800", "7700"]):
+                tier_floor = 350.0
+
+        filtered = [p for p in valid_prices if p >= tier_floor]
+        if filtered:
+            return filtered[0]
+        return min(valid_prices)
+
     async def scrape_retailer_accurate_offer(self, model_query: str, retailer_name: str, domain_pattern: str, category: str) -> dict:
         print(f"[Tavily Search] Querying {retailer_name} for \"{model_query}\" ({category})...")
         
         for attempt in range(len(TAVILY_API_KEYS)):
             try:
-                # 1. Search with Tavily to get URLs (NO raw_content)
+                # 1. Search with Tavily to get URLs
                 async with httpx.AsyncClient() as client:
                     res = await client.post('https://api.tavily.com/search', json={
                         "api_key": self.get_tavily_key(),
@@ -500,13 +552,12 @@ class TavilyHardwareAgent:
                 data = res.json()
                 results = data.get('results', [])
                 
-                # Batch filter all titles to save Groq API calls (prevents 429 rate limits)
+                # Batch filter all titles to save Groq API calls
                 titles_to_check = [r.get('title', '') for r in results]
                 match_results = await self.filter_matching_titles(titles_to_check, model_query, category)
 
                 valid_hits = []
                 for i, hit in enumerate(results):
-                    # Check match result
                     if i < len(match_results) and not match_results[i]:
                         print(f"⚠️ [Tavily Title Mismatch] Skipping: {hit.get('title')}")
                         continue
@@ -517,22 +568,7 @@ class TavilyHardwareAgent:
                         
                     clean_url = full_url.replace('/reviews/', '').split('?')[0]
                     content = hit.get('content', '')
-                    
-                    # Strip promotions, protection plans, monthly financing, taxes, and shipping fees
-                    clean_content = re.sub(r'(?:shipping|delivery|handling|postage|est\.?\s*shipping|import\s*charges|save\s+the\s+tax|protection\s+plan|warranty|add\s+a\s+protection\s+plan\s+from|from|save|off)[:\s]*\$[0-9,]+(?:\.[0-9]{2})?', '', content, flags=re.I)
-                    clean_content = re.sub(r'\$[0-9,]+(?:\.[0-9]{2})?\s*(?:shipping|delivery|handling|postage|per\s*month|/\s*mo|suggested\s+payments|monthly)', '', clean_content, flags=re.I)
-                    
-                    # Estimate price from snippet
-                    prices = re.findall(r'\$[0-9,]+(?:\.[0-9]{2})?', clean_content)
-                    est_price = float('inf')
-                    if prices:
-                        try:
-                            parsed_prices = [float(p.replace('$', '').replace(',', '')) for p in prices]
-                            valid_prices = [p for p in parsed_prices if self.is_price_sanity_valid(p, model_query, category)]
-                            if valid_prices:
-                                est_price = min(valid_prices)
-                        except:
-                            pass
+                    est_price = self.extract_clean_snippet_price(content, model_query, category)
                             
                     valid_hits.append({
                         'url': clean_url,
@@ -546,14 +582,14 @@ class TavilyHardwareAgent:
                 # Sort by estimated price (putting float('inf') at the end)
                 valid_hits.sort(key=lambda x: x['est_price'])
                 
-                # Try Firecrawl on the top candidate (fast 8s check)
-                for candidate in valid_hits[:1]:
+                # Try Firecrawl on top 2 candidates
+                for candidate in valid_hits[:2]:
                     offer = await self.firecrawl_extract(candidate['url'], retailer_name, category, model_query)
                     if offer:
                         print(f"✅ [CHEAPEST AVAILABLE {retailer_name.upper()} OFFER] \"${offer['price']}\" -> {offer['title'][:60]}")
                         return offer
 
-                # Instant Fallback: use verified Tavily snippet price if Firecrawl is blocked / times out
+                # Instant Fallback: use verified, noise-filtered Tavily snippet price
                 for candidate in valid_hits:
                     if candidate['est_price'] < float('inf') and self.is_price_sanity_valid(candidate['est_price'], model_query, category):
                         print(f"✅ [TAVILY SNIPPET FALLBACK] {retailer_name}: Found price ${candidate['est_price']:.2f} -> {candidate['title'][:50]}")
@@ -580,8 +616,8 @@ class TavilyHardwareAgent:
             return None
             
         print(f"[Firecrawl] Extracting {url} ...")
-        # Quick 8s timeout: if a retailer blocks/tarpits Firecrawl, fail fast to trigger snippet fallback
-        scrape_timeout = 8.0
+        # Generous 22s timeout: allows JavaScript heavy pages (Best Buy, Micro Center, eBay) to fully render
+        scrape_timeout = 22.0
         try:
             try:
                 res = await asyncio.wait_for(
@@ -594,7 +630,6 @@ class TavilyHardwareAgent:
             except Exception as e:
                 error_str = str(e).lower()
                 if "payment" in error_str or "credits" in error_str or "401" in error_str or "402" in error_str or "rate limit" in error_str or "429" in error_str:
-                    # Don't retry on rate-limit — all keys share the same plan limit.
                     print(f"[Firecrawl] Rate/credit limit — skipping {url}")
                     return None
                 else:
