@@ -19,6 +19,39 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 firecrawl_apps = [FirecrawlApp(api_key=key) for key in FIRECRAWL_API_KEYS] if FIRECRAWL_API_KEYS else []
 
+def clean_hardware_query(query: str, category: str = None) -> str:
+    s = query.strip()
+    # Normalize common hardware acronyms and casing
+    s = re.sub(r'(?i)\bgeforce\b', 'GeForce', s)
+    s = re.sub(r'(?i)\bradeon\b', 'Radeon', s)
+    s = re.sub(r'(?i)\bwi-?fi\b', 'WiFi', s)
+    s = re.sub(r'(?i)\bmini-?itx\b', 'ITX', s)
+    s = re.sub(r'(?i)\bmicro-?atx\b', 'mATX', s)
+    s = re.sub(r'(?i)\bgen\s*([345])\b', r'Gen\1', s)
+    
+    # Split glued tokens (e.g. Z890WiFi -> Z890 WiFi, RTX4070 -> RTX 4070, Ryzen7 -> Ryzen 7)
+    s = re.sub(r'(?i)(z\d{3}|b\d{3}|x\d{3}|a\d{3})(wifi|pro|plus|gaming|elite|hero|taichi|max)', r'\1 \2', s)
+    s = re.sub(r'(?i)(rtx|gtx|rx)(\d{3,4})', r'\1 \2', s)
+    s = re.sub(r'(?i)(ryzen|core)(\d+)', r'\1 \2', s)
+    s = re.sub(r'(\d+)(gb|tb|w|mhz|ghz)\b', r'\1\2', s, flags=re.I)
+    
+    # Strip marketing filler while preserving all model, brand, capacity, and spec tokens
+    FLUFF_PATTERNS = [
+        r'(?i)\b(?:desktop\s+processor|boxed\s+processor|unlocked\s+desktop\s+processor)\b',
+        r'(?i)\b(?:graphics\s+card|video\s+card|gaming\s+graphics\s+card)\b',
+        r'(?i)\b(?:gaming\s+motherboard|desktop\s+motherboard)\b',
+        r'(?i)\b(?:internal\s+solid\s+state\s+drive|solid\s+state\s+drive|internal\s+ssd)\b',
+        r'(?i)\b(?:desktop\s+memory|pc\s+gaming\s+memory|dram\s+desktop\s+memory)\b',
+        r'(?i)\b(?:power\s+supply\s+unit)\b',
+        r'(?i)\b(?:heatsink\s+not\s+included|cooler\s+not\s+included|no\s+cooler|without\s+cooler)\b',
+        r'(?i)\b(?:brand\s+new|sealed\s+in\s+box|factory\s+sealed)\b',
+    ]
+    for pattern in FLUFF_PATTERNS:
+        s = re.sub(pattern, ' ', s)
+        
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
 class TavilyHardwareAgent:
     def __init__(self):
         self.current_key_index = 0
@@ -44,104 +77,93 @@ class TavilyHardwareAgent:
 
     # --------------------------------------------------------
     # FAST REGEX PRE-FILTER
-    # Classifies obvious hardware queries without any LLM call.
-    # Only truly ambiguous queries reach Groq.
+    # Classifies all known hardware categories instantly.
     # --------------------------------------------------------
     _REGEX_RULES = [
-        # GPU — RTX / GTX (NVIDIA)
+        # GPU — RTX / GTX / Titan / Quadro (NVIDIA)
         (re.compile(r'\b(geforce\s+)?(rtx|gtx)\s*\d{3,4}(?:\s*(super|ti|xt))?\b', re.I), 'GPU'),
         # GPU — Radeon RX (AMD)
         (re.compile(r'\b(radeon\s+)?rx\s*\d{3,4}(?:\s*(xt|xtx|gre))?\b', re.I), 'GPU'),
         # GPU — Intel Arc
         (re.compile(r'\barc\s+[ab]\d{3,4}\b', re.I), 'GPU'),
-        # GPU — RX 9xxx (RDNA 4)
-        (re.compile(r'\brx\s*9\d{3}(?:\s*(xt|xtx))?\b', re.I), 'GPU'),
-        # CPU — AMD Ryzen & Threadripper (e.g. "Ryzen 7 7800X3D", "Ryzen 9 9900X3D", "Ryzen 5 7600X")
+        # GPU — RX 9xxx / 8xxx
+        (re.compile(r'\brx\s*[89]\d{3}(?:\s*(xt|xtx))?\b', re.I), 'GPU'),
+        # CPU — AMD Ryzen & Threadripper
         (re.compile(r'\b(?:amd\s+)?(ryzen\s*[3579]|threadripper)\s+\d{4,5}[a-z0-9]*(?:\s*x3d)?\b', re.I), 'CPU'),
-        # CPU — Intel Core Ultra (Series 1 & 2: Ultra 5/7/9, 2xx / 1xx, K/KF/Plus/T/H/HX)
+        # CPU — Intel Core Ultra
         (re.compile(r'\b(?:intel\s+)?(?:core\s+)?ultra\s*[3579]\s*(?:series\s*2\s*)?[- ]?\d{3,4}[a-z]*(?:\s+plus)?\b', re.I), 'CPU'),
         (re.compile(r'\b(?:intel\s+)?(?:core\s+)?(ultra\s*[3579]|i[3579])[- ]\d{3,6}[a-z]*(?:\s+plus)?\b', re.I), 'CPU'),
-        # CPU — Intel Core i-series (e.g. "i9 14900K", "Core i7-14700K", "i5 13600K")
+        # CPU — Intel Core i-series
         (re.compile(r'\b(?:intel\s+)?(?:core\s+)?i[3579][ -]\d{4,5}[a-z]*\b', re.I), 'CPU'),
-        # RAM — explicit capacity + DDR
-        (re.compile(r'\b\d+gb\s+(ddr[45]|so-?dimm)\b', re.I), 'RAM'),
-        (re.compile(r'\bddr[45][- ]\d{4,5}\b', re.I), 'RAM'),
-        (re.compile(r'\bddr[45]\s+\d+gb\b', re.I), 'RAM'),
-        # Storage — explicit capacity + type
-        (re.compile(r'\b\d+(?:\.\d+)?\s*(tb|gb)\s+(nvme|ssd|hdd|m\.2|solid\s+state)\b', re.I), 'Storage'),
-        (re.compile(r'\b(nvme|ssd|m\.2)\s+\d+(?:\.\d+)?\s*(tb|gb)\b', re.I), 'Storage'),
-        # PSU — wattage-only queries (e.g. "850W PSU")
-        (re.compile(r'\b\d{3,4}\s*w\s+(psu|power\s+supply|modular|atx|sfx)\b', re.I), 'Power Supply'),
-        (re.compile(r'\b(psu|power\s+supply)\s+\d{3,4}\s*w\b', re.I), 'Power Supply'),
-        # Motherboard — brand+chipset (e.g. "ASRock Z890", "ASUS Z890", "MSI B650", "Gigabyte X870")
-        (re.compile(r'\b(asrock|asus|msi|gigabyte)\s+(z|b|x|a)\d{3}[a-z]*(?:\s+(?:wifi|pro|plus|gaming|elite|hero|taichi|extreme|max|tomahawk))?\b', re.I), 'Motherboard'),
+        # Motherboard — brand + chipset
+        (re.compile(r'\b(asrock|asus|msi|gigabyte|nzxt|biostar)\s+(z|b|x|a)\d{3}[a-z]*(?:\s+(?:wifi|pro|plus|gaming|elite|hero|taichi|extreme|max|tomahawk|aorus|strix|tuf))?\b', re.I), 'Motherboard'),
         # Motherboard — chipset + form factor
         (re.compile(r'\b(z\d{3}|b\d{3}|x\d{3}|a\d{3})\s*(e|f|p|m|a|plus|pro|max|wifi|gaming)?\s*(motherboard|atx|matx|itx|mainboard)?\b', re.I), 'Motherboard'),
-        # Cooling — AIO / air coolers (exclude CPU "heatsink not included" or "cooler not included")
-        (re.compile(r'\b(aio\s+liquid|liquid\s+cooler|cpu\s+cooler|air\s+cooler|noctua|be\s+quiet|arctic\s+liquid|arctic\s+freezer|deepcool|id-cooling|thermalright\s+peerless|thermalright\s+phantom|nzxt\s+kraken|corsair\s+icue\s+link|corsair\s+h\d{3})\b', re.I), 'Cooling'),
-        # Case
-        (re.compile(r'\b(pc\s+case|mid\s+tower|full\s+tower|mini\s+itx\s+case|atx\s+case)\b', re.I), 'Case'),
-        # Monitor — explicit size + Hz or "monitor"
-        (re.compile(r'\b\d{2,3}\s*(hz|"\s*monitor|inch\s+monitor|\"\s+ips|\"\s+oled|\"\s+va|\"\s+tn)\b', re.I), 'Monitor'),
+        # RAM — DDR capacity/speed / famous series
+        (re.compile(r'\b(trident\s*z\d?|dominator|vengeance|ripjaws|fury\s+beast|t-force|g\.?skill)\b', re.I), 'RAM'),
+        (re.compile(r'\b\d+gb\s+(?:kit\s+)?(?:\(\d+x\d+gb\)\s+)?(ddr[45]|so-?dimm)\b', re.I), 'RAM'),
+        (re.compile(r'\bddr[45][- ]\d{4,5}\b', re.I), 'RAM'),
+        (re.compile(r'\bddr[45]\s+\d+gb\b', re.I), 'RAM'),
+        # Storage — SSD / NVMe / HDD / famous models
+        (re.compile(r'\b(990\s+pro|980\s+pro|sn850x|sn770|t700|t500|kc3000|firecuda|ironwolf|barracuda)\b', re.I), 'Storage'),
+        (re.compile(r'\b\d+(?:\.\d+)?\s*(tb|gb)\s+(nvme|ssd|hdd|m\.2|solid\s+state|gen[45])\b', re.I), 'Storage'),
+        (re.compile(r'\b(nvme|ssd|m\.2)\s+\d+(?:\.\d+)?\s*(tb|gb)\b', re.I), 'Storage'),
+        # Power Supply — PSU models and wattages
+        (re.compile(r'\b(rm\d{3,4}[a-z]*|sf\d{3,4}|focus\s+gx|toughpower|dark\s+power|pure\s+power|supernova)\b', re.I), 'Power Supply'),
+        (re.compile(r'\b\d{3,4}\s*w\s+(psu|power\s+supply|modular|atx|sfx)\b', re.I), 'Power Supply'),
+        (re.compile(r'\b(psu|power\s+supply)\s+\d{3,4}\s*w\b', re.I), 'Power Supply'),
+        # Cooling — AIO / Air Coolers / Fans / Paste
+        (re.compile(r'\b(nh-d15|nh-u12a|peerless\s+assassin|phantom\s+spirit|ak620|lt720|kraken|liquid\s+freezer|galahad|icue\s+link|kryonaut|mx-[456]|nt-h[12]|uni\s+fan)\b', re.I), 'Cooling'),
+        (re.compile(r'\b(aio\s+liquid|liquid\s+cooler|cpu\s+cooler|air\s+cooler|thermal\s+paste|case\s+fan|case\s+fans|120mm\s+fan|140mm\s+fan)\b', re.I), 'Cooling'),
+        # Case — popular cases / form factors
+        (re.compile(r'\b(o11\s+dynamic|lancool|h[5679]\s+flow|fractal\s+north|meshify|pop\s+air|4000d|5000d|king\s+95|nv[57]|y[67]0)\b', re.I), 'Case'),
+        (re.compile(r'\b(pc\s+case|mid\s+tower|full\s+tower|mini\s+itx\s+case|atx\s+case|dual\s+chamber)\b', re.I), 'Case'),
+        # Monitor — specs & models
+        (re.compile(r'\b(ultragear|odyssey\s+g\d|alienware\s+aw\d{4}|rog\s+swift)\b', re.I), 'Monitor'),
+        (re.compile(r'\b\d{2,3}\s*(hz|inch\s+monitor|ips|oled|va|tn)\b', re.I), 'Monitor'),
         (re.compile(r'\b\d{2,3}(?:\.\d)?["\u201d]?\s*(4k|1440p|1080p|ips|oled|va|tn)\s*(monitor|display|screen)?\b', re.I), 'Monitor'),
+        # Peripherals — Keyboards, Mice, Headsets, Mics, Stream Decks
+        (re.compile(r'\b(superlight|viper\s+v\d|deathadder|basilisk|g502|wooting|keychron|apex\s+pro|huntsman|stream\s+deck|wave:?\s*3|shure\s+sm7|blackshark)\b', re.I), 'Peripherals'),
+        (re.compile(r'\b(gaming\s+mouse|mechanical\s+keyboard|gaming\s+headset|usb\s+microphone|capture\s+card)\b', re.I), 'Peripherals'),
     ]
 
     def _fast_classify(self, query: str) -> dict | None:
-        """Return classification instantly if the query matches a known hardware pattern.
-
-        Returns just the MATCHED hardware token (e.g. "RTX 4090"), not the whole
-        raw input string — otherwise a messy title like "ASUS ROG Strix GeForce
-        RTX 4090 OC Edition 24GB" would be sent to retailers verbatim as the
-        search query, drastically cutting down on how many listings can match it.
-        """
+        """Return classification instantly if the query matches a known hardware pattern."""
         text = query.strip()
-        # Normalize text for regex matching (split glued words/camelCase like Z890WiFi -> Z890 WiFi)
-        norm_text = re.sub(r'(?i)wi-?fi', ' wifi ', text)
-        norm_text = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', norm_text)
-        norm_text = re.sub(r'([a-zA-Z]{2,})(\d+)', r'\1 \2', norm_text)
-        norm_text = re.sub(r'(\d+)([a-zA-Z]{2,})', r'\1 \2', norm_text)
-        norm_text = re.sub(r'\s+', ' ', norm_text).strip()
-
         for pattern, category in self._REGEX_RULES:
-            match = pattern.search(norm_text) or pattern.search(text)
-            if match:
-                extracted = match.group(0).strip()
-                # Collapse internal whitespace from the match
-                extracted = re.sub(r'\s+', ' ', extracted)
-                print(f"[Fast Classify] '{text}' → '{extracted}' / {category} (regex)")
-                return {"model": extracted, "category": category}
+            if pattern.search(text):
+                cleaned = clean_hardware_query(text, category)
+                print(f"[Fast Classify] '{text}' → '{cleaned}' / {category} (regex)")
+                return {"model": cleaned, "category": category}
         return None
 
     async def analyze_query_with_groq(self, query: str) -> dict:
-        # Try regex first — zero tokens, zero latency.
+        # Try fast pre-filter first
         fast = self._fast_classify(query)
         if fast:
             return fast
 
         if not GROQ_API_KEY:
-            return {"model": query, "category": "Not compatible (N/A)"}
+            cleaned = clean_hardware_query(query)
+            return {"model": cleaned, "category": "Hardware"}
 
         system_prompt = (
-            "You are an AI that extracts the core, canonical hardware model from messy product titles, and classifies the component into a strict category. "
+            "You are an expert PC hardware classifier and query normalizer. "
+            "Given a user search query for computer hardware or peripherals, extract the canonical component name and classify it into an exact category. "
             "Return ONLY a JSON object with two keys: 'model' and 'category'. "
-            "For 'model': Strip marketing fluff (e.g., 'Quad-Core', 'White Edition', 'Graphics Card', 'Desktop'). "
-            "CRITICAL: Do NOT strip capacities like '2TB', '850W', '16GB'. "
-            "Only set 'model' to EXACTLY 'GENERIC_QUERY_ERROR' if the query is a broad product LINE or CHIPSET FAMILY with no specific model number "
-            "(e.g. 'RTX 40 series', 'Ryzen 5000 series', 'X870 chipset', 'DDR5 RAM', 'NVMe SSD'). "
-            "IMPORTANT: 'RTX 4070', 'RTX 5050', 'RX 7900 XT', 'i9-14900K', 'Ryzen 7 7800X3D' are all SPECIFIC models — do NOT return GENERIC_QUERY_ERROR for these. "
-            "For 'category': Classify the item into ONE of these EXACT strings: GPU, CPU, RAM, Motherboard, Storage, Power Supply, Case, Cooling, Monitor, Peripherals, Networking. "
-            "If the item is NOT a computer component or peripheral, set 'category' EXACTLY to 'Not compatible (N/A)'. "
+            "For 'model': Clean marketing fluff (e.g. 'Desktop Processor', 'Graphics Card') while PRESERVING brand, series, sub-model, capacities (e.g. '2TB', '850W', '32GB'), and colors. "
+            "Only set 'model' to EXACTLY 'GENERIC_QUERY_ERROR' if the query is a completely broad product family with no specific model number (e.g. 'RTX 40 series', 'Ryzen 5000 series', 'DDR5 RAM'). "
+            "For 'category': Classify into ONE of: GPU, CPU, RAM, Motherboard, Storage, Power Supply, Case, Cooling, Monitor, Peripherals, Accessories. "
+            "Only if the item is completely unrelated to computers or gaming (e.g. 'iPhone', 'Nike shoes', 'Car tires'), set 'category' to 'Not compatible (N/A)'. "
             "Examples:\n"
-            "Input: ASUS ROG Strix GeForce RTX 4090 OC Edition 24GB -> {\"model\": \"RTX 4090\", \"category\": \"GPU\"}\n"
-            "Input: RTX 5050 -> {\"model\": \"RTX 5050\", \"category\": \"GPU\"}\n"
-            "Input: RTX 4070 -> {\"model\": \"RTX 4070\", \"category\": \"GPU\"}\n"
-            "Input: GeForce RTX 5050 -> {\"model\": \"RTX 5050\", \"category\": \"GPU\"}\n"
-            "Input: Intel Core i9-14900K 3.2 GHz 24-Core -> {\"model\": \"i9-14900K\", \"category\": \"CPU\"}\n"
-            "Input: Crucial T700 2TB Gen5 NVMe M.2 SSD -> {\"model\": \"T700 2TB\", \"category\": \"Storage\"}\n"
-            "Input: ASUS Z890 Motherboard -> {\"model\": \"ASUS Z890\", \"category\": \"Motherboard\"}\n"
-            "Input: MSI PRO MP273L 27\" IPS Monitor -> {\"model\": \"PRO MP273L\", \"category\": \"Monitor\"}\n"
-            "Input: RTX 40 series -> {\"model\": \"GENERIC_QUERY_ERROR\", \"category\": \"GPU\"}\n"
-            "Input: Ryzen 5 -> {\"model\": \"GENERIC_QUERY_ERROR\", \"category\": \"CPU\"}\n"
+            "Input: ASUS ROG Strix GeForce RTX 4090 OC 24GB -> {\"model\": \"ASUS ROG Strix RTX 4090\", \"category\": \"GPU\"}\n"
+            "Input: Lian Li O11 Dynamic EVO RGB White -> {\"model\": \"Lian Li O11 Dynamic EVO RGB White\", \"category\": \"Case\"}\n"
+            "Input: Noctua NH-D15 chromax.black -> {\"model\": \"Noctua NH-D15 chromax.black\", \"category\": \"Cooling\"}\n"
+            "Input: Corsair RM850x 850W Gold PSU -> {\"model\": \"Corsair RM850x 850W\", \"category\": \"Power Supply\"}\n"
+            "Input: Samsung 990 Pro 2TB NVMe SSD -> {\"model\": \"Samsung 990 Pro 2TB\", \"category\": \"Storage\"}\n"
+            "Input: Wooting 60HE+ Mechanical Keyboard -> {\"model\": \"Wooting 60HE+\", \"category\": \"Peripherals\"}\n"
+            "Input: Logitech G Pro X Superlight 2 Wireless -> {\"model\": \"Logitech G Pro X Superlight 2\", \"category\": \"Peripherals\"}\n"
+            "Input: Thermal Grizzly Kryonaut 1g -> {\"model\": \"Thermal Grizzly Kryonaut 1g\", \"category\": \"Cooling\"}\n"
             "Input: iPhone 15 Pro Max -> {\"model\": \"iPhone 15 Pro Max\", \"category\": \"Not compatible (N/A)\"}\n"
         )
 
@@ -166,13 +188,13 @@ class TavilyHardwareAgent:
                     print(f"[DEBUG Groq Analyzer] Raw JSON response: {raw_content}")
                     data = json.loads(raw_content)
 
-                    # Smart context fallback: if it's considered Not compatible, it might just be an obscure part number.
+                    # Smart context fallback: if it's marked Not compatible, check if web context clarifies it as hardware
                     if data.get('category') == 'Not compatible (N/A)' and self.get_tavily_key():
                         try:
                             print(f"[AI Analyzer] '{query}' marked Not compatible. Fetching web context...")
                             tavily_res = await client.post('https://api.tavily.com/search', json={
                                 "api_key": self.get_tavily_key(),
-                                "query": f"{query} specs computer",
+                                "query": f"{query} specs computer hardware",
                                 "search_depth": "basic",
                                 "max_results": 1
                             }, timeout=3.0)
@@ -186,7 +208,7 @@ class TavilyHardwareAgent:
                                         json={
                                             "model": "groq/compound-mini",
                                             "messages": [
-                                                {"role": "system", "content": system_prompt + "\nUse the provided web search snippet context to help you accurately classify the item if it's ambiguous."},
+                                                {"role": "system", "content": system_prompt + "\nUse the search context to verify if this is a computer hardware item."},
                                                 {"role": "user", "content": f"Title: {query}\n\nSearch Context: {snippet}"}
                                             ],
                                             "response_format": {"type": "json_object"},
@@ -205,7 +227,8 @@ class TavilyHardwareAgent:
         except Exception as e:
             print(f"[Groq Analyzer Error] {e}")
 
-        return {"model": query, "category": "Not compatible (N/A)"}
+        cleaned = clean_hardware_query(query)
+        return {"model": cleaned, "category": "Hardware"}
 
     async def run(self, prompt: str, emit_fn=None, user_id: str = None, pending_id: str = None) -> dict:
         clean_prompt = prompt.strip()
@@ -853,7 +876,9 @@ class TavilyHardwareAgent:
                 
             # If title is extracted, we can do a single-item check if not already performed via batch
             if title and model_query:
-                is_match = (await self.filter_matching_titles([title], model_query, category))[0]
+                # Include URL text in the match check so retailer-specific product titles that omit brand headers (e.g. Micro Center) still match
+                full_check_title = f"{title} {url}"
+                is_match = (await self.filter_matching_titles([full_check_title], model_query, category))[0]
                 if not is_match:
                     print(f"⚠️ [Title Mismatch] {retailer_name}: \"{title}\" does not match query \"{model_query}\"")
                     return None
@@ -863,7 +888,7 @@ class TavilyHardwareAgent:
                 # verification that the page was even for the right product. Validate against
                 # a slice of the raw page text instead of blindly trusting the price.
                 page_text_sample = (markdown_content or html_content or '')[:3000]
-                is_match = (await self.filter_matching_titles([page_text_sample], model_query, category))[0]
+                is_match = (await self.filter_matching_titles([f"{page_text_sample} {url}"], model_query, category))[0]
                 if not is_match:
                     print(f"⚠️ [No Title — Content Mismatch] {retailer_name}: page content doesn't confirm \"{model_query}\"")
                     return None
@@ -903,59 +928,53 @@ class TavilyHardwareAgent:
                     
             return None
         except Exception as e:
-            print(f"[Firecrawl Error] {e}")
+            print(f"⚠️ [Firecrawl Extraction Error] {url}: {e}")
             return None
 
     async def parse_with_groq(self, markdown_content: str, query: str, retailer: str, category: str) -> dict:
         if not GROQ_API_KEY:
-            print("[Groq API] Key missing.")
-            return None
-            
+            return {}
+
+        # Strip distracting recommended carousel headers and sidebars
+        clean_markdown = re.sub(r'##\s*People who viewed this item also viewed[\s\S]*?(?=##|\Z)', '', markdown_content, flags=re.I)
+        clean_markdown = re.sub(r'##\s*Similar items[\s\S]*?(?=##|\Z)', '', clean_markdown, flags=re.I)
+        clean_markdown = re.sub(r'##\s*Sponsored items[\s\S]*?(?=##|\Z)', '', clean_markdown, flags=re.I)
+        clean_markdown = re.sub(r'##\s*Compare with similar items[\s\S]*?(?=##|\Z)', '', clean_markdown, flags=re.I)
+
         system_prompt = (
-            "You are a strict JSON extractor. Given the markdown of a product page, extract the core product details. "
-            "Return ONLY valid JSON with keys: price (float, nullable), title (string), brand (string, nullable), "
-            "inStock (boolean), originalPrice (float, nullable), isRefurbished (boolean). "
-            f"The user was looking for '{query}'. Extract the price of the MAIN product. "
+            f"You are an expert product data extraction agent parsing a {retailer} product page. "
+            f"Extract product details for the target item: '{query}' ({category}). "
             "CRITICAL RULES:\n"
-            "1. Ignore prices for 'frequently bought together', 'sponsored items', or 'related products'.\n"
-            "2. Never extract shipping costs, delivery fees, import charges, taxes, or financing options (e.g. '$5.80 shipping' or '$20/month'). Extract ONLY the actual buy-it-now / purchase price of the item itself.\n"
-            "3. If the text says 'Currently unavailable', 'Out of stock', or 'We don't know when or if this item will be back in stock', you MUST set inStock to false and price to null.\n"
-            "4. If the retailer is eBay, reject any listing that implies the item is broken, 'For Parts', 'Not Working', 'Box Only', or 'As Is' (set price to null).\n"
-            "5. If the item is listed as Used or Refurbished, set isRefurbished to true."
+            "1. Extract the current active BUYBOX selling price for the MAIN product.\n"
+            "2. NEVER extract protection plans (e.g. '$28.00'), warranties, financing (e.g. '$55/mo'), or shipping fees.\n"
+            "3. NEVER extract prices of related or recommended items from carousels.\n"
+            "4. Return ONLY valid JSON with keys: price (float), originalPrice (float or null), title (str), brand (str or null), inStock (bool)."
         )
-        
+
         try:
             async with httpx.AsyncClient() as client:
                 res = await client.post(
                     "https://api.groq.com/openai/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {GROQ_API_KEY}",
-                        "Content-Type": "application/json"
-                    },
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                     json={
                         "model": "groq/compound-mini",
                         "messages": [
                             {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": f"Extract info from this markdown:\n\n{markdown_content[:6000]}"}
+                            {"role": "user", "content": f"Extract info from this markdown:\n\n{clean_markdown[:7000]}"}
                         ],
                         "response_format": {"type": "json_object"},
                         "temperature": 0
                     },
-                    timeout=15.0
+                    timeout=10.0
                 )
-            if res.status_code == 200:
-                data = res.json()
-                content = data["choices"][0]["message"]["content"]
-                return json.loads(content)
-            elif res.status_code == 429:
-                print(f"[Groq 429] Rate limit on AI fallback — skipping {retailer}")
-                return None
-            else:
-                print(f"[Groq API Error] {res.status_code} - {res.text[:100]}")
-                return None
+                if res.status_code == 200:
+                    return json.loads(res.json()["choices"][0]["message"]["content"])
+                elif res.status_code == 429:
+                    print(f"[Groq 429] Rate limit on AI fallback — skipping {retailer}")
         except Exception as e:
-            print(f"[Groq Request Error] {e}")
-            return None
+            print(f"[Groq Price Parse Error] {e}")
+
+        return {}
 
     def is_valid_direct_product_url(self, url: str, domain_pattern: str) -> bool:
         lower = url.lower()
@@ -974,72 +993,77 @@ class TavilyHardwareAgent:
         results = []
         
         # 1. Smart tokenize query (split glued words, camelCase, and punctuation)
-        q_raw = re.sub(r'(?i)wi-?fi', ' wifi ', query)
+        q_raw = re.sub(r'(?i)\bwi-?fi\b', 'wifi', query)
+        q_raw = re.sub(r'(?i)\bmini-?itx\b', 'itx', q_raw)
+        q_raw = re.sub(r'(?i)\bmicro-?atx\b', 'matx', q_raw)
+        q_raw = re.sub(r'(?i)\bgen\s*([345])\b', r'gen\1', q_raw)
         q_raw = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', q_raw)
         q_raw = re.sub(r'([a-zA-Z]{2,})(\d+)', r'\1 \2', q_raw)
         q_raw = re.sub(r'(\d+)([a-zA-Z]{2,})', r'\1 \2', q_raw)
         q_tokens = [w for w in re.sub(r'[^a-z0-9\s]', ' ', q_raw.lower()).split() if len(w) > 0]
+        lower_q = query.lower()
         
-        # Extract model digits (e.g. '890', '4070', '7800', '9900', '265', '270')
+        # Extract model digits (e.g. '890', '4070', '7800', '9900', '265', '270', '850', '2', '64')
         digit_tokens = [w for w in q_tokens if re.search(r'\d', w)]
         pure_digits = [re.findall(r'\d+', w)[0] for w in digit_tokens if re.findall(r'\d+', w)]
         
-        # Recognized hardware brands
+        # Comprehensive dictionary of hardware & peripheral brands
         BRANDS = {
-            'asrock', 'asus', 'msi', 'gigabyte', 'zotac', 'pny', 'sapphire', 'xfx', 'evga', 
-            'corsair', 'samsung', 'intel', 'amd', 'nvidia', 'crucial', 'gskill', 'nzxt', 
-            'thermalright', 'be quiet', 'noctua', 'arctic', 'western digital', 'wd', 'seagate', 
-            'lian li', 'fractal', 'deepcool', 'seasonic', 'antec', 'montech', 'kingston', 'teamgroup'
+            'asrock', 'asus', 'msi', 'gigabyte', 'zotac', 'pny', 'sapphire', 'xfx', 'evga', 'powercolor', 'inno3d', 'palit', 'gainward',
+            'corsair', 'samsung', 'intel', 'amd', 'nvidia', 'crucial', 'gskill', 'g.skill', 'kingston', 'teamgroup', 'patriot', 'adata', 'xpg',
+            'nzxt', 'thermalright', 'be quiet', 'bequiet', 'noctua', 'arctic', 'deepcool', 'id-cooling', 'phanteks', 'lian li', 'lianli', 'fractal', 'montech', 'hyte', 'antec', 'cooler master', 'coolermaster', 'thermaltake', 'silverstone', 'seasonic', 'super flower',
+            'western digital', 'wd', 'seagate', 'sabrent', 'sk hynix', 'solidigm', 'kioxia',
+            'logitech', 'razer', 'steelseries', 'hyperx', 'corsair', 'glorious', 'wooting', 'keychron', 'ducky', 'epomaker', 'varmilo', 'akko', 'rk royal kludge', 'redragon', 'finalmouse', 'pulsar', 'lamzu', 'ninjutso', 'endgame gear', 'vaxee', 'zowie',
+            'elgato', 'shure', 'rode', 'audio-technica', 'sennheiser', 'beyerdynamic', 'fifine', 'blue',
+            'lg', 'dell', 'alienware', 'samsung', 'acer', 'aoc', 'benq', 'viewsonic', 'innocn', 'ktc'
         }
         query_brands = [w for w in q_tokens if w in BRANDS]
         
-        # Significant distinguishing model words
-        CRITICAL_FEATURE_WORDS = {'plus', 'super', 'ti', 'xt', 'xtx', 'wifi', 'white', 'liquid', 'water'}
-        query_features = [w for w in q_tokens if w in CRITICAL_FEATURE_WORDS]
+        # Significant distinguishing model words & modifiers
+        CRITICAL_MODIFIERS = {'plus', 'super', 'ti', 'xt', 'xtx', 'wifi', 'white', 'liquid', 'water', 'wireless', 'rgb', 'argb', 'oled', 'lcd', 'heatsink', 'modular', 'sfx', 'itx', 'matx', 'atx'}
+        query_modifiers = [w for w in q_tokens if w in CRITICAL_MODIFIERS]
         
         for t in titles:
             lower_t = t.lower()
             clean_t = re.sub(r'[^a-z0-9]', '', lower_t)
             
-            # Rule 1: Must contain all core model number sequences (e.g. '890' for Z890, '4070', '7800', '265')
+            # Rule 1: Reject junk/noise unless explicitly requested
+            bad_keywords = [
+                'for parts', 'broken', 'box only', 'read description', 'empty box', 
+                'sticker only', 'packaging only', 'manual only', 'dummy', 'poster', 'as is', 'case badge'
+            ]
+            if any(b in lower_t and b not in lower_q for b in bad_keywords):
+                results.append(False)
+                continue
+
+            # Rule 2: Reject prebuilt PCs when looking for individual components
+            if category in ['GPU', 'CPU', 'Motherboard', 'RAM', 'Storage', 'Power Supply', 'Case', 'Cooling']:
+                if not any(k in lower_q for k in ['pc', 'desktop', 'prebuilt', 'laptop', 'system']):
+                    if any(p in lower_t for p in ['desktop pc', 'gaming pc', 'gaming desktop', 'laptop', 'prebuilt pc', 'complete pc', 'all-in-one']):
+                        results.append(False)
+                        continue
+                        
+            # Rule 3: Reject combos/bundles when looking for standalone components
+            if category in ['GPU', 'CPU', 'Motherboard', 'RAM', 'Storage', 'Power Supply', 'Case', 'Cooling']:
+                if not any(k in lower_q for k in ['combo', 'bundle', 'pack', 'set']):
+                    if any(b in lower_t for b in ['motherboard combo', 'cpu combo', 'with motherboard', '+ motherboard', 'plus motherboard', 'cpu + mobo', 'gpu + mobo', 'cpu motherboard combo']):
+                        results.append(False)
+                        continue
+
+            # Rule 4: Must contain all core numeric sequences (e.g. '890' for Z890, '4070', '7800', '265', '990', '850')
             if pure_digits and not all(d in clean_t for d in pure_digits):
                 results.append(False)
                 continue
                 
-            # Rule 2: If query specifies a brand (e.g. 'asrock'), title must belong to that brand
-            if query_brands and not any(b in lower_t for b in query_brands):
-                results.append(False)
-                continue
-                
-            # Rule 3: If query specifies a critical feature word (e.g. 'wifi' or 'plus' or 'super' or 'ti'), title must contain it
-            if query_features and not all(f in clean_t for f in query_features):
-                results.append(False)
-                continue
-
-            # Rule 4: Reject accessories, replacements, parts, boxes, or misleading listings
-            bad_keywords = [
-                'for parts', 'broken', 'box only', 'read description', 'empty box', 
-                'waterblock only', 'only box', 'cooler only', 'heatsink only', 'thermal paste',
-                'sticker', 'badge', 'decal', 'packaging only', 'manual only', 'cable only',
-                'bracket only', 'screws only', 'mounting kit', 'keycap', 'replacement fan',
-                'backplate only', 'not working', 'as is', 'dummy', 'poster', 'case badge'
-            ]
-            if any(b in lower_t for b in bad_keywords):
-                results.append(False)
-                continue
-                
-            # Rule 5: Reject prebuilts if looking for raw components
-            if category in ['GPU', 'CPU', 'Motherboard', 'RAM', 'Storage', 'Power Supply']:
-                pc_keywords = ['desktop pc', 'gaming pc', 'gaming desktop', 'laptop', 'prebuilt', 'built pc', 'computer system']
-                if any(p in lower_t for p in pc_keywords):
+            # Rule 5: If query specifies a brand (e.g. 'asrock', 'samsung'), title must belong to that brand
+            if query_brands:
+                if not any(b.replace(' ', '').replace('.', '') in clean_t for b in query_brands):
                     results.append(False)
                     continue
-
-            # Rule 6: Reject combos / bundles if looking for standalone components
-            is_bundle_query = 'combo' in query.lower() or 'bundle' in query.lower()
-            if not is_bundle_query and category in ['GPU', 'CPU', 'Motherboard', 'RAM', 'Storage', 'Power Supply', 'Case', 'Cooling']:
-                bundle_keywords = ['combo', 'bundle', 'motherboard combo', 'cpu combo', 'with motherboard', '+ motherboard', 'plus motherboard', 'cpu + mobo', 'gpu + mobo']
-                if any(b in lower_t for b in bundle_keywords):
+                
+            # Rule 6: If query specifies a critical modifier (e.g. 'wifi', 'super', 'ti', 'white', 'wireless'), title must contain it
+            if query_modifiers:
+                if not all(m in clean_t for m in query_modifiers):
                     results.append(False)
                     continue
                     
@@ -1051,22 +1075,29 @@ class TavilyHardwareAgent:
         if not price or price <= 0:
             return False
 
-        # Category-level realistic price floors & ceilings for modern standalone computer hardware
+        # Category-level realistic price floors & ceilings for modern computer hardware
         CATEGORY_PRICE_BOUNDS = {
             'GPU': (50.0, 5000.0),
             'CPU': (35.0, 3000.0),
             'Motherboard': (35.0, 1500.0),
-            'RAM': (15.0, 1200.0),
-            'Storage': (15.0, 1500.0),
-            'Power Supply': (25.0, 1000.0),
-            'Case': (25.0, 800.0),
-            'Cooling': (10.0, 600.0),
-            'Monitor': (40.0, 3500.0),
-            'Peripherals': (5.0, 800.0),
-            'Networking': (10.0, 1000.0),
+            'RAM': (15.0, 1500.0),
+            'Storage': (15.0, 2000.0),
+            'Power Supply': (25.0, 1200.0),
+            'Case': (20.0, 1000.0),
+            'Cooling': (5.0, 800.0),
+            'Case Fans': (5.0, 300.0),
+            'Thermal Paste': (3.0, 100.0),
+            'Monitor': (40.0, 4000.0),
+            'Peripherals': (5.0, 1200.0),
+            'Keyboard': (10.0, 600.0),
+            'Mouse': (10.0, 300.0),
+            'Headset': (10.0, 1000.0),
+            'Microphone': (15.0, 800.0),
+            'Accessories': (3.0, 500.0),
+            'Networking': (10.0, 1500.0),
         }
 
-        min_bound, max_bound = CATEGORY_PRICE_BOUNDS.get(category, (5.0, 10000.0))
+        min_bound, max_bound = CATEGORY_PRICE_BOUNDS.get(category, (3.0, 10000.0))
         if price < min_bound or price > max_bound:
             return False
 
