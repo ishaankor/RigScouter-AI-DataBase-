@@ -511,24 +511,8 @@ class TavilyHardwareAgent:
         if not valid_prices:
             return float("inf")
 
-        # Dynamic tier-aware sanity floor for hardware
-        tier_floor = 10.0
-        lower_m = model_query.lower()
-        if category == "CPU":
-            if any(k in lower_m for k in ["ryzen 9", "9900", "9950", "7900", "7950", "i9", "ultra 9", "ultra 7", "7800x3d", "9800x3d", "9900x3d"]):
-                tier_floor = 250.0
-            elif any(k in lower_m for k in ["ryzen 7", "ryzen 5", "i7", "i5", "ultra 5"]):
-                tier_floor = 120.0
-        elif category == "GPU":
-            if any(k in lower_m for k in ["4090", "4080", "5090", "5080", "7900", "5070 ti"]):
-                tier_floor = 600.0
-            elif any(k in lower_m for k in ["4070", "5070", "7800", "7700"]):
-                tier_floor = 350.0
-
-        filtered = [p for p in valid_prices if p >= tier_floor]
-        if filtered:
-            return filtered[0]
-        return min(valid_prices)
+        # Return the primary product price from the clean, non-noise clause
+        return valid_prices[0]
 
     async def scrape_retailer_accurate_offer(self, model_query: str, retailer_name: str, domain_pattern: str, category: str) -> dict:
         print(f"[Tavily Search] Querying {retailer_name} for \"{model_query}\" ({category})...")
