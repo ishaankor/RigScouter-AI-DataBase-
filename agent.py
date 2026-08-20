@@ -56,12 +56,13 @@ class TavilyHardwareAgent:
         (re.compile(r'\barc\s+[ab]\d{3,4}\b', re.I), 'GPU'),
         # GPU — RX 9xxx (RDNA 4)
         (re.compile(r'\brx\s*9\d{3}(?:\s*(xt|xtx))?\b', re.I), 'GPU'),
-        # CPU — AMD Ryzen
-        (re.compile(r'\b(ryzen\s*[3579]|threadripper)\s+\d{4,5}[a-z0-9]*\b', re.I), 'CPU'),
-        # CPU — Intel Core i-series and Ultra
-        (re.compile(r'\b(core\s+)?(i[3579]|ultra\s*\d+)-\d{4,6}[a-z]*\b', re.I), 'CPU'),
-        # CPU — Intel Core Ultra (new naming)
-        (re.compile(r'\bcore\s+ultra\s+\d+\s+\d{3,4}[a-z]*\b', re.I), 'CPU'),
+        # CPU — AMD Ryzen & Threadripper (e.g. "Ryzen 7 7800X3D", "Ryzen 9 9900X3D", "Ryzen 5 7600X")
+        (re.compile(r'\b(?:amd\s+)?(ryzen\s*[3579]|threadripper)\s+\d{4,5}[a-z0-9]*(?:\s*x3d)?\b', re.I), 'CPU'),
+        # CPU — Intel Core Ultra (Series 1 & 2: Ultra 5/7/9, 2xx / 1xx, K/KF/Plus/T/H/HX)
+        (re.compile(r'\b(?:intel\s+)?(?:core\s+)?ultra\s*[3579]\s*(?:series\s*2\s*)?[- ]?\d{3,4}[a-z]*(?:\s+plus)?\b', re.I), 'CPU'),
+        (re.compile(r'\b(?:intel\s+)?(?:core\s+)?(ultra\s*[3579]|i[3579])[- ]\d{3,6}[a-z]*(?:\s+plus)?\b', re.I), 'CPU'),
+        # CPU — Intel Core i-series (e.g. "i9 14900K", "Core i7-14700K", "i5 13600K")
+        (re.compile(r'\b(?:intel\s+)?(?:core\s+)?i[3579][ -]\d{4,5}[a-z]*\b', re.I), 'CPU'),
         # RAM — explicit capacity + DDR
         (re.compile(r'\b\d+gb\s+(ddr[45]|so-?dimm)\b', re.I), 'RAM'),
         (re.compile(r'\bddr[45][- ]\d{4,5}\b', re.I), 'RAM'),
@@ -76,8 +77,8 @@ class TavilyHardwareAgent:
         (re.compile(r'\b(z\d{3}|b\d{3}|x\d{3}|a\d{3})\s*(e|f|p|m|a|plus|pro|max|wifi|gaming)?\s*(motherboard|atx|matx|itx|mainboard)\b', re.I), 'Motherboard'),
         # Motherboard — brand+chipset (e.g. "ASUS Z890", "MSI B650")
         (re.compile(r'\b(asus|msi|gigabyte|asrock)\s+(z|b|x|a)\d{3}\b', re.I), 'Motherboard'),
-        # Cooling — AIO / air coolers
-        (re.compile(r'\b(aio|liquid\s+cooler|cpu\s+cooler|air\s+cooler|heatsink|noctua|be\s+quiet|arctic\s+freezer|deepcool|id-cooling)\b', re.I), 'Cooling'),
+        # Cooling — AIO / air coolers (exclude CPU "heatsink not included" or "cooler not included")
+        (re.compile(r'\b(aio\s+liquid|liquid\s+cooler|cpu\s+cooler|air\s+cooler|noctua|be\s+quiet|arctic\s+liquid|arctic\s+freezer|deepcool|id-cooling|thermalright\s+peerless|thermalright\s+phantom|nzxt\s+kraken|corsair\s+icue\s+link|corsair\s+h\d{3})\b', re.I), 'Cooling'),
         # Case
         (re.compile(r'\b(pc\s+case|mid\s+tower|full\s+tower|mini\s+itx\s+case|atx\s+case)\b', re.I), 'Case'),
         # Monitor — explicit size + Hz or "monitor"
@@ -365,9 +366,9 @@ class TavilyHardwareAgent:
                     "component_name": best.get('title') or clean_prompt,
                     "category": category,
                     "target_price": round(best['price'] * 0.9, 2),
-                    "previous_price_24h": round(best['price'] * 1.05, 2),
-                    "previous_price_7d": round(best['price'] * 1.08, 2),
-                    "previous_price_30d": round(best['price'] * 1.12, 2),
+                    "previous_price_24h": best['price'],
+                    "previous_price_7d": best['price'],
+                    "previous_price_30d": best['price'],
                     "all_time_low": best['price'],
                 }
                 if user_id:
@@ -487,9 +488,9 @@ class TavilyHardwareAgent:
                     clean_url = full_url.replace('/reviews/', '').split('?')[0]
                     content = hit.get('content', '')
                     
-                    # Strip shipping fees, delivery charges, and monthly financing costs before price extraction
-                    clean_content = re.sub(r'(?:shipping|delivery|handling|postage|est\.?\s*shipping|import\s*charges)[:\s]*\$[0-9,]+(?:\.[0-9]{2})?', '', content, flags=re.I)
-                    clean_content = re.sub(r'\$[0-9,]+(?:\.[0-9]{2})?\s*(?:shipping|delivery|handling|postage|per\s*month|/\s*mo)', '', clean_content, flags=re.I)
+                    # Strip promotions, protection plans, monthly financing, taxes, and shipping fees
+                    clean_content = re.sub(r'(?:shipping|delivery|handling|postage|est\.?\s*shipping|import\s*charges|save\s+the\s+tax|protection\s+plan|warranty|add\s+a\s+protection\s+plan\s+from|from|save|off)[:\s]*\$[0-9,]+(?:\.[0-9]{2})?', '', content, flags=re.I)
+                    clean_content = re.sub(r'\$[0-9,]+(?:\.[0-9]{2})?\s*(?:shipping|delivery|handling|postage|per\s*month|/\s*mo|suggested\s+payments|monthly)', '', clean_content, flags=re.I)
                     
                     # Estimate price from snippet
                     prices = re.findall(r'\$[0-9,]+(?:\.[0-9]{2})?', clean_content)
@@ -629,12 +630,7 @@ class TavilyHardwareAgent:
                         print(f"⚠️ [Out of Stock] Amazon: Item is marked unavailable in BS4.")
                         return None
                         
-                    # Main price MUST come from the actual new-item buybox first. Nearly every
-                    # popular Amazon listing also has a "used/warehouse" offers section on the
-                    # page even when the primary listing is new — treating that section as a
-                    # priority source (old behavior) silently substituted a used price for the
-                    # new one on a huge fraction of listings. Only fall back to the used price
-                    # if no new-item buybox price exists at all.
+                    # Main price MUST come from the actual new-item buybox first.
                     price_container = soup.select_one('#corePriceDisplay_desktop_feature_div .a-price') or \
                                       soup.select_one('#corePrice_feature_div .a-price') or \
                                       soup.select_one('#corePrice_desktop .a-price') or \
@@ -648,45 +644,47 @@ class TavilyHardwareAgent:
                             is_refurbished = True
 
                     if price_container:
-                        price_whole = price_container.select_one('.a-price-whole')
-                        price_fraction = price_container.select_one('.a-price-fraction')
-                        if price_whole:
-                            price_str = price_whole.text.replace(',', '').replace('.', '').strip()
-                            frac = price_fraction.text.strip() if price_fraction else "00"
-                            price = float(f"{price_str}.{frac}")
+                        offscreen = price_container.select_one('.a-offscreen')
+                        if offscreen:
+                            m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', offscreen.text)
+                            if m:
+                                try: price = float(m.group(1).replace(',', ''))
+                                except ValueError: pass
+                        if not price:
+                            price_whole = price_container.select_one('.a-price-whole')
+                            price_fraction = price_container.select_one('.a-price-fraction')
+                            if price_whole:
+                                price_str = price_whole.text.replace(',', '').replace('.', '').strip()
+                                frac = price_fraction.text.strip() if price_fraction else "00"
+                                try: price = float(f"{price_str}.{frac}")
+                                except ValueError: pass
                             
                     title_elem = soup.select_one('#productTitle')
                     if title_elem: title = title_elem.text.strip()
                     
                     # Reject out of stock items explicitly
-                    availability_elem = soup.select_one('#availability')
                     if availability_elem and ('currently unavailable' in availability_elem.text.lower() or 'out of stock' in availability_elem.text.lower()):
                         print(f"⚠️ [Out of Stock] Amazon: Currently unavailable.")
                         return None
                     
                 elif retailer_name == 'Newegg':
-                    # Avoid picking up related/sponsored items by ignoring .item-container
-                    # Newegg mutates class names like .price-current_2026
-                    price_elements = soup.select('[class^="price-current"]')
-                    main_price_candidates = [p for p in price_elements if p.text.strip() and not p.find_parent(class_='item-container')]
-                    price_container = main_price_candidates[0] if main_price_candidates else None
-                    
-                    if not price_container:
-                        # Fallback
-                        for p in price_elements:
-                            if p.text.strip():
-                                price_container = p
-                                break
-                                
-                    if price_container:
-                        price_strong = price_container.select_one('strong')
-                        price_sup = price_container.select_one('sup')
+                    # Extract main price from active buy box
+                    price_elem = soup.select_one('.price-current') or soup.select_one('[class^="price-current"]')
+                    if price_elem:
+                        price_strong = price_elem.select_one('strong')
+                        price_sup = price_elem.select_one('sup')
                         if price_strong:
                             price_str = price_strong.text.replace(',', '').strip()
                             frac = price_sup.text.strip() if price_sup else ".00"
-                            price = float(f"{price_str}{frac}")
+                            try: price = float(f"{price_str}{frac}")
+                            except ValueError: pass
+                        else:
+                            m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', price_elem.text)
+                            if m:
+                                try: price = float(m.group(1).replace(',', ''))
+                                except ValueError: pass
                             
-                    title_elem = soup.select_one('.product-title')
+                    title_elem = soup.select_one('.product-title') or soup.select_one('h1.product-title')
                     if title_elem: title = title_elem.text.strip()
                     
                     # Reject out of stock items explicitly
@@ -694,7 +692,6 @@ class TavilyHardwareAgent:
                     if inventory_elem and 'out of stock' in inventory_elem.text.lower():
                         print(f"⚠️ [Out of Stock] Newegg: Out of stock.")
                         return None
-                    
                     
                 elif retailer_name == 'Best Buy':
                     # 1. Try JSON-LD first for highly accurate pricing
@@ -711,9 +708,6 @@ class TavilyHardwareAgent:
                                         clean_q_words = [w for w in re.sub(r'[^a-z0-9\s]', '', model_query.lower()).split() if len(w) > 2]
                                         digit_tokens = [w for w in clean_q_words if re.search(r'\d', w)]
                                         clean_item_name = re.sub(r'[^a-z0-9]', '', item_name)
-                                        # Require ALL digit-bearing tokens (model numbers/capacities), not just
-                                        # the single "longest word" — that heuristic let e.g. "RTX 4070" match a
-                                        # JSON-LD entry for "RTX 4090" whenever some other longer word matched.
                                         if digit_tokens and not all(d in clean_item_name for d in digit_tokens):
                                             continue
                                             
@@ -737,12 +731,12 @@ class TavilyHardwareAgent:
                             '.pricing-price span'
                         )
                         for p in price_candidates:
-                            text = p.text.replace('$', '').replace(',', '').strip()
-                            try:
-                                if text: 
-                                    price = float(text)
+                            m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', p.text)
+                            if m:
+                                try:
+                                    price = float(m.group(1).replace(',', ''))
                                     break
-                            except ValueError: continue
+                                except ValueError: continue
                             
                     title_elem = soup.select_one('.sku-title h1, h1[class*="product-title"], h1.heading-5, h1[class*="text-5"]')
                     if title_elem: title = title_elem.text.strip()
@@ -754,10 +748,15 @@ class TavilyHardwareAgent:
                         return None
                     
                 elif retailer_name == 'B&H':
-                    price_elem = soup.select_one('[data-selenium="pricingPrice"]')
+                    price_elem = soup.select_one('[data-selenium="pricingPrice"]') or \
+                                 soup.select_one('.price__9gLfjPSjp') or \
+                                 soup.select_one('[data-selenium="pricingContainer"] .price__9gLfjPSjp')
                     if price_elem:
-                        price = float(price_elem.text.replace('$', '').replace(',', '').strip())
-                    title_elem = soup.select_one('[data-selenium="productTitle"]')
+                        m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', price_elem.text)
+                        if m:
+                            try: price = float(m.group(1).replace(',', ''))
+                            except ValueError: pass
+                    title_elem = soup.select_one('[data-selenium="productTitle"]') or soup.select_one('h1[data-selenium="productTitle"]')
                     if title_elem: title = title_elem.text.strip()
                     
                     # Reject out of stock / no longer available explicitly
@@ -767,13 +766,16 @@ class TavilyHardwareAgent:
                         return None
                     
                 elif retailer_name == 'eBay':
-                    # Extract main price from eBay buy box
-                    price_elem = soup.select_one('.x-price-primary span.ux-textspans') or soup.select_one('.x-price-primary')
+                    # Extract main price from eBay buy box (ignore strikethrough list prices and financing)
+                    price_elem = soup.select_one('.x-price-primary') or soup.select_one('[data-testid="x-price-primary"]') or soup.select_one('.x-price-approx')
                     if price_elem:
-                        # e.g., "US $350.00" -> "350.00"
-                        price_text = price_elem.text.replace('US', '').replace('$', '').replace(',', '').strip()
-                        try: price = float(price_text)
-                        except ValueError: pass
+                        spans = price_elem.select('.ux-textspans')
+                        valid_spans = [s for s in spans if 'strikethrough' not in ''.join(s.get('class', [])).lower()]
+                        target_text = valid_spans[0].text if valid_spans else price_elem.text
+                        m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', target_text)
+                        if m:
+                            try: price = float(m.group(1).replace(',', ''))
+                            except ValueError: pass
                     
                     # Extract title
                     title_elem = soup.select_one('.x-item-title__mainTitle span.ux-textspans') or soup.select_one('.x-item-title__mainTitle')
@@ -803,21 +805,25 @@ class TavilyHardwareAgent:
                     # Try OpenGraph price first (Micro Center often puts it here)
                     og_price = soup.select_one('meta[property="og:price:amount"]') or soup.select_one('meta[itemprop="price"]')
                     if og_price and og_price.get('content'):
-                        try: price = float(og_price['content'].replace('$', '').replace(',', ''))
-                        except ValueError: pass
+                        m = re.search(r'([0-9,]+(?:\.[0-9]{2})?)', og_price['content'])
+                        if m:
+                            try: price = float(m.group(1).replace(',', ''))
+                            except ValueError: pass
                     
                     if not price:
                         price_elem = soup.select_one('#pricing') or soup.select_one('#pricing2')
-                        if price_elem and price_elem.get('content'):
-                            try: price = float(price_elem['content'])
-                            except ValueError: pass
-                            
-                    if not price:
-                        # Fallback to data-price on the main title if available
-                        data_price_elem = soup.select_one('.ProductLink_' + soup.select_one('[data-id]')['data-id']) if soup.select_one('[data-id]') else None
-                        if data_price_elem and data_price_elem.get('data-price'):
-                            try: price = float(data_price_elem['data-price'])
-                            except ValueError: pass
+                        if price_elem:
+                            content_val = price_elem.get('content')
+                            if content_val:
+                                m = re.search(r'([0-9,]+(?:\.[0-9]{2})?)', content_val)
+                                if m:
+                                    try: price = float(m.group(1).replace(',', ''))
+                                    except ValueError: pass
+                            if not price:
+                                m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', price_elem.text)
+                                if m:
+                                    try: price = float(m.group(1).replace(',', ''))
+                                    except ValueError: pass
                     
                     # Extract title
                     title_elem = soup.select_one('.ProductLink_' + soup.select_one('[data-id]')['data-id']) if soup.select_one('[data-id]') else None
@@ -1000,6 +1006,14 @@ class TavilyHardwareAgent:
             if category in ['GPU', 'CPU', 'Motherboard', 'RAM', 'Storage', 'Power Supply']:
                 pc_keywords = ['desktop pc', 'gaming pc', 'gaming desktop', 'laptop', 'prebuilt', 'built pc', 'computer system']
                 if any(p in lower_t for p in pc_keywords):
+                    results.append(False)
+                    continue
+
+            # Rule 4: Reject combos / bundles if looking for standalone components
+            is_bundle_query = 'combo' in query.lower() or 'bundle' in query.lower()
+            if not is_bundle_query and category in ['GPU', 'CPU', 'Motherboard', 'RAM', 'Storage', 'Power Supply', 'Case', 'Cooling']:
+                bundle_keywords = ['combo', 'bundle', 'motherboard combo', 'cpu combo', 'with motherboard', '+ motherboard', 'plus motherboard', 'cpu + mobo', 'gpu + mobo']
+                if any(b in lower_t for b in bundle_keywords):
                     results.append(False)
                     continue
                     
