@@ -73,10 +73,10 @@ class TavilyHardwareAgent:
         # PSU — wattage-only queries (e.g. "850W PSU")
         (re.compile(r'\b\d{3,4}\s*w\s+(psu|power\s+supply|modular|atx|sfx)\b', re.I), 'Power Supply'),
         (re.compile(r'\b(psu|power\s+supply)\s+\d{3,4}\s*w\b', re.I), 'Power Supply'),
+        # Motherboard — brand+chipset (e.g. "ASRock Z890", "ASUS Z890", "MSI B650", "Gigabyte X870")
+        (re.compile(r'\b(asrock|asus|msi|gigabyte)\s+(z|b|x|a)\d{3}[a-z]*(?:\s+(?:wifi|pro|plus|gaming|elite|hero|taichi|extreme|max|tomahawk))?\b', re.I), 'Motherboard'),
         # Motherboard — chipset + form factor
-        (re.compile(r'\b(z\d{3}|b\d{3}|x\d{3}|a\d{3})\s*(e|f|p|m|a|plus|pro|max|wifi|gaming)?\s*(motherboard|atx|matx|itx|mainboard)\b', re.I), 'Motherboard'),
-        # Motherboard — brand+chipset (e.g. "ASUS Z890", "MSI B650")
-        (re.compile(r'\b(asus|msi|gigabyte|asrock)\s+(z|b|x|a)\d{3}\b', re.I), 'Motherboard'),
+        (re.compile(r'\b(z\d{3}|b\d{3}|x\d{3}|a\d{3})\s*(e|f|p|m|a|plus|pro|max|wifi|gaming)?\s*(motherboard|atx|matx|itx|mainboard)?\b', re.I), 'Motherboard'),
         # Cooling — AIO / air coolers (exclude CPU "heatsink not included" or "cooler not included")
         (re.compile(r'\b(aio\s+liquid|liquid\s+cooler|cpu\s+cooler|air\s+cooler|noctua|be\s+quiet|arctic\s+liquid|arctic\s+freezer|deepcool|id-cooling|thermalright\s+peerless|thermalright\s+phantom|nzxt\s+kraken|corsair\s+icue\s+link|corsair\s+h\d{3})\b', re.I), 'Cooling'),
         # Case
@@ -95,11 +95,18 @@ class TavilyHardwareAgent:
         search query, drastically cutting down on how many listings can match it.
         """
         text = query.strip()
+        # Normalize text for regex matching (split glued words/camelCase like Z890WiFi -> Z890 WiFi)
+        norm_text = re.sub(r'(?i)wi-?fi', ' wifi ', text)
+        norm_text = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', norm_text)
+        norm_text = re.sub(r'([a-zA-Z]{2,})(\d+)', r'\1 \2', norm_text)
+        norm_text = re.sub(r'(\d+)([a-zA-Z]{2,})', r'\1 \2', norm_text)
+        norm_text = re.sub(r'\s+', ' ', norm_text).strip()
+
         for pattern, category in self._REGEX_RULES:
-            match = pattern.search(text)
+            match = pattern.search(norm_text) or pattern.search(text)
             if match:
                 extracted = match.group(0).strip()
-                # Collapse internal whitespace from the match (e.g. "RTX   4090" -> "RTX 4090")
+                # Collapse internal whitespace from the match
                 extracted = re.sub(r'\s+', ' ', extracted)
                 print(f"[Fast Classify] '{text}' → '{extracted}' / {category} (regex)")
                 return {"model": extracted, "category": category}
@@ -704,7 +711,6 @@ class TavilyHardwareAgent:
                                 if item.get('@type') == 'Product' and 'offers' in item:
                                     item_name = item.get('name', '').lower()
                                     if model_query and item_name:
-                                        import re
                                         clean_q_words = [w for w in re.sub(r'[^a-z0-9\s]', '', model_query.lower()).split() if len(w) > 2]
                                         digit_tokens = [w for w in clean_q_words if re.search(r'\d', w)]
                                         clean_item_name = re.sub(r'[^a-z0-9]', '', item_name)
@@ -965,35 +971,55 @@ class TavilyHardwareAgent:
         return True
 
     async def filter_matching_titles(self, titles: list[str], query: str, category: str) -> list[bool]:
-        import re
         results = []
-        clean_q_words = [w for w in re.sub(r'[^a-z0-9\s]', '', query.lower()).split() if len(w) > 2]
+        
+        # 1. Smart tokenize query (split glued words, camelCase, and punctuation)
+        q_raw = re.sub(r'(?i)wi-?fi', ' wifi ', query)
+        q_raw = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', q_raw)
+        q_raw = re.sub(r'([a-zA-Z]{2,})(\d+)', r'\1 \2', q_raw)
+        q_raw = re.sub(r'(\d+)([a-zA-Z]{2,})', r'\1 \2', q_raw)
+        q_tokens = [w for w in re.sub(r'[^a-z0-9\s]', ' ', q_raw.lower()).split() if len(w) > 0]
+        
+        # Extract model digits (e.g. '890', '4070', '7800', '9900', '265', '270')
+        digit_tokens = [w for w in q_tokens if re.search(r'\d', w)]
+        pure_digits = [re.findall(r'\d+', w)[0] for w in digit_tokens if re.findall(r'\d+', w)]
+        
+        # Recognized hardware brands
+        BRANDS = {
+            'asrock', 'asus', 'msi', 'gigabyte', 'zotac', 'pny', 'sapphire', 'xfx', 'evga', 
+            'corsair', 'samsung', 'intel', 'amd', 'nvidia', 'crucial', 'gskill', 'nzxt', 
+            'thermalright', 'be quiet', 'noctua', 'arctic', 'western digital', 'wd', 'seagate', 
+            'lian li', 'fractal', 'deepcool', 'seasonic', 'antec', 'montech', 'kingston', 'teamgroup'
+        }
+        query_brands = [w for w in q_tokens if w in BRANDS]
+        
+        # Significant distinguishing model words
+        CRITICAL_FEATURE_WORDS = {'plus', 'super', 'ti', 'xt', 'xtx', 'wifi', 'white', 'liquid', 'water'}
+        query_features = [w for w in q_tokens if w in CRITICAL_FEATURE_WORDS]
         
         for t in titles:
             lower_t = t.lower()
             clean_t = re.sub(r'[^a-z0-9]', '', lower_t)
             
-            # Rule 1: Must contain core query model identifiers.
-            # Digit-bearing tokens (model numbers, capacities, wattages — "4090", "24gb",
-            # "14900k") are the actual identifying part of a hardware query. Requiring only
-            # ANY ONE of these (the old behavior) let "RTX 4070" match a listing for
-            # "RTX 4090 24GB" purely because "24gb" happened to appear in both. Require ALL
-            # digit-bearing tokens to be present so distinct SKUs in the same product line
-            # can't be confused with each other.
-            digit_tokens = [w for w in clean_q_words if re.search(r'\d', w)]
-            word_tokens = [w for w in clean_q_words if len(w) >= 4 and not re.search(r'\d', w)]
-
-            if digit_tokens and not all(d in clean_t for d in digit_tokens):
-                results.append(False)
-                continue
-            if not digit_tokens and word_tokens and not any(w in clean_t for w in word_tokens):
+            # Rule 1: Must contain all core model number sequences (e.g. '890' for Z890, '4070', '7800', '265')
+            if pure_digits and not all(d in clean_t for d in pure_digits):
                 results.append(False)
                 continue
                 
-            # Rule 2: Reject accessories, replacements, parts, boxes, or misleading listings
+            # Rule 2: If query specifies a brand (e.g. 'asrock'), title must belong to that brand
+            if query_brands and not any(b in lower_t for b in query_brands):
+                results.append(False)
+                continue
+                
+            # Rule 3: If query specifies a critical feature word (e.g. 'wifi' or 'plus' or 'super' or 'ti'), title must contain it
+            if query_features and not all(f in clean_t for f in query_features):
+                results.append(False)
+                continue
+
+            # Rule 4: Reject accessories, replacements, parts, boxes, or misleading listings
             bad_keywords = [
                 'for parts', 'broken', 'box only', 'read description', 'empty box', 
-                'waterblock', 'only box', 'cooler only', 'heatsink only', 'thermal paste',
+                'waterblock only', 'only box', 'cooler only', 'heatsink only', 'thermal paste',
                 'sticker', 'badge', 'decal', 'packaging only', 'manual only', 'cable only',
                 'bracket only', 'screws only', 'mounting kit', 'keycap', 'replacement fan',
                 'backplate only', 'not working', 'as is', 'dummy', 'poster', 'case badge'
@@ -1002,14 +1028,14 @@ class TavilyHardwareAgent:
                 results.append(False)
                 continue
                 
-            # Rule 3: Reject prebuilts if looking for raw components
+            # Rule 5: Reject prebuilts if looking for raw components
             if category in ['GPU', 'CPU', 'Motherboard', 'RAM', 'Storage', 'Power Supply']:
                 pc_keywords = ['desktop pc', 'gaming pc', 'gaming desktop', 'laptop', 'prebuilt', 'built pc', 'computer system']
                 if any(p in lower_t for p in pc_keywords):
                     results.append(False)
                     continue
 
-            # Rule 4: Reject combos / bundles if looking for standalone components
+            # Rule 6: Reject combos / bundles if looking for standalone components
             is_bundle_query = 'combo' in query.lower() or 'bundle' in query.lower()
             if not is_bundle_query and category in ['GPU', 'CPU', 'Motherboard', 'RAM', 'Storage', 'Power Supply', 'Case', 'Cooling']:
                 bundle_keywords = ['combo', 'bundle', 'motherboard combo', 'cpu combo', 'with motherboard', '+ motherboard', 'plus motherboard', 'cpu + mobo', 'gpu + mobo']
