@@ -567,13 +567,23 @@ class TavilyHardwareAgent:
                 valid_hits.sort(key=lambda x: x['est_price'])
                 
                 # Try Firecrawl on top 2 candidates
+                confirmed_out_of_stock = False
                 for candidate in valid_hits[:2]:
                     offer = await self.firecrawl_extract(candidate['url'], retailer_name, category, model_query)
                     if offer:
-                        print(f"✅ [CHEAPEST AVAILABLE {retailer_name.upper()} OFFER] \"${offer['price']}\" -> {offer['title'][:60]}")
-                        return offer
+                        if offer.get('out_of_stock'):
+                            confirmed_out_of_stock = True
+                            continue
+                        if offer.get('price', 0) > 0:
+                            print(f"✅ [CHEAPEST AVAILABLE {retailer_name.upper()} OFFER] \"${offer['price']}\" -> {offer['title'][:60]}")
+                            return offer
 
-                # Instant Fallback: use verified, noise-filtered Tavily snippet price
+                # If the product is confirmed out of stock / discontinued on this store, do NOT invent a snippet fallback
+                if confirmed_out_of_stock:
+                    print(f"⚠️ [Confirmed Out of Stock] {retailer_name}: Scraped page confirmed item is out of stock. Skipping snippet fallback.")
+                    return None
+
+                # Instant Fallback: use verified, noise-filtered Tavily snippet price only if Firecrawl timed out or was blocked
                 for candidate in valid_hits:
                     if candidate['est_price'] < float('inf') and self.is_price_sanity_valid(candidate['est_price'], model_query, category):
                         print(f"✅ [TAVILY SNIPPET FALLBACK] {retailer_name}: Found price ${candidate['est_price']:.2f} -> {candidate['title'][:50]}")
@@ -714,7 +724,7 @@ class TavilyHardwareAgent:
                     # Reject out of stock items explicitly
                     if availability_elem and ('currently unavailable' in availability_elem.text.lower() or 'out of stock' in availability_elem.text.lower()):
                         print(f"⚠️ [Out of Stock] Amazon: Currently unavailable.")
-                        return None
+                        return {"out_of_stock": True}
                     
                 elif retailer_name == 'Newegg':
                     # Extract main price from active buy box
@@ -740,7 +750,7 @@ class TavilyHardwareAgent:
                     inventory_elem = soup.select_one('.product-inventory')
                     if inventory_elem and 'out of stock' in inventory_elem.text.lower():
                         print(f"⚠️ [Out of Stock] Newegg: Out of stock.")
-                        return None
+                        return {"out_of_stock": True}
                     
                 elif retailer_name == 'Best Buy':
                     # 1. Try JSON-LD first for highly accurate pricing
@@ -793,7 +803,7 @@ class TavilyHardwareAgent:
                     add_to_cart_btn = soup.select_one('.add-to-cart-button, button[data-button-state]')
                     if add_to_cart_btn and ('sold_out' in add_to_cart_btn.get('data-button-state', '').lower() or 'sold out' in add_to_cart_btn.text.lower()):
                         print(f"⚠️ [Out of Stock] Best Buy: Sold out.")
-                        return None
+                        return {"out_of_stock": True}
                     
                 elif retailer_name == 'B&H':
                     price_elem = soup.select_one('[data-selenium="pricingPrice"]') or \
@@ -808,10 +818,12 @@ class TavilyHardwareAgent:
                     if title_elem: title = title_elem.text.strip()
                     
                     # Reject out of stock / no longer available explicitly
-                    availability_elem = soup.select_one('.shippingAvail_yL7x0I4P, [data-selenium="stockStatus"]')
-                    if availability_elem and ('no longer available' in availability_elem.text.lower() or 'discontinued' in availability_elem.text.lower()):
+                    availability_elem = soup.select_one('.shippingAvail_yL7x0I4P, [data-selenium="stockStatus"], [data-selenium="availability"]')
+                    avail_text = availability_elem.text.lower() if availability_elem else ''
+                    raw_text_snippet = (soup.text or '')[:2000].lower()
+                    if 'no longer available' in avail_text or 'discontinued' in avail_text or 'no longer available' in raw_text_snippet or 'discontinued' in raw_text_snippet:
                         print(f"⚠️ [Out of Stock] B&H: No longer available.")
-                        return None
+                        return {"out_of_stock": True}
                     
                 elif retailer_name == 'eBay':
                     # Extract main price from eBay buy box (ignore strikethrough list prices and financing)
@@ -833,7 +845,7 @@ class TavilyHardwareAgent:
                     ended_msg = soup.select_one('.x-ended-item-msg, .msg-error, .ux-notice')
                     if ended_msg and ('ended' in ended_msg.text.lower() or 'out of stock' in ended_msg.text.lower()):
                         print(f"⚠️ [Out of Stock] eBay: Listing ended or out of stock.")
-                        return None
+                        return {"out_of_stock": True}
                     
                     # Extract condition (Used vs New) to set is_refurbished roughly
                     condition_elem = soup.select_one('.x-item-condition-text span.ux-textspans') or soup.select_one('.x-item-condition-text')
@@ -889,7 +901,7 @@ class TavilyHardwareAgent:
                         inventory_text = inventory_elem.text.lower()
                         if 'sold out' in inventory_text or 'no longer carried' in inventory_text or 'not available' in inventory_text:
                             print(f"⚠️ [Out of Stock] Micro Center: Sold out or no longer carried.")
-                            return None
+                            return {"out_of_stock": True}
             except Exception as e:
                 print(f"[BS4 Parse Error] {retailer_name}: {e}")
                 
