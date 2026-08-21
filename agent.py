@@ -323,26 +323,21 @@ class TavilyHardwareAgent:
                         state["scrapedOffers"].append(offer)
                         
                         try:
-                            offer_model_group = self.normalize_model(offer['title'], clean_prompt)
-                            offer_component_id = f"comp-{re.sub(r'[^a-z0-9]+', '-', offer_model_group.lower())}-{re.sub(r'[^a-z0-9]+', '-', offer['retailer'].lower())}"
-
-                            offer_msrp = offer.get('originalPrice') if offer.get('originalPrice') and offer.get('originalPrice') > offer['price'] else offer['price']
-                            offer_deal_score = min(100, max(50, round(50 + ((offer_msrp - offer['price']) / offer_msrp) * 100))) if offer_msrp > offer['price'] else 50
-
+                            comp_id = f"comp-{re.sub(r'[^a-z0-9]+', '-', clean_prompt.lower())}-{offer['retailer'].lower().replace(' ', '-')}"
                             query1 = supabase.table('hardware_components').upsert({
-                                "id": offer_component_id,
+                                "id": comp_id,
                                 "name": offer['title'],
                                 "category": category,
-                                "brand": offer.get('brand') or offer['title'].split(' ')[0] or 'Hardware',
-                                "model": offer_model_group,
+                                "brand": offer['title'].split()[0] if offer['title'] else "Hardware",
+                                "model": clean_prompt,
                                 "specs": json.dumps({
-                                    "AgentSummary": "Live Scraping...",
+                                    "AgentSummary": "Live Autonomous Scraping Engine",
                                     "InStock": offer['inStock'],
                                     "IsRefurbished": offer.get('isRefurbished', False),
                                     "OriginalPrice": offer.get('originalPrice'),
                                     "ScrapedAt": datetime.now(timezone.utc).isoformat()
                                 }),
-                                "msrp": offer_msrp,
+                                "msrp": offer.get('originalPrice') or offer['price'],
                                 "current_price": offer['price'],
                                 "lowest_price_90d": offer['price'],
                                 "retailer": offer['retailer'],
@@ -354,6 +349,16 @@ class TavilyHardwareAgent:
                             })
                             await asyncio.to_thread(query1.execute)
                             print(f"[DB Persist Success] Saved \"{offer['retailer']}\" offer: \"{offer['title']}\" (${offer['price']:.2f}) to hardware_components")
+
+                            # Log historical price snapshot
+                            try:
+                                await asyncio.to_thread(supabase.table('price_snapshots').insert({
+                                    "price": offer['price'],
+                                    "in_stock": offer['inStock'],
+                                    "scraped_at": datetime.now(timezone.utc).isoformat()
+                                }).execute)
+                            except Exception:
+                                pass
                         except Exception as e:
                             print(f"[Agent Incremental Persistence Error]: {e}")
                             
@@ -391,36 +396,49 @@ class TavilyHardwareAgent:
             try:
                 best = state["bestOffer"]
                 primary_comp_id = f"comp-{re.sub(r'[^a-z0-9]+', '-', clean_prompt.lower())}"
-                wl_row = {
-                    "component_id": primary_comp_id,
-                    "component_name": best.get('title') or clean_prompt,
-                    "category": category,
-                    "target_price": round(best['price'] * 0.9, 2),
-                    "previous_price_24h": best['price'],
-                    "previous_price_7d": best['price'],
-                    "previous_price_30d": best['price'],
-                    "all_time_low": best['price'],
-                }
-                if user_id:
-                    wl_row["user_id"] = user_id
-
+                
                 # Check if this user already has an entry for this clean_prompt / component_id
-                existing_check = supabase.table('watchlist_items').select('id').eq('component_id', primary_comp_id)
+                existing_check = supabase.table('watchlist_items').select('*').eq('component_id', primary_comp_id)
                 if user_id:
                     existing_check = existing_check.eq('user_id', user_id)
                 existing_res = await asyncio.to_thread(existing_check.execute)
 
                 if existing_res.data and len(existing_res.data) > 0:
-                    target_id = existing_res.data[0]['id']
+                    existing_row = existing_res.data[0]
+                    target_id = existing_row['id']
+                    prior_price = existing_row.get('current_price') or existing_row.get('all_time_low')
+                    prior_atl = existing_row.get('all_time_low') or best['price']
+
+                    wl_row = {
+                        "component_name": best.get('title') or clean_prompt,
+                        "category": category,
+                        "target_price": round(best['price'] * 0.9, 2),
+                        "current_price": best['price'],
+                        "previous_price_24h": prior_price if prior_price and prior_price != best['price'] else existing_row.get('previous_price_24h', best['price']),
+                        "all_time_low": min(prior_atl, best['price']),
+                    }
                     await asyncio.to_thread(
                         supabase.table('watchlist_items').update(wl_row).eq('id', target_id).execute
                     )
                     print(f"[Watchlist Persist Success] Updated single entry for '{clean_prompt}' in watchlist_items")
                 else:
+                    wl_row = {
+                        "component_id": primary_comp_id,
+                        "component_name": best.get('title') or clean_prompt,
+                        "category": category,
+                        "target_price": round(best['price'] * 0.9, 2),
+                        "current_price": best['price'],
+                        "previous_price_24h": best['price'],
+                        "previous_price_7d": best['price'],
+                        "previous_price_30d": best['price'],
+                        "all_time_low": best['price'],
+                    }
+                    if user_id:
+                        wl_row["user_id"] = user_id
                     await asyncio.to_thread(
                         supabase.table('watchlist_items').insert(wl_row).execute
                     )
-                    print(f"[Watchlist Persist Success] Created single entry for '{clean_prompt}' in watchlist_items")
+                    print(f"[Watchlist Persist Success] Created single baseline entry for '{clean_prompt}' in watchlist_items")
             except Exception as wl_e:
                 print(f"[Watchlist Persist Notice]: {wl_e}")
 
