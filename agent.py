@@ -324,6 +324,29 @@ class TavilyHardwareAgent:
                         
                         try:
                             comp_id = f"comp-{re.sub(r'[^a-z0-9]+', '-', clean_prompt.lower())}-{offer['retailer'].lower().replace(' ', '-')}"
+                            
+                            # Preserve and append to PriceHistory
+                            existing_specs = {}
+                            offer_lowest_90d = offer['price']
+                            try:
+                                exist_check = await asyncio.to_thread(supabase.table('hardware_components').select('specs, lowest_price_90d').eq('id', comp_id).execute)
+                                if exist_check.data and len(exist_check.data) > 0:
+                                    raw_s = exist_check.data[0].get('specs')
+                                    existing_specs = json.loads(raw_s) if isinstance(raw_s, str) else (raw_s or {})
+                                    if exist_check.data[0].get('lowest_price_90d'):
+                                        offer_lowest_90d = min(float(exist_check.data[0]['lowest_price_90d']), float(offer['price']))
+                            except Exception:
+                                pass
+
+                            price_history = existing_specs.get('PriceHistory', [])
+                            price_history.append({
+                                "price": offer['price'],
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "inStock": offer['inStock']
+                            })
+                            if len(price_history) > 180:
+                                price_history = price_history[-180:]
+
                             query1 = supabase.table('hardware_components').upsert({
                                 "id": comp_id,
                                 "name": offer['title'],
@@ -335,11 +358,12 @@ class TavilyHardwareAgent:
                                     "InStock": offer['inStock'],
                                     "IsRefurbished": offer.get('isRefurbished', False),
                                     "OriginalPrice": offer.get('originalPrice'),
-                                    "ScrapedAt": datetime.now(timezone.utc).isoformat()
+                                    "ScrapedAt": datetime.now(timezone.utc).isoformat(),
+                                    "PriceHistory": price_history
                                 }),
                                 "msrp": offer.get('originalPrice') or offer['price'],
                                 "current_price": offer['price'],
-                                "lowest_price_90d": offer['price'],
+                                "lowest_price_90d": offer_lowest_90d,
                                 "retailer": offer['retailer'],
                                 "product_url": offer['url'],
                                 "image_url": offer.get('imageUrl') or "https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=600&q=80",
@@ -348,17 +372,7 @@ class TavilyHardwareAgent:
                                 "updated_at": datetime.now(timezone.utc).isoformat()
                             })
                             await asyncio.to_thread(query1.execute)
-                            print(f"[DB Persist Success] Saved \"{offer['retailer']}\" offer: \"{offer['title']}\" (${offer['price']:.2f}) to hardware_components")
-
-                            # Log historical price snapshot
-                            try:
-                                await asyncio.to_thread(supabase.table('price_snapshots').insert({
-                                    "price": offer['price'],
-                                    "in_stock": offer['inStock'],
-                                    "scraped_at": datetime.now(timezone.utc).isoformat()
-                                }).execute)
-                            except Exception:
-                                pass
+                            print(f"[DB Persist Success] Saved \"{offer['retailer']}\" offer: \"{offer['title']}\" (${offer['price']:.2f}) with PriceHistory ({len(price_history)} snapshots)")
                         except Exception as e:
                             print(f"[Agent Incremental Persistence Error]: {e}")
                             
