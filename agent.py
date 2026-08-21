@@ -347,6 +347,16 @@ class TavilyHardwareAgent:
                             if len(price_history) > 180:
                                 price_history = price_history[-180:]
 
+                            # Calculate deal score for offer
+                            orig_p = offer.get('originalPrice') or offer['price']
+                            if orig_p and orig_p > offer['price']:
+                                discount_pct = (orig_p - offer['price']) / orig_p
+                                offer_deal_score = min(99, int(60 + discount_pct * 100))
+                            elif offer['price'] <= offer_lowest_90d:
+                                offer_deal_score = 90
+                            else:
+                                offer_deal_score = 60
+
                             query1 = supabase.table('hardware_components').upsert({
                                 "id": comp_id,
                                 "name": offer['title'],
@@ -427,7 +437,6 @@ class TavilyHardwareAgent:
                         "component_name": best.get('title') or clean_prompt,
                         "category": category,
                         "target_price": round(best['price'] * 0.9, 2),
-                        "current_price": best['price'],
                         "previous_price_24h": prior_price if prior_price and prior_price != best['price'] else existing_row.get('previous_price_24h', best['price']),
                         "all_time_low": min(prior_atl, best['price']),
                     }
@@ -441,7 +450,6 @@ class TavilyHardwareAgent:
                         "component_name": best.get('title') or clean_prompt,
                         "category": category,
                         "target_price": round(best['price'] * 0.9, 2),
-                        "current_price": best['price'],
                         "previous_price_24h": best['price'],
                         "previous_price_7d": best['price'],
                         "previous_price_30d": best['price'],
