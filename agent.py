@@ -767,8 +767,13 @@ class TavilyHardwareAgent:
                         return {"out_of_stock": True}
                     
                 elif retailer_name == 'Newegg':
-                    # Extract main price from active buy box
-                    price_elem = soup.select_one('.price-current') or soup.select_one('[class^="price-current"]')
+                    # Decompose sponsored banners & recommendation carousels so they don't hijack the buybox
+                    for sp in soup.select('[class*="sponsored"], .item-sponsored, .recommended-box, .swiper, .carousel, .featured-seller'):
+                        sp.decompose()
+
+                    # Extract main price from active product buybox pane specifically
+                    main_pane = soup.select_one('.product-pane, .product-buy-box, .product-main, #product-details') or soup
+                    price_elem = main_pane.select_one('.price-current') or main_pane.select_one('[class^="price-current"]')
                     if price_elem:
                         price_strong = price_elem.select_one('strong')
                         price_sup = price_elem.select_one('sup')
@@ -783,7 +788,7 @@ class TavilyHardwareAgent:
                                 try: price = float(m.group(1).replace(',', ''))
                                 except ValueError: pass
                             
-                    title_elem = soup.select_one('.product-title') or soup.select_one('h1.product-title')
+                    title_elem = main_pane.select_one('.product-title') or soup.select_one('h1.product-title') or soup.select_one('h1')
                     if title_elem: title = title_elem.text.strip()
                     
                     # Reject out of stock items explicitly
@@ -866,8 +871,15 @@ class TavilyHardwareAgent:
                         return {"out_of_stock": True}
                     
                 elif retailer_name == 'eBay':
+                    # Decompose warranty, protection plans, and service add-ons so they NEVER get extracted
+                    for plan in soup.select('.x-additional-services, [data-testid*="additional-services"], [class*="protection-plan"], [class*="warranty"], [data-testid*="warranty"], .insurance-plan'):
+                        plan.decompose()
+
                     # Extract main price from eBay buy box (ignore strikethrough list prices and financing)
-                    price_elem = soup.select_one('.x-price-primary') or soup.select_one('[data-testid="x-price-primary"]') or soup.select_one('.x-price-approx')
+                    price_elem = soup.select_one('.x-price-primary') or \
+                                 soup.select_one('[data-testid="x-price-primary"]') or \
+                                 soup.select_one('.x-bin-price .x-price-primary') or \
+                                 soup.select_one('.x-price-approx')
                     if price_elem:
                         spans = price_elem.select('.ux-textspans')
                         valid_spans = [s for s in spans if 'strikethrough' not in ''.join(s.get('class', [])).lower()]
@@ -876,6 +888,15 @@ class TavilyHardwareAgent:
                         if m:
                             try: price = float(m.group(1).replace(',', ''))
                             except ValueError: pass
+                    
+                    # Fallback to main item price container if .x-price-primary was inside another wrapper
+                    if not price:
+                        main_price_box = soup.select_one('.x-bin-price, .x-price-section, [data-testid="x-bin-action"]')
+                        if main_price_box:
+                            m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', main_price_box.text)
+                            if m:
+                                try: price = float(m.group(1).replace(',', ''))
+                                except ValueError: pass
                     
                     # Extract title
                     title_elem = soup.select_one('.x-item-title__mainTitle span.ux-textspans') or soup.select_one('.x-item-title__mainTitle')
@@ -1006,11 +1027,12 @@ class TavilyHardwareAgent:
         if not GROQ_API_KEY:
             return {}
 
-        # Strip distracting recommended carousel headers and sidebars
+        # Strip distracting recommended carousel headers, sidebars, and protection plan snippets
         clean_markdown = re.sub(r'##\s*People who viewed this item also viewed[\s\S]*?(?=##|\Z)', '', markdown_content, flags=re.I)
         clean_markdown = re.sub(r'##\s*Similar items[\s\S]*?(?=##|\Z)', '', clean_markdown, flags=re.I)
         clean_markdown = re.sub(r'##\s*Sponsored items[\s\S]*?(?=##|\Z)', '', clean_markdown, flags=re.I)
         clean_markdown = re.sub(r'##\s*Compare with similar items[\s\S]*?(?=##|\Z)', '', clean_markdown, flags=re.I)
+        clean_markdown = re.sub(r'(?:additional service available|protection plan|allstate|squaretrade|asurion|applecare|extended warranty)[\s\S]*?(?=\n\n|\Z)', '', clean_markdown, flags=re.I)
 
         system_prompt = (
             f"You are an expert product data extraction agent parsing a {retailer} product page. "
@@ -1169,6 +1191,21 @@ class TavilyHardwareAgent:
         }
 
         min_bound, max_bound = CATEGORY_PRICE_BOUNDS.get(category, (3.0, 10000.0))
+
+        # Model-aware floor checks to prevent protection plans/accessories from slipping past category floors
+        q_lower = (query or '').lower()
+        if category == 'GPU' or 'rtx' in q_lower or 'radeon' in q_lower or 'geforce' in q_lower or 'graphics card' in q_lower:
+            if any(m in q_lower for m in ['5090', '4090']):
+                min_bound = 1200.0
+            elif any(m in q_lower for m in ['5080', '4080', '7900 xtx', '7900 xt']):
+                min_bound = 700.0
+            elif any(m in q_lower for m in ['5070', '4070', '7800 xt', '7700 xt']):
+                min_bound = 350.0
+            elif any(m in q_lower for m in ['5060', '4060', '7600', '3060', '6700']):
+                min_bound = 180.0
+            else:
+                min_bound = 75.0
+
         if price < min_bound or price > max_bound:
             return False
 
