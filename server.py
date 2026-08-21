@@ -169,11 +169,36 @@ async def api_status():
         "schedulerRunning": scheduler_state["schedulerRunning"],
         "lastSchedulerRun": scheduler_state["lastSchedulerRun"],
         "schedulerQueueIndex": scheduler_state["schedulerQueueIndex"],
-        "nextPart": queue[scheduler_state["schedulerQueueIndex"] % len(queue)],
+        "nextPart": queue[scheduler_state["schedulerQueueIndex"] % len(queue)] if queue else None,
         "partsQueue": queue,
         "totalParts": len(queue),
         "intervalMinutes": SCHEDULER_INTERVAL_SECONDS / 60,
         "connectedSseClients": len(sse_clients),
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+@app.get("/api/cron/trigger-daily-update")
+@app.post("/api/cron/trigger-daily-update")
+async def trigger_daily_update(background_tasks: BackgroundTasks, limit: int = 10):
+    """Refreshes live prices across tracked hardware components and records timestamped PriceHistory snapshots."""
+    queue = await get_dynamic_parts_queue()
+    items_to_update = queue[:limit] if queue else DEFAULT_PARTS_CATALOG[:limit]
+    
+    async def run_batch():
+        print(f"\n[Batch Update] 🚀 Starting daily refresh for {len(items_to_update)} components...")
+        for item_name in items_to_update:
+            try:
+                print(f"[Batch Update] Scraping: \"{item_name}\" across Amazon, Newegg, Micro Center, B&H, eBay...")
+                await agent.run(item_name, agent_sse_emitter)
+            except Exception as err:
+                print(f"[Batch Update Error] \"{item_name}\": {err}")
+        print(f"[Batch Update] ✅ Completed refresh for {len(items_to_update)} components.")
+
+    background_tasks.add_task(run_batch)
+    return {
+        "status": "started",
+        "message": f"Daily price update initiated for {len(items_to_update)} component(s) in background.",
+        "components": items_to_update,
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
