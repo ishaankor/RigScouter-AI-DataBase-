@@ -1191,23 +1191,10 @@ class TavilyHardwareAgent:
         }
 
         min_bound, max_bound = CATEGORY_PRICE_BOUNDS.get(category, (3.0, 10000.0))
-
-        # Model-aware floor checks to prevent protection plans/accessories from slipping past category floors
-        q_lower = (query or '').lower()
-        if category == 'GPU' or 'rtx' in q_lower or 'radeon' in q_lower or 'geforce' in q_lower or 'graphics card' in q_lower:
-            if any(m in q_lower for m in ['5090', '4090']):
-                min_bound = 1200.0
-            elif any(m in q_lower for m in ['5080', '4080', '7900 xtx', '7900 xt']):
-                min_bound = 700.0
-            elif any(m in q_lower for m in ['5070', '4070', '7800 xt', '7700 xt']):
-                min_bound = 350.0
-            elif any(m in q_lower for m in ['5060', '4060', '7600', '3060', '6700']):
-                min_bound = 180.0
-            else:
-                min_bound = 75.0
-
         if price < min_bound or price > max_bound:
             return False
+
+        return True
 
         return True
 
