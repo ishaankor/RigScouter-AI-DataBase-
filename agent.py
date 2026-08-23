@@ -1060,7 +1060,7 @@ class TavilyHardwareAgent:
             return None
             
         print(f"[Firecrawl] Extracting {url} ...")
-        scrape_timeout = 22.0
+        scrape_timeout = 10.0
         try:
             try:
                 res = await asyncio.wait_for(
@@ -1068,7 +1068,7 @@ class TavilyHardwareAgent:
                     timeout=scrape_timeout
                 )
             except asyncio.TimeoutError:
-                print(f"⚠️ [Firecrawl Timeout] {retailer_name} took >{scrape_timeout}s — using fallback")
+                print(f"⚠️ [Firecrawl Timeout] {retailer_name} took >{scrape_timeout}s — skipping URL")
                 return None
             except Exception as e:
                 error_str = str(e).lower()
