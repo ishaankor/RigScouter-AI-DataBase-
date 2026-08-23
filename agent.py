@@ -831,6 +831,63 @@ class TavilyHardwareAgent:
             }
         return None
 
+    def is_page_out_of_stock(self, soup: BeautifulSoup, retailer_name: str) -> bool:
+        """
+        Verifies if the page or buybox explicitly indicates out of stock / discontinued / no longer available.
+        """
+        lower_page = (soup.text or '')[:4000].lower()
+
+        # 1. Retailer-specific critical indicators
+        if retailer_name == 'B&H':
+            avail = soup.select_one('[data-selenium="stockStatus"], [data-selenium="availability"], .shippingAvail_yL7x0I4P, [class*="stockStatus"], [class*="availability"]')
+            if avail:
+                text = avail.text.lower()
+                if any(s in text for s in ['no longer available', 'discontinued', 'out of stock', 'sold out', 'backorder', 'not available']):
+                    return True
+            if 'no longer available' in lower_page or 'discontinued' in lower_page:
+                return True
+
+        elif retailer_name == 'Best Buy':
+            btn = soup.select_one('.add-to-cart-button, button[data-button-state]')
+            if btn:
+                btn_state = btn.get('data-button-state', '').lower()
+                btn_text = btn.text.lower()
+                if 'sold_out' in btn_state or 'sold out' in btn_text or 'unavailable' in btn_text:
+                    return True
+            fulfillment = soup.select_one('.fulfillment-add-to-cart-button, .fulfillment-fulfillment-summary')
+            if fulfillment and ('sold out' in fulfillment.text.lower() or 'currently unavailable' in fulfillment.text.lower()):
+                return True
+            if 'sold out' in lower_page[:1500] or 'currently unavailable' in lower_page[:1500]:
+                return True
+
+        elif retailer_name == 'Newegg':
+            inv = soup.select_one('.product-inventory, .product-buy-box')
+            if inv and any(s in inv.text.lower() for s in ['out of stock', 'sold out', 'discontinued', 'auto notify']):
+                return True
+
+        elif retailer_name == 'Micro Center':
+            inv = soup.select_one('.inventoryCnt, .out-of-stock, .unavailable, .availabilityTrunc')
+            if inv and any(s in inv.text.lower() for s in ['sold out', 'no longer carried', 'not available', '0 in stock', 'out of stock']):
+                return True
+
+        elif retailer_name == 'Amazon':
+            avail = soup.select_one('#availability')
+            if avail and any(s in avail.text.lower() for s in ['currently unavailable', 'out of stock', 'temporarily out of stock']):
+                return True
+
+        elif retailer_name == 'eBay':
+            ended = soup.select_one('.x-ended-item-msg, .msg-error, .ux-notice')
+            if ended and any(s in ended.text.lower() for s in ['ended', 'out of stock', 'this listing has ended', 'this listing was ended']):
+                return True
+
+        # 2. Universal stock badge search
+        raw_badges = soup.select('.stock-status, .out-of-stock, .badge-out-of-stock, [data-stock="out_of_stock"]')
+        for b in raw_badges:
+            if any(s in b.text.lower() for s in ['out of stock', 'sold out', 'no longer available', 'discontinued']):
+                return True
+
+        return False
+
     async def parse_page_content(self, html_content: str, markdown_content: str, url: str, retailer_name: str, category: str, model_query: str = None) -> dict | None:
         if not html_content:
             return None
@@ -868,8 +925,16 @@ class TavilyHardwareAgent:
                     "source": "groq-ai"
                 }
 
+        # Multi-layer stock validation: check if page indicates out of stock / discontinued
+        page_oos = self.is_page_out_of_stock(soup, retailer_name)
+        if page_oos:
+            if offer:
+                offer['inStock'] = False
+            else:
+                return {"out_of_stock": True}
+
         if not offer or offer.get('price', 0) <= 0:
-            return None
+            return {"out_of_stock": True} if page_oos else None
 
         title = offer.get('title') or model_query or ''
         full_title_for_check = f"{title} {url}"
@@ -880,13 +945,14 @@ class TavilyHardwareAgent:
                 print(f"⚠️ [Semantic Mismatch] {retailer_name}: '{title}' does not match query '{model_query}'")
                 return None
 
-        print(f"✅ [{offer.get('source', 'scraped').upper()} HIT] {retailer_name}: Found price ${offer['price']:.2f} -> {title[:60]}")
+        is_stock_final = offer.get('inStock', True) and not page_oos
+        print(f"✅ [{offer.get('source', 'scraped').upper()} HIT] {retailer_name}: Found price ${offer['price']:.2f} (InStock: {is_stock_final}) -> {title[:60]}")
         return {
             "retailer": retailer_name,
             "title": title,
             "price": offer['price'],
             "originalPrice": offer.get('originalPrice'),
-            "inStock": offer.get('inStock', True),
+            "inStock": is_stock_final,
             "isRefurbished": offer.get('isRefurbished', False),
             "url": url,
             "imageUrl": offer.get('imageUrl'),
@@ -939,8 +1005,8 @@ class TavilyHardwareAgent:
                 if not valid_hits:
                     return None
                     
-                # Try direct extraction on top 3 candidate URLs
-                for candidate in valid_hits[:3]:
+                # Try direct extraction on candidate URLs
+                for candidate in valid_hits[:5]:
                     # 1. Try Direct HTTP fetch first (fast, browser headers, 0 credit cost)
                     offer = await self.direct_http_extract(candidate['url'], retailer_name, category, model_query)
                     
@@ -949,14 +1015,14 @@ class TavilyHardwareAgent:
                         offer = await self.firecrawl_extract(candidate['url'], retailer_name, category, model_query)
 
                     if offer:
-                        if offer.get('out_of_stock'):
-                            print(f"⚠️ [Confirmed Out of Stock] {retailer_name}: Item is out of stock.")
+                        if offer.get('out_of_stock') or not offer.get('inStock', True):
+                            print(f"⚠️ [Confirmed Out of Stock] {retailer_name}: '{offer.get('title', candidate['title'])}' is out of stock / discontinued. Skipping to next candidate...")
                             continue
                         if offer.get('price', 0) > 0:
                             print(f"✅ [CHEAPEST AVAILABLE {retailer_name.upper()} OFFER] \"${offer['price']}\" -> {offer['title'][:60]}")
                             return offer
 
-                # Zero snippet guessing: If direct page scraping could not confirm an offer, return None
+                # Zero snippet guessing: If direct page scraping could not confirm an in-stock offer, return None
                 return None
             except Exception as e:
                 print(f"[Tavily Search Error] {retailer_name}: {e}")

@@ -121,6 +121,28 @@ def test_scraper():
     res_oos = asyncio.run(a.parse_page_content(oos_html, "", "https://bestbuy.com/p/999", "Best Buy", "GPU", "RTX 5080"))
     assert_eq(res_oos['inStock'], False, "Out of Stock detected accurately")
 
+    # 5b. B&H Discontinued / No Longer Available Page Test (from real user screenshot)
+    bh_discontinued_html = """
+    <html><head>
+    <script type="application/ld+json">
+    {
+        "@type": "Product",
+        "name": "EVGA GeForce GTX 1070 GAMING ACX 3.0 Black Edition Graphics Card",
+        "offers": {
+            "price": "599.00",
+            "priceCurrency": "USD",
+            "availability": "http://schema.org/InStock"
+        }
+    }
+    </script>
+    </head><body>
+    <h1>EVGA GeForce GTX 1070 GAMING ACX 3.0 Black Edition Graphics Card</h1>
+    <div data-selenium="stockStatus">No Longer Available</div>
+    </body></html>
+    """
+    res_bh_disc = asyncio.run(a.parse_page_content(bh_discontinued_html, "", "https://bhphotovideo.com/c/product/123", "B&H", "GPU", "GTX 1070"))
+    assert_eq(res_bh_disc['inStock'], False, "B&H No Longer Available item detected as out of stock")
+
     # 6. Semantic Entity Matcher Tests
     assert_eq(a.is_semantic_product_match("GIGABYTE AORUS RTX 5080 16GB", "RTX 5080", "GPU"), True, "Valid GPU match")
     assert_eq(a.is_semantic_product_match("12VHPWR Power Cable for RTX 5080 5090", "RTX 5080", "GPU"), False, "Accessory cable rejected")
