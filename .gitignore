@@ -3,3 +3,6 @@
 /__pycache__/**
 /scratch/**
 .gitignore
+keep_alive_cron.sql
+keep_alive.py
+server.py
