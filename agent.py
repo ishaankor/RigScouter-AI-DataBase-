@@ -522,20 +522,31 @@ class TavilyHardwareAgent:
         if not text:
             return float("inf")
 
-        # Split into distinct sentences / clauses without breaking decimal numbers
-        clauses = re.split(r'(?:\.(?!\d)|[\n;\|•·–—])', text)
+        # 1. Scrub explicit discount amounts, financing, and warranty noise from snippet text
+        clean_text = text
+        NOISE_PHRASES = [
+            r"\b(?:save|saving|savings|discount|off|was|discounted from)\s*(?:up to\s*)?\$[0-9,]+(?:\.[0-9]{2})?",
+            r"\$[0-9,]+(?:\.[0-9]{2})?\s*(?:off|savings|discount|cashback|rebate|less)\b",
+            r"\$[0-9,]+(?:\.[0-9]{2})?\s*(?:\/|\s*per|\s*a)?\s*(?:mo|month|yr|year|pm|bi-weekly)\b",
+            r"\b(?:plan|warranty|protection|geek squad|applecare|care pack|allstate)\s*.*?\$[0-9,]+(?:\.[0-9]{2})?",
+            r"\b(?:trade-?in|trade in|recycle)\s*.*?\$[0-9,]+(?:\.[0-9]{2})?",
+        ]
+        for np in NOISE_PHRASES:
+            clean_text = re.sub(np, " ", clean_text, flags=re.I)
+
+        # Split into distinct sentences / clauses without breaking decimal numbers or numbers with commas
+        clauses = re.split(r"(?:\.(?!\d)|,(?!\d)|[!;:\n|•·–—]|\s+\bor\b\s+|\s+\band\b\s+)", clean_text)
         valid_prices = []
 
         NOISE_KEYWORDS = [
             'plan', 'warranty', 'protection', 'geek squad', 'applecare', 'care pack',
-            '/mo', '/month', 'per month', 'monthly', 'a month', 'financing', 'payments',
-            'save', 'saving', 'discount', 'was', 'list price', 'retail price',
+            '/mo', '/month', 'per month', 'monthly', 'financing',
             'shipping', 'delivery', 'handling', 'postage', 'fee', 'trade-in', 'trade in'
         ]
 
         for clause in clauses:
             lower_clause = clause.lower().strip()
-            # If the clause mentions warranty/financing/shipping/discounts, skip all prices inside it
+            # If the clause still mentions warranty/financing/shipping/discounts, skip all prices inside it
             if any(re.search(r'\b' + re.escape(w) + r'\b', lower_clause) for w in NOISE_KEYWORDS):
                 continue
 
@@ -551,7 +562,7 @@ class TavilyHardwareAgent:
         if not valid_prices:
             return float("inf")
 
-        # Return the primary product price from the clean, non-noise clause
+        # Return the primary product price that passed all strict model-specific bounds
         return valid_prices[0]
 
     async def scrape_retailer_accurate_offer(self, model_query: str, retailer_name: str, domain_pattern: str, category: str) -> dict:
@@ -559,7 +570,7 @@ class TavilyHardwareAgent:
         
         for attempt in range(len(TAVILY_API_KEYS)):
             try:
-                # 1. Search with Tavily to get URLs
+                # 1. Search with Tavily to get candidate URLs
                 async with httpx.AsyncClient() as client:
                     res = await client.post('https://api.tavily.com/search', json={
                         "api_key": self.get_tavily_key(),
@@ -576,7 +587,7 @@ class TavilyHardwareAgent:
                 data = res.json()
                 results = data.get('results', [])
                 
-                # Batch filter all titles to save Groq API calls
+                # Batch filter all titles to eliminate accessories, prebuilts, combos & spam
                 titles_to_check = [r.get('title', '') for r in results]
                 match_results = await self.filter_matching_titles(titles_to_check, model_query, category)
 
@@ -606,24 +617,30 @@ class TavilyHardwareAgent:
                 # Sort by estimated price (putting float('inf') at the end)
                 valid_hits.sort(key=lambda x: x['est_price'])
                 
-                # Try Firecrawl on top 2 candidates
+                # Try direct extraction (Firecrawl first, then direct HTTP fetch with browser headers)
                 confirmed_out_of_stock = False
-                for candidate in valid_hits[:2]:
+                for candidate in valid_hits[:3]:
+                    # 1. Try Firecrawl extraction
                     offer = await self.firecrawl_extract(candidate['url'], retailer_name, category, model_query)
+                    
+                    # 2. If Firecrawl was blocked / timed out / rate limited, try direct HTTP fetch
+                    if not offer or (offer.get('price', 0) == 0 and not offer.get('out_of_stock')):
+                        offer = await self.direct_http_extract(candidate['url'], retailer_name, category, model_query)
+
                     if offer:
                         if offer.get('out_of_stock'):
                             confirmed_out_of_stock = True
                             continue
-                        if offer.get('price', 0) > 0:
+                        if offer.get('price', 0) > 0 and self.is_price_sanity_valid(offer['price'], model_query, category):
                             print(f"✅ [CHEAPEST AVAILABLE {retailer_name.upper()} OFFER] \"${offer['price']}\" -> {offer['title'][:60]}")
                             return offer
 
-                # If the product is confirmed out of stock / discontinued on this store, do NOT invent a snippet fallback
+                # If the product is confirmed out of stock on this store, do NOT invent a snippet fallback
                 if confirmed_out_of_stock:
-                    print(f"⚠️ [Confirmed Out of Stock] {retailer_name}: Scraped page confirmed item is out of stock. Skipping snippet fallback.")
+                    print(f"⚠️ [Confirmed Out of Stock] {retailer_name}: Item is out of stock. Skipping snippet fallback.")
                     return None
 
-                # Instant Fallback: use verified, noise-filtered Tavily snippet price only if Firecrawl timed out or was blocked
+                # Fallback: use verified, noise-filtered Tavily snippet price ONLY if strictly sanity valid
                 for candidate in valid_hits:
                     if candidate['est_price'] < float('inf') and self.is_price_sanity_valid(candidate['est_price'], model_query, category):
                         print(f"✅ [TAVILY SNIPPET FALLBACK] {retailer_name}: Found price ${candidate['est_price']:.2f} -> {candidate['title'][:50]}")
@@ -643,14 +660,37 @@ class TavilyHardwareAgent:
                 self.rotate_tavily_key()
         return None
 
+    async def direct_http_extract(self, url: str, retailer_name: str, category: str, model_query: str = None) -> dict:
+        """Direct HTTP scraper with realistic browser headers when Firecrawl is blocked/unavailable."""
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.google.com/",
+            "Sec-Ch-Ua": '"Google Chrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"macOS"',
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "cross-site",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1"
+        }
+        try:
+            async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=10.0) as client:
+                res = await client.get(url)
+                if res.status_code == 200:
+                    return await self.parse_html_and_extract_offer(res.text, "", url, retailer_name, category, model_query)
+        except Exception:
+            pass
+        return None
+
     async def firecrawl_extract(self, url: str, retailer_name: str, category: str, model_query: str = None) -> dict:
         app = self.get_firecrawl_app()
         if not app:
-            print("[Firecrawl] API key missing")
             return None
             
         print(f"[Firecrawl] Extracting {url} ...")
-        # Generous 22s timeout: allows JavaScript heavy pages (Best Buy, Micro Center, eBay) to fully render
         scrape_timeout = 22.0
         try:
             try:
@@ -687,347 +727,314 @@ class TavilyHardwareAgent:
                     if not markdown_content:
                         markdown_content = res.metadata.get('markdown', '')
 
-            # Fallback if html wasn't specifically found
             if not html_content:
                 html_content = markdown_content
                 
-            try:
-                with open(f"scratch/dump_{retailer_name.replace(' ', '_')}.html", "w") as f:
-                    f.write(html_content)
-                with open(f"scratch/dump_{retailer_name.replace(' ', '_')}.md", "w") as f:
-                    f.write(markdown_content)
-            except: pass
-                
-            if not html_content:
-                return None
-            
-            soup = BeautifulSoup(html_content, 'lxml')
-            price = None
-            title = None
-            image_url = None
-            in_stock = True
-            is_refurbished = False
-            
-            try:
-                og_image = soup.find('meta', property='og:image')
-                if og_image and og_image.get('content'):
-                    image_url = og_image.get('content')
-            except:
-                pass
-            
-            # Deterministic Extraction Logic
-            try:
-                if retailer_name == 'Amazon':
-                    # Check for bot/captcha
-                    if 'robot check' in soup.text.lower() or 'enter the characters you see below' in soup.text.lower():
-                        print(f"⚠️ [Blocked] Amazon: Encountered CAPTCHA/Bot Check page.")
-                        return None
-                        
-                    # Check for out of stock first
-                    availability_elem = soup.select_one('#availability')
-                    if availability_elem and ('currently unavailable' in availability_elem.text.lower() or 'out of stock' in availability_elem.text.lower()):
-                        print(f"⚠️ [Out of Stock] Amazon: Item is marked unavailable in BS4.")
-                        return None
-                        
-                    # Main price MUST come from the actual new-item buybox first.
-                    price_container = soup.select_one('#corePriceDisplay_desktop_feature_div .a-price') or \
-                                      soup.select_one('#corePrice_feature_div .a-price') or \
-                                      soup.select_one('#corePrice_desktop .a-price') or \
-                                      soup.select_one('#apex_desktop .a-price')
+            return await self.parse_html_and_extract_offer(html_content, markdown_content, url, retailer_name, category, model_query)
+        except Exception as e:
+            print(f"⚠️ [Firecrawl Extraction Error] {url}: {e}")
+            return None
 
-                    if not price_container:
-                        used_price_container = soup.select_one('#usedBuySection .a-price') or \
-                                               soup.select_one('#olp-upd-new-used .a-color-price')
-                        if used_price_container:
-                            price_container = used_price_container
-                            is_refurbished = True
-
-                    if price_container:
-                        offscreen = price_container.select_one('.a-offscreen')
-                        if offscreen:
-                            m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', offscreen.text)
-                            if m:
-                                try: price = float(m.group(1).replace(',', ''))
-                                except ValueError: pass
-                        if not price:
-                            price_whole = price_container.select_one('.a-price-whole')
-                            price_fraction = price_container.select_one('.a-price-fraction')
-                            if price_whole:
-                                price_str = price_whole.text.replace(',', '').replace('.', '').strip()
-                                frac = price_fraction.text.strip() if price_fraction else "00"
-                                try: price = float(f"{price_str}.{frac}")
-                                except ValueError: pass
-                            
-                    title_elem = soup.select_one('#productTitle')
-                    if title_elem: title = title_elem.text.strip()
+    async def parse_html_and_extract_offer(self, html_content: str, markdown_content: str, url: str, retailer_name: str, category: str, model_query: str = None) -> dict:
+        if not html_content:
+            return None
+        
+        soup = BeautifulSoup(html_content, 'lxml')
+        price = None
+        title = None
+        image_url = None
+        in_stock = True
+        is_refurbished = False
+        
+        try:
+            og_image = soup.find('meta', property='og:image')
+            if og_image and og_image.get('content'):
+                image_url = og_image.get('content')
+        except:
+            pass
+        
+        # Deterministic Extraction Logic
+        try:
+            if retailer_name == 'Amazon':
+                # Check for bot/captcha
+                if 'robot check' in soup.text.lower() or 'enter the characters you see below' in soup.text.lower():
+                    print(f"⚠️ [Blocked] Amazon: Encountered CAPTCHA/Bot Check page.")
+                    return None
                     
-                    # Reject out of stock items explicitly
-                    if availability_elem and ('currently unavailable' in availability_elem.text.lower() or 'out of stock' in availability_elem.text.lower()):
-                        print(f"⚠️ [Out of Stock] Amazon: Currently unavailable.")
-                        return {"out_of_stock": True}
+                # Check for out of stock first
+                availability_elem = soup.select_one('#availability')
+                if availability_elem and ('currently unavailable' in availability_elem.text.lower() or 'out of stock' in availability_elem.text.lower()):
+                    print(f"⚠️ [Out of Stock] Amazon: Item is marked unavailable in BS4.")
+                    return {"out_of_stock": True}
                     
-                elif retailer_name == 'Newegg':
-                    # Decompose sponsored banners & recommendation carousels so they don't hijack the buybox
-                    for sp in soup.select('[class*="sponsored"], .item-sponsored, .recommended-box, .swiper, .carousel, .featured-seller'):
-                        sp.decompose()
+                # Main price MUST come from the actual new-item buybox first.
+                price_container = soup.select_one('#corePriceDisplay_desktop_feature_div .a-price') or \
+                                  soup.select_one('#corePrice_feature_div .a-price') or \
+                                  soup.select_one('#corePrice_desktop .a-price') or \
+                                  soup.select_one('#apex_desktop .a-price')
 
-                    # Extract main price from active product buybox pane specifically
-                    main_pane = soup.select_one('.product-pane, .product-buy-box, .product-main, #product-details') or soup
-                    price_elem = main_pane.select_one('.price-current') or main_pane.select_one('[class^="price-current"]')
-                    if price_elem:
-                        price_strong = price_elem.select_one('strong')
-                        price_sup = price_elem.select_one('sup')
-                        if price_strong:
-                            price_str = price_strong.text.replace(',', '').strip()
-                            frac = price_sup.text.strip() if price_sup else ".00"
-                            try: price = float(f"{price_str}{frac}")
+                if not price_container:
+                    used_price_container = soup.select_one('#usedBuySection .a-price') or \
+                                           soup.select_one('#olp-upd-new-used .a-color-price')
+                    if used_price_container:
+                        price_container = used_price_container
+                        is_refurbished = True
+
+                if price_container:
+                    offscreen = price_container.select_one('.a-offscreen')
+                    if offscreen:
+                        m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', offscreen.text)
+                        if m:
+                            try: price = float(m.group(1).replace(',', ''))
                             except ValueError: pass
-                        else:
-                            m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', price_elem.text)
-                            if m:
-                                try: price = float(m.group(1).replace(',', ''))
-                                except ValueError: pass
-                            
-                    title_elem = main_pane.select_one('.product-title') or soup.select_one('h1.product-title') or soup.select_one('h1')
-                    if title_elem: title = title_elem.text.strip()
-                    
-                    # Reject out of stock items explicitly
-                    inventory_elem = soup.select_one('.product-inventory')
-                    if inventory_elem and 'out of stock' in inventory_elem.text.lower():
-                        print(f"⚠️ [Out of Stock] Newegg: Out of stock.")
-                        return {"out_of_stock": True}
-                    
-                elif retailer_name == 'Best Buy':
-                    # 1. Try JSON-LD first for highly accurate pricing
-                    for script in soup.find_all('script', type='application/ld+json'):
-                        if not script.string: continue
-                        try:
-                            data = __import__('json').loads(script.string)
-                            items = data if isinstance(data, list) else [data]
-                            for item in items:
-                                if item.get('@type') == 'Product' and 'offers' in item:
-                                    item_name = item.get('name', '').lower()
-                                    if model_query and item_name:
-                                        clean_q_words = [w for w in re.sub(r'[^a-z0-9\s]', '', model_query.lower()).split() if len(w) > 2]
-                                        digit_tokens = [w for w in clean_q_words if re.search(r'\d', w)]
-                                        clean_item_name = re.sub(r'[^a-z0-9]', '', item_name)
-                                        if digit_tokens and not all(d in clean_item_name for d in digit_tokens):
-                                            continue
-                                            
-                                    offers = item['offers']
-                                    if isinstance(offers, dict) and 'price' in offers:
-                                        price = float(offers['price'])
-                                        break
-                                    elif isinstance(offers, list) and len(offers) > 0 and 'price' in offers[0]:
-                                        price = float(offers[0]['price'])
-                                        break
-                            if price: break
-                        except: pass
-                    
-                    # 2. Fallback to expanded CSS selectors
                     if not price:
-                        price_candidates = soup.select(
-                            '.priceView-customer-price span[aria-hidden="true"], '
-                            '.priceView-hero-price span[aria-hidden="true"], '
-                            'div[data-testid="customer-price"] span[aria-hidden="true"], '
-                            'div[data-testid="price-block-customer-price"] span[aria-hidden="true"], '
-                            '.pricing-price span'
-                        )
-                        for p in price_candidates:
-                            m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', p.text)
-                            if m:
-                                try:
-                                    price = float(m.group(1).replace(',', ''))
-                                    break
-                                except ValueError: continue
-                            
-                    title_elem = soup.select_one('.sku-title h1, h1[class*="product-title"], h1.heading-5, h1[class*="text-5"]')
-                    if title_elem: title = title_elem.text.strip()
-                    
-                    # Reject out of stock items explicitly
-                    add_to_cart_btn = soup.select_one('.add-to-cart-button, button[data-button-state]')
-                    if add_to_cart_btn and ('sold_out' in add_to_cart_btn.get('data-button-state', '').lower() or 'sold out' in add_to_cart_btn.text.lower()):
-                        print(f"⚠️ [Out of Stock] Best Buy: Sold out.")
-                        return {"out_of_stock": True}
-                    
-                elif retailer_name == 'B&H':
-                    price_elem = soup.select_one('[data-selenium="pricingPrice"]') or \
-                                 soup.select_one('.price__9gLfjPSjp') or \
-                                 soup.select_one('[data-selenium="pricingContainer"] .price__9gLfjPSjp')
-                    if price_elem:
+                        price_whole = price_container.select_one('.a-price-whole')
+                        price_fraction = price_container.select_one('.a-price-fraction')
+                        if price_whole:
+                            price_str = price_whole.text.replace(',', '').replace('.', '').strip()
+                            frac = price_fraction.text.strip() if price_fraction else "00"
+                            try: price = float(f"{price_str}.{frac}")
+                            except ValueError: pass
+                        
+                title_elem = soup.select_one('#productTitle')
+                if title_elem: title = title_elem.text.strip()
+                
+            elif retailer_name == 'Newegg':
+                for sp in soup.select('[class*="sponsored"], .item-sponsored, .recommended-box, .swiper, .carousel, .featured-seller'):
+                    sp.decompose()
+
+                main_pane = soup.select_one('.product-pane, .product-buy-box, .product-main, #product-details') or soup
+                price_elem = main_pane.select_one('.price-current') or main_pane.select_one('[class^="price-current"]')
+                if price_elem:
+                    price_strong = price_elem.select_one('strong')
+                    price_sup = price_elem.select_one('sup')
+                    if price_strong:
+                        price_str = price_strong.text.replace(',', '').strip()
+                        frac = price_sup.text.strip() if price_sup else ".00"
+                        try: price = float(f"{price_str}{frac}")
+                        except ValueError: pass
+                    else:
                         m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', price_elem.text)
                         if m:
                             try: price = float(m.group(1).replace(',', ''))
                             except ValueError: pass
-                    title_elem = soup.select_one('[data-selenium="productTitle"]') or soup.select_one('h1[data-selenium="productTitle"]')
-                    if title_elem: title = title_elem.text.strip()
-                    
-                    # Reject out of stock / no longer available explicitly
-                    availability_elem = soup.select_one('.shippingAvail_yL7x0I4P, [data-selenium="stockStatus"], [data-selenium="availability"]')
-                    avail_text = availability_elem.text.lower() if availability_elem else ''
-                    raw_text_snippet = (soup.text or '')[:2000].lower()
-                    if 'no longer available' in avail_text or 'discontinued' in avail_text or 'no longer available' in raw_text_snippet or 'discontinued' in raw_text_snippet:
-                        print(f"⚠️ [Out of Stock] B&H: No longer available.")
-                        return {"out_of_stock": True}
-                    
-                elif retailer_name == 'eBay':
-                    # Decompose warranty, protection plans, and service add-ons so they NEVER get extracted
-                    for plan in soup.select('.x-additional-services, [data-testid*="additional-services"], [class*="protection-plan"], [class*="warranty"], [data-testid*="warranty"], .insurance-plan'):
-                        plan.decompose()
+                        
+                title_elem = main_pane.select_one('.product-title') or soup.select_one('h1.product-title') or soup.select_one('h1')
+                if title_elem: title = title_elem.text.strip()
+                
+                inventory_elem = soup.select_one('.product-inventory')
+                if inventory_elem and 'out of stock' in inventory_elem.text.lower():
+                    print(f"⚠️ [Out of Stock] Newegg: Out of stock.")
+                    return {"out_of_stock": True}
+                
+            elif retailer_name == 'Best Buy':
+                # 1. Try JSON-LD first for highly accurate pricing
+                for script in soup.find_all('script', type='application/ld+json'):
+                    if not script.string: continue
+                    try:
+                        data = __import__('json').loads(script.string)
+                        items = data if isinstance(data, list) else [data]
+                        for item in items:
+                            if item.get('@type') == 'Product' and 'offers' in item:
+                                item_name = item.get('name', '').lower()
+                                if model_query and item_name:
+                                    clean_q_words = [w for w in re.sub(r'[^a-z0-9\s]', '', model_query.lower()).split() if len(w) > 2]
+                                    digit_tokens = [w for w in clean_q_words if re.search(r'\d', w)]
+                                    clean_item_name = re.sub(r'[^a-z0-9]', '', item_name)
+                                    if digit_tokens and not all(d in clean_item_name for d in digit_tokens):
+                                        continue
+                                        
+                                offers = item['offers']
+                                if isinstance(offers, dict) and 'price' in offers:
+                                    price = float(offers['price'])
+                                    break
+                                elif isinstance(offers, list) and len(offers) > 0 and 'price' in offers[0]:
+                                    price = float(offers[0]['price'])
+                                    break
+                        if price: break
+                    except: pass
+                
+                # 2. Fallback to expanded CSS selectors
+                if not price:
+                    price_candidates = soup.select(
+                        '.priceView-customer-price span[aria-hidden="true"], '
+                        '.priceView-hero-price span[aria-hidden="true"], '
+                        'div[data-testid="customer-price"] span[aria-hidden="true"], '
+                        'div[data-testid="price-block-customer-price"] span[aria-hidden="true"], '
+                        '.pricing-price span'
+                    )
+                    for p in price_candidates:
+                        m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', p.text)
+                        if m:
+                            try:
+                                price = float(m.group(1).replace(',', ''))
+                                break
+                            except ValueError: continue
+                        
+                title_elem = soup.select_one('.sku-title h1, h1[class*="product-title"], h1.heading-5, h1[class*="text-5"]')
+                if title_elem: title = title_elem.text.strip()
+                
+                add_to_cart_btn = soup.select_one('.add-to-cart-button, button[data-button-state]')
+                if add_to_cart_btn and ('sold_out' in add_to_cart_btn.get('data-button-state', '').lower() or 'sold out' in add_to_cart_btn.text.lower()):
+                    print(f"⚠️ [Out of Stock] Best Buy: Sold out.")
+                    return {"out_of_stock": True}
+                
+            elif retailer_name == 'B&H':
+                price_elem = soup.select_one('[data-selenium="pricingPrice"]') or \
+                             soup.select_one('.price__9gLfjPSjp') or \
+                             soup.select_one('[data-selenium="pricingContainer"] .price__9gLfjPSjp')
+                if price_elem:
+                    m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', price_elem.text)
+                    if m:
+                        try: price = float(m.group(1).replace(',', ''))
+                        except ValueError: pass
+                title_elem = soup.select_one('[data-selenium="productTitle"]') or soup.select_one('h1[data-selenium="productTitle"]')
+                if title_elem: title = title_elem.text.strip()
+                
+                availability_elem = soup.select_one('.shippingAvail_yL7x0I4P, [data-selenium="stockStatus"], [data-selenium="availability"]')
+                avail_text = availability_elem.text.lower() if availability_elem else ''
+                raw_text_snippet = (soup.text or '')[:2000].lower()
+                if 'no longer available' in avail_text or 'discontinued' in avail_text or 'no longer available' in raw_text_snippet or 'discontinued' in raw_text_snippet:
+                    print(f"⚠️ [Out of Stock] B&H: No longer available.")
+                    return {"out_of_stock": True}
+                
+            elif retailer_name == 'eBay':
+                for plan in soup.select('.x-additional-services, [data-testid*="additional-services"], [class*="protection-plan"], [class*="warranty"], [data-testid*="warranty"], .insurance-plan'):
+                    plan.decompose()
 
-                    # Extract main price from eBay buy box (ignore strikethrough list prices and financing)
-                    price_elem = soup.select_one('.x-price-primary') or \
-                                 soup.select_one('[data-testid="x-price-primary"]') or \
-                                 soup.select_one('.x-bin-price .x-price-primary') or \
-                                 soup.select_one('.x-price-approx')
-                    if price_elem:
-                        spans = price_elem.select('.ux-textspans')
-                        valid_spans = [s for s in spans if 'strikethrough' not in ''.join(s.get('class', [])).lower()]
-                        target_text = valid_spans[0].text if valid_spans else price_elem.text
-                        m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', target_text)
+                price_elem = soup.select_one('.x-price-primary') or \
+                             soup.select_one('[data-testid="x-price-primary"]') or \
+                             soup.select_one('.x-bin-price .x-price-primary') or \
+                             soup.select_one('.x-price-approx')
+                if price_elem:
+                    spans = price_elem.select('.ux-textspans')
+                    valid_spans = [s for s in spans if 'strikethrough' not in ''.join(s.get('class', [])).lower()]
+                    target_text = valid_spans[0].text if valid_spans else price_elem.text
+                    m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', target_text)
+                    if m:
+                        try: price = float(m.group(1).replace(',', ''))
+                        except ValueError: pass
+                
+                if not price:
+                    main_price_box = soup.select_one('.x-bin-price, .x-price-section, [data-testid="x-bin-action"]')
+                    if main_price_box:
+                        m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', main_price_box.text)
                         if m:
                             try: price = float(m.group(1).replace(',', ''))
                             except ValueError: pass
-                    
-                    # Fallback to main item price container if .x-price-primary was inside another wrapper
-                    if not price:
-                        main_price_box = soup.select_one('.x-bin-price, .x-price-section, [data-testid="x-bin-action"]')
-                        if main_price_box:
-                            m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', main_price_box.text)
+                
+                title_elem = soup.select_one('.x-item-title__mainTitle span.ux-textspans') or soup.select_one('.x-item-title__mainTitle')
+                if title_elem: title = title_elem.text.strip()
+                
+                ended_msg = soup.select_one('.x-ended-item-msg, .msg-error, .ux-notice')
+                if ended_msg and ('ended' in ended_msg.text.lower() or 'out of stock' in ended_msg.text.lower()):
+                    print(f"⚠️ [Out of Stock] eBay: Listing ended or out of stock.")
+                    return {"out_of_stock": True}
+                
+                condition_elem = soup.select_one('.x-item-condition-text span.ux-textspans') or soup.select_one('.x-item-condition-text')
+                if condition_elem:
+                    cond_text = condition_elem.text.lower()
+                    if 'used' in cond_text or 'refurbished' in cond_text or 'parts' in cond_text or 'as is' in cond_text:
+                        is_refurbished = True
+                        
+                    if 'for parts' in cond_text or 'not working' in cond_text or 'box only' in cond_text or 'as is' in cond_text:
+                        print(f"⚠️ [Rejected] eBay: Item is marked as broken/parts ({condition_elem.text}).")
+                        return None
+                        
+            elif retailer_name == 'Micro Center':
+                price = 0
+                og_price = soup.select_one('meta[property="og:price:amount"]') or soup.select_one('meta[itemprop="price"]')
+                if og_price and og_price.get('content'):
+                    m = re.search(r'([0-9,]+(?:\.[0-9]{2})?)', og_price['content'])
+                    if m:
+                        try: price = float(m.group(1).replace(',', ''))
+                        except ValueError: pass
+                
+                if not price:
+                    price_elem = soup.select_one('#pricing') or soup.select_one('#pricing2')
+                    if price_elem:
+                        content_val = price_elem.get('content')
+                        if content_val:
+                            m = re.search(r'([0-9,]+(?:\.[0-9]{2})?)', content_val)
                             if m:
                                 try: price = float(m.group(1).replace(',', ''))
                                 except ValueError: pass
+                        if not price:
+                            m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', price_elem.text)
+                            if m:
+                                try: price = float(m.group(1).replace(',', ''))
+                                except ValueError: pass
+                
+                title_elem = soup.select_one('.ProductLink_' + soup.select_one('[data-id]')['data-id']) if soup.select_one('[data-id]') else None
+                if not title_elem:
+                    title_elem = soup.select_one('[data-name]')
                     
-                    # Extract title
-                    title_elem = soup.select_one('.x-item-title__mainTitle span.ux-textspans') or soup.select_one('.x-item-title__mainTitle')
-                    if title_elem: title = title_elem.text.strip()
+                if title_elem and title_elem.get('data-name'):
+                    title = title_elem['data-name'].strip()
+                elif title_elem:
+                    title = title_elem.text.strip()
                     
-                    # Reject ended/out of stock items explicitly
-                    ended_msg = soup.select_one('.x-ended-item-msg, .msg-error, .ux-notice')
-                    if ended_msg and ('ended' in ended_msg.text.lower() or 'out of stock' in ended_msg.text.lower()):
-                        print(f"⚠️ [Out of Stock] eBay: Listing ended or out of stock.")
+                inventory_elem = soup.select_one('.inventoryCnt, .out-of-stock, .unavailable, .availabilityTrunc')
+                if inventory_elem:
+                    inventory_text = inventory_elem.text.lower()
+                    if 'sold out' in inventory_text or 'no longer carried' in inventory_text or 'not available' in inventory_text:
+                        print(f"⚠️ [Out of Stock] Micro Center: Sold out or no longer carried.")
                         return {"out_of_stock": True}
-                    
-                    # Extract condition (Used vs New) to set is_refurbished roughly
-                    condition_elem = soup.select_one('.x-item-condition-text span.ux-textspans') or soup.select_one('.x-item-condition-text')
-                    if condition_elem:
-                        cond_text = condition_elem.text.lower()
-                        if 'used' in cond_text or 'refurbished' in cond_text or 'parts' in cond_text or 'as is' in cond_text:
-                            is_refurbished = True
-                            
-                        # Reject broken items instantly
-                        if 'for parts' in cond_text or 'not working' in cond_text or 'box only' in cond_text or 'as is' in cond_text:
-                            print(f"⚠️ [Rejected] eBay: Item is marked as broken/parts ({condition_elem.text}).")
-                            return None
-                            
-                elif retailer_name == 'Micro Center':
-                    # Extract price
-                    price = 0
-                    # Try OpenGraph price first (Micro Center often puts it here)
-                    og_price = soup.select_one('meta[property="og:price:amount"]') or soup.select_one('meta[itemprop="price"]')
-                    if og_price and og_price.get('content'):
-                        m = re.search(r'([0-9,]+(?:\.[0-9]{2})?)', og_price['content'])
-                        if m:
-                            try: price = float(m.group(1).replace(',', ''))
-                            except ValueError: pass
-                    
-                    if not price:
-                        price_elem = soup.select_one('#pricing') or soup.select_one('#pricing2')
-                        if price_elem:
-                            content_val = price_elem.get('content')
-                            if content_val:
-                                m = re.search(r'([0-9,]+(?:\.[0-9]{2})?)', content_val)
-                                if m:
-                                    try: price = float(m.group(1).replace(',', ''))
-                                    except ValueError: pass
-                            if not price:
-                                m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', price_elem.text)
-                                if m:
-                                    try: price = float(m.group(1).replace(',', ''))
-                                    except ValueError: pass
-                    
-                    # Extract title
-                    title_elem = soup.select_one('.ProductLink_' + soup.select_one('[data-id]')['data-id']) if soup.select_one('[data-id]') else None
-                    if not title_elem:
-                        title_elem = soup.select_one('[data-name]')
-                        
-                    if title_elem and title_elem.get('data-name'):
-                        title = title_elem['data-name'].strip()
-                    elif title_elem:
-                        title = title_elem.text.strip()
-                        
-                    # Check stock status (ONLY in the specific inventory element to avoid false positives)
-                    inventory_elem = soup.select_one('.inventoryCnt, .out-of-stock, .unavailable, .availabilityTrunc')
-                    if inventory_elem:
-                        inventory_text = inventory_elem.text.lower()
-                        if 'sold out' in inventory_text or 'no longer carried' in inventory_text or 'not available' in inventory_text:
-                            print(f"⚠️ [Out of Stock] Micro Center: Sold out or no longer carried.")
-                            return {"out_of_stock": True}
-            except Exception as e:
-                print(f"[BS4 Parse Error] {retailer_name}: {e}")
-                
-            # If title is extracted, we can do a single-item check if not already performed via batch
-            if title and model_query:
-                # Include URL text in the match check so retailer-specific product titles that omit brand headers (e.g. Micro Center) still match
-                full_check_title = f"{title} {url}"
-                is_match = (await self.filter_matching_titles([full_check_title], model_query, category))[0]
-                if not is_match:
-                    print(f"⚠️ [Title Mismatch] {retailer_name}: \"{title}\" does not match query \"{model_query}\"")
-                    return None
-            elif model_query:
-                # No title could be scraped (selector drift, unusual page layout, etc). The old
-                # code fell straight through to accepting whatever price it found, with zero
-                # verification that the page was even for the right product. Validate against
-                # a slice of the raw page text instead of blindly trusting the price.
-                page_text_sample = (markdown_content or html_content or '')[:3000]
-                is_match = (await self.filter_matching_titles([f"{page_text_sample} {url}"], model_query, category))[0]
-                if not is_match:
-                    print(f"⚠️ [No Title — Content Mismatch] {retailer_name}: page content doesn't confirm \"{model_query}\"")
-                    return None
-                
-            if price and self.is_price_sanity_valid(price, model_query or title or url, category):
-                print(f"✅ [BS4 Hit] {retailer_name}: Found price ${price:.2f}")
+        except Exception as e:
+            print(f"[BS4 Parse Error] {retailer_name}: {e}")
+            
+        if title and model_query:
+            full_check_title = f"{title} {url}"
+            is_match = (await self.filter_matching_titles([full_check_title], model_query, category))[0]
+            if not is_match:
+                print(f"⚠️ [Title Mismatch] {retailer_name}: \"{title}\" does not match query \"{model_query}\"")
+                return None
+        elif model_query:
+            page_text_sample = (markdown_content or html_content or '')[:3000]
+            is_match = (await self.filter_matching_titles([f"{page_text_sample} {url}"], model_query, category))[0]
+            if not is_match:
+                print(f"⚠️ [No Title — Content Mismatch] {retailer_name}: page content doesn't confirm \"{model_query}\"")
+                return None
+            
+        if price and self.is_price_sanity_valid(price, model_query or title or url, category):
+            print(f"✅ [BS4 Hit] {retailer_name}: Found price ${price:.2f}")
+            return {
+                "retailer": retailer_name,
+                "price": price,
+                "originalPrice": None,
+                "title": title or model_query or url,
+                "brand": None,
+                "url": url,
+                "imageUrl": image_url,
+                "inStock": in_stock,
+                "isRefurbished": is_refurbished
+            }
+            
+        print(f"⚠️ [BS4 Miss] {retailer_name}: Falling back to AI extraction...")
+        groq_data = await self.parse_with_groq(markdown_content or html_content[:8000], model_query, retailer_name, category)
+        if groq_data and groq_data.get('price'):
+            if self.is_price_sanity_valid(groq_data['price'], model_query or title or url, category):
+                print(f"✅ [Groq Fallback Hit] {retailer_name}: Found price ${groq_data['price']:.2f}")
                 return {
                     "retailer": retailer_name,
-                    "price": price,
-                    "originalPrice": None,
-                    "title": title or model_query or url,
-                    "brand": None,
+                    "price": groq_data['price'],
+                    "originalPrice": groq_data.get('originalPrice'),
+                    "title": groq_data.get('title') or title or model_query or url,
+                    "brand": groq_data.get('brand'),
                     "url": url,
                     "imageUrl": image_url,
-                    "inStock": in_stock,
-                    "isRefurbished": is_refurbished
+                    "inStock": groq_data.get('inStock', in_stock),
+                    "isRefurbished": groq_data.get('isRefurbished', is_refurbished)
                 }
+            else:
+                print(f"⚠️ [Groq Sanity Fail] {retailer_name}: Extracted price ${groq_data['price']:.2f} failed sanity check.")
                 
-            print(f"⚠️ [BS4 Miss] {retailer_name}: Falling back to AI extraction...")
-            groq_data = await self.parse_with_groq(markdown_content, model_query, retailer_name, category)
-            if groq_data and groq_data.get('price'):
-                if self.is_price_sanity_valid(groq_data['price'], model_query or title or url, category):
-                    print(f"✅ [Groq Fallback Hit] {retailer_name}: Found price ${groq_data['price']:.2f}")
-                    return {
-                        "retailer": retailer_name,
-                        "price": groq_data['price'],
-                        "originalPrice": groq_data.get('originalPrice'),
-                        "title": groq_data.get('title') or title or model_query or url,
-                        "brand": groq_data.get('brand'),
-                        "url": url,
-                        "imageUrl": image_url,
-                        "inStock": groq_data.get('inStock', in_stock),
-                        "isRefurbished": groq_data.get('isRefurbished', is_refurbished)
-                    }
-                else:
-                    print(f"⚠️ [Groq Hallucination] {retailer_name}: Extracted price ${groq_data['price']:.2f} failed sanity check.")
-                    
-            return None
-        except Exception as e:
-            print(f"⚠️ [Firecrawl Extraction Error] {url}: {e}")
-            return None
+        return None
 
     async def parse_with_groq(self, markdown_content: str, query: str, retailer: str, category: str) -> dict:
         if not GROQ_API_KEY:
             return {}
 
-        # Strip distracting recommended carousel headers, sidebars, and protection plan snippets
         clean_markdown = re.sub(r'##\s*People who viewed this item also viewed[\s\S]*?(?=##|\Z)', '', markdown_content, flags=re.I)
         clean_markdown = re.sub(r'##\s*Similar items[\s\S]*?(?=##|\Z)', '', clean_markdown, flags=re.I)
         clean_markdown = re.sub(r'##\s*Sponsored items[\s\S]*?(?=##|\Z)', '', clean_markdown, flags=re.I)
@@ -1044,34 +1051,37 @@ class TavilyHardwareAgent:
             "4. Return ONLY valid JSON with keys: price (float), originalPrice (float or null), title (str), brand (str or null), inStock (bool)."
         )
 
-        try:
-            async with httpx.AsyncClient() as client:
-                res = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                    json={
-                        "model": "groq/compound-mini",
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": f"Extract info from this markdown:\n\n{clean_markdown[:7000]}"}
-                        ],
-                        "response_format": {"type": "json_object"},
-                        "temperature": 0
-                    },
-                    timeout=10.0
-                )
-                if res.status_code == 200:
-                    return json.loads(res.json()["choices"][0]["message"]["content"])
-                elif res.status_code == 429:
-                    print(f"[Groq 429] Rate limit on AI fallback — skipping {retailer}")
-        except Exception as e:
-            print(f"[Groq Price Parse Error] {e}")
+        models_to_try = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"]
+        for model_name in models_to_try:
+            try:
+                async with httpx.AsyncClient() as client:
+                    res = await client.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                        json={
+                            "model": model_name,
+                            "messages": [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": f"Extract info from this markdown:\n\n{clean_markdown[:7000]}"}
+                            ],
+                            "response_format": {"type": "json_object"},
+                            "temperature": 0
+                        },
+                        timeout=10.0
+                    )
+                    if res.status_code == 200:
+                        return json.loads(res.json()["choices"][0]["message"]["content"])
+                    elif res.status_code == 429:
+                        print(f"[Groq 429] Rate limit on {model_name} — trying next model fallback...")
+                        continue
+            except Exception as e:
+                print(f"[Groq Price Parse Error with {model_name}] {e}")
 
         return {}
 
     def is_valid_direct_product_url(self, url: str, domain_pattern: str) -> bool:
         lower = url.lower()
-        if any(x in lower for x in ['/reviews/', 'reviews', 'questions', '/forum/', '/blog/', 'searchpage.jsp', '/s?k=', '/p/pl']):
+        if any(x in lower for x in ['/reviews/', 'reviews', 'questions', '/forum/', '/blog/', 'searchpage.jsp', '/s?k=', '/p/pl', '/openbox']):
             return False
             
         if 'microcenter.com' in domain_pattern: return '/product/' in lower
@@ -1120,7 +1130,7 @@ class TavilyHardwareAgent:
             lower_t = t.lower()
             clean_t = re.sub(r'[^a-z0-9]', '', lower_t)
             
-            # Rule 1: Reject junk/noise unless explicitly requested
+            # Rule 0: Reject junk, broken items, and parts-only listings
             bad_keywords = [
                 'for parts', 'broken', 'box only', 'read description', 'empty box', 
                 'sticker only', 'packaging only', 'manual only', 'dummy', 'poster', 'as is', 'case badge'
@@ -1129,32 +1139,52 @@ class TavilyHardwareAgent:
                 results.append(False)
                 continue
 
-            # Rule 2: Reject prebuilt PCs when looking for individual components
+            # Rule 0.5: Reject accessory and part replacement listings unless query explicitly asked for an accessory
+            ACCESSORY_KEYWORDS = [
+                'cable', '12vhpwr', 'adapter', 'bracket', 'backplate', 'anti-sag', 'holder', 'support bracket',
+                'water block', 'waterblock', 'block only', 'heatsink only', 'cooler only', 'shroud', 'replacement fan',
+                'gpu fan', 'case badge', 'sticker', 'poster', 'skin', 'wrap', 'keycap', 'mining rig', 'dummy card',
+                'chassis frame', 'riser cable', 'extension cable', 'sleeved cable', 'mounting kit', 'liquid cooler block',
+                'thermal pad', 'copper shim', 'stand only', 'box only', 'empty box', 'decal'
+            ]
+            if not any(k in lower_q for k in ['cable', 'adapter', 'bracket', 'backplate', 'block', 'shroud', 'fan', 'pad', 'shim', 'mount']):
+                if any(re.search(r'\b' + re.escape(ak) + r'\b', lower_t) for ak in ACCESSORY_KEYWORDS):
+                    results.append(False)
+                    continue
+
+            # Rule 0.8: Reject multi-model keyword stuffing spam (e.g. "RTX 5070 Ti 5080 5090" in title)
+            found_gpus = re.findall(r'\b(5090|5080|5070\s*ti|5070|5060\s*ti|5060|4090|4080|4070\s*ti|4070|4060\s*ti|4060|3090|3080|3070|3060)\b', lower_t)
+            if len(set(re.sub(r'\s+', '', g) for g in found_gpus)) > 1:
+                # Multiple different GPU models in title indicates an accessory or SEO spam listing
+                results.append(False)
+                continue
+
+            # Rule 1: Reject prebuilt PCs when looking for individual components
             if category in ['GPU', 'CPU', 'Motherboard', 'RAM', 'Storage', 'Power Supply', 'Case', 'Cooling']:
                 if not any(k in lower_q for k in ['pc', 'desktop', 'prebuilt', 'laptop', 'system']):
                     if any(p in lower_t for p in ['desktop pc', 'gaming pc', 'gaming desktop', 'laptop', 'prebuilt pc', 'complete pc', 'all-in-one']):
                         results.append(False)
                         continue
                         
-            # Rule 3: Reject combos/bundles when looking for standalone components
+            # Rule 2: Reject combos/bundles when looking for standalone components
             if category in ['GPU', 'CPU', 'Motherboard', 'RAM', 'Storage', 'Power Supply', 'Case', 'Cooling']:
                 if not any(k in lower_q for k in ['combo', 'bundle', 'pack', 'set']):
                     if any(b in lower_t for b in ['motherboard combo', 'cpu combo', 'with motherboard', '+ motherboard', 'plus motherboard', 'cpu + mobo', 'gpu + mobo', 'cpu motherboard combo']):
                         results.append(False)
                         continue
 
-            # Rule 4: Must contain all core numeric sequences (e.g. '890' for Z890, '4070', '7800', '265', '990', '850')
+            # Rule 3: Must contain all core numeric sequences (e.g. '890' for Z890, '4070', '7800', '265', '990', '850')
             if pure_digits and not all(d in clean_t for d in pure_digits):
                 results.append(False)
                 continue
                 
-            # Rule 5: If query specifies a brand (e.g. 'asrock', 'samsung'), title must belong to that brand
+            # Rule 4: If query specifies a brand (e.g. 'asrock', 'samsung'), title must belong to that brand
             if query_brands:
                 if not any(b.replace(' ', '').replace('.', '') in clean_t for b in query_brands):
                     results.append(False)
                     continue
                 
-            # Rule 6: If query specifies a critical modifier (e.g. 'wifi', 'super', 'ti', 'white', 'wireless'), title must contain it
+            # Rule 5: If query specifies a critical modifier (e.g. 'wifi', 'super', 'ti', 'white', 'wireless'), title must contain it
             if query_modifiers:
                 if not all(m in clean_t for m in query_modifiers):
                     results.append(False)
@@ -1168,33 +1198,106 @@ class TavilyHardwareAgent:
         if not price or price <= 0:
             return False
 
+        q_lower = (query or '').lower()
+
+        # 1. Model-specific and Tier-specific realistic price floors for modern computer hardware
+        # GPUs (NVIDIA 50-series, 40-series, 30-series, AMD Radeon RX 7000/8000)
+        if re.search(r'\b(?:rtx\s*5090|5090)\b', q_lower):
+            if price < 1350.0: return False
+        elif re.search(r'\b(?:rtx\s*5080|5080)\b', q_lower):
+            if price < 750.0: return False
+        elif re.search(r'\b(?:rtx\s*5070\s*ti|5070\s*ti)\b', q_lower):
+            if price < 580.0: return False
+        elif re.search(r'\b(?:rtx\s*5070|5070)\b', q_lower):
+            if price < 420.0: return False
+        elif re.search(r'\b(?:rtx\s*5060\s*ti|5060\s*ti)\b', q_lower):
+            if price < 280.0: return False
+        elif re.search(r'\b(?:rtx\s*5060|5060)\b', q_lower):
+            if price < 200.0: return False
+        elif re.search(r'\b(?:rtx\s*4090|4090)\b', q_lower):
+            if price < 1350.0: return False
+        elif re.search(r'\b(?:rtx\s*4080\s*super|rtx\s*4080|4080\s*super|4080)\b', q_lower):
+            if price < 750.0: return False
+        elif re.search(r'\b(?:rtx\s*4070\s*ti\s*super|rtx\s*4070\s*ti|4070\s*ti)\b', q_lower):
+            if price < 580.0: return False
+        elif re.search(r'\b(?:rtx\s*4070\s*super|rtx\s*4070|4070\s*super|4070)\b', q_lower):
+            if price < 420.0: return False
+        elif re.search(r'\b(?:rtx\s*4060\s*ti|4060\s*ti)\b', q_lower):
+            if price < 280.0: return False
+        elif re.search(r'\b(?:rtx\s*4060|4060)\b', q_lower):
+            if price < 200.0: return False
+        elif re.search(r'\b(?:rx\s*7900\s*xtx|7900\s*xtx)\b', q_lower):
+            if price < 650.0: return False
+        elif re.search(r'\b(?:rx\s*7900\s*xt|7900\s*xt|7900\s*gre)\b', q_lower):
+            if price < 450.0: return False
+        elif re.search(r'\b(?:rx\s*7800\s*xt|7800\s*xt)\b', q_lower):
+            if price < 360.0: return False
+        elif re.search(r'\b(?:rx\s*7700\s*xt|7700\s*xt)\b', q_lower):
+            if price < 290.0: return False
+        elif re.search(r'\b(?:rx\s*7600\s*xt|rx\s*7600|7600\s*xt|7600)\b', q_lower):
+            if price < 180.0: return False
+
+        # CPUs (AMD Ryzen 9/7/5 9000 & 7000, Intel Ultra Series 2, 14th Gen)
+        elif re.search(r'\b(?:9950x3d|9950x|7950x3d|7950x)\b', q_lower):
+            if price < 380.0: return False
+        elif re.search(r'\b(?:9900x3d|9900x|7900x3d|7900x)\b', q_lower):
+            if price < 290.0: return False
+        elif re.search(r'\b(?:9800x3d|7800x3d|9700x|7700x|7700)\b', q_lower):
+            if price < 220.0: return False
+        elif re.search(r'\b(?:9600x|7600x|7600)\b', q_lower):
+            if price < 130.0: return False
+        elif re.search(r'\b(?:ultra\s*9\s*285k|i9-?14900k|14900k|13900k)\b', q_lower):
+            if price < 350.0: return False
+        elif re.search(r'\b(?:ultra\s*7\s*265k|i7-?14700k|14700k|13700k)\b', q_lower):
+            if price < 240.0: return False
+        elif re.search(r'\b(?:ultra\s*5\s*245k|i5-?14600k|14600k|13600k)\b', q_lower):
+            if price < 160.0: return False
+
+        # RAM
+        elif '64gb' in q_lower and ('ddr5' in q_lower or 'ram' in q_lower or category == 'RAM'):
+            if price < 110.0: return False
+        elif '32gb' in q_lower and ('ddr5' in q_lower or 'ram' in q_lower or category == 'RAM'):
+            if price < 55.0: return False
+
+        # Storage (SSDs)
+        elif '4tb' in q_lower and ('ssd' in q_lower or 'nvme' in q_lower or category == 'Storage'):
+            if price < 160.0: return False
+        elif '2tb' in q_lower and ('ssd' in q_lower or 'nvme' in q_lower or category == 'Storage'):
+            if price < 75.0: return False
+        elif '1tb' in q_lower and ('ssd' in q_lower or 'nvme' in q_lower or category == 'Storage'):
+            if price < 38.0: return False
+
+        # Motherboards
+        elif re.search(r'\b(z890|x870e|x870|z790|x670e|x670)\b', q_lower):
+            if price < 140.0: return False
+        elif re.search(r'\b(b850|b840|b650|b760)\b', q_lower):
+            if price < 70.0: return False
+
         # Category-level realistic price floors & ceilings for modern computer hardware
         CATEGORY_PRICE_BOUNDS = {
-            'GPU': (50.0, 5000.0),
-            'CPU': (35.0, 3000.0),
-            'Motherboard': (35.0, 1500.0),
-            'RAM': (15.0, 1500.0),
-            'Storage': (15.0, 2000.0),
-            'Power Supply': (25.0, 1200.0),
-            'Case': (20.0, 1000.0),
-            'Cooling': (5.0, 800.0),
-            'Case Fans': (5.0, 300.0),
-            'Thermal Paste': (3.0, 100.0),
-            'Monitor': (40.0, 4000.0),
-            'Peripherals': (5.0, 1200.0),
-            'Keyboard': (10.0, 600.0),
-            'Mouse': (10.0, 300.0),
-            'Headset': (10.0, 1000.0),
-            'Microphone': (15.0, 800.0),
-            'Accessories': (3.0, 500.0),
-            'Networking': (10.0, 1500.0),
+            'GPU': (120.0, 5000.0),
+            'CPU': (70.0, 3000.0),
+            'Motherboard': (60.0, 1500.0),
+            'RAM': (25.0, 1500.0),
+            'Storage': (25.0, 2000.0),
+            'Power Supply': (40.0, 1200.0),
+            'Case': (35.0, 1000.0),
+            'Cooling': (15.0, 800.0),
+            'Case Fans': (10.0, 300.0),
+            'Thermal Paste': (4.0, 100.0),
+            'Monitor': (70.0, 4000.0),
+            'Peripherals': (15.0, 1200.0),
+            'Keyboard': (25.0, 600.0),
+            'Mouse': (20.0, 300.0),
+            'Headset': (25.0, 1000.0),
+            'Microphone': (30.0, 800.0),
+            'Accessories': (5.0, 500.0),
+            'Networking': (20.0, 1500.0),
         }
 
-        min_bound, max_bound = CATEGORY_PRICE_BOUNDS.get(category, (3.0, 10000.0))
+        min_bound, max_bound = CATEGORY_PRICE_BOUNDS.get(category, (5.0, 10000.0))
         if price < min_bound or price > max_bound:
             return False
-
-        return True
 
         return True
 
@@ -1217,33 +1320,34 @@ class TavilyHardwareAgent:
             "If it is NOT a computer component or peripheral, return EXACTLY: Not compatible (N/A). "
             "Return ONLY the category name. Do not include any other text."
         )
-        try:
-            async with httpx.AsyncClient() as client:
-                res = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                    json={
-                        "model": "groq/compound-mini",
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": f"Query: {text}"}
-                        ],
-                        "temperature": 0
-                    },
-                    timeout=5.0
-                )
-            if res.status_code == 200:
-                category = res.json()["choices"][0]["message"]["content"].strip()
-                valid_categories = ['GPU', 'CPU', 'RAM', 'Motherboard', 'Storage', 'Power Supply', 'Case', 'Cooling', 'Monitor', 'Peripherals', 'Networking']
-                if category in valid_categories:
-                    return category
-                for vc in valid_categories:
-                    if vc.lower() in category.lower():
-                        return vc
-        except Exception as e:
-            print(f"[Groq Category Detect Error] {e}")
-            pass
-            
+        models_to_try = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+        for model_name in models_to_try:
+            try:
+                async with httpx.AsyncClient() as client:
+                    res = await client.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                        json={
+                            "model": model_name,
+                            "messages": [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": f"Query: {text}"}
+                            ],
+                            "temperature": 0
+                        },
+                        timeout=5.0
+                    )
+                if res.status_code == 200:
+                    category = res.json()["choices"][0]["message"]["content"].strip()
+                    valid_categories = ['GPU', 'CPU', 'RAM', 'Motherboard', 'Storage', 'Power Supply', 'Case', 'Cooling', 'Monitor', 'Peripherals', 'Networking']
+                    if category in valid_categories:
+                        return category
+                    for vc in valid_categories:
+                        if vc.lower() in category.lower():
+                            return vc
+            except Exception as e:
+                print(f"[Groq Category Detect Error with {model_name}] {e}")
+                
         return 'Not compatible (N/A)'
 
     def normalize_model(self, text: str, fallback: str) -> str:
