@@ -320,6 +320,7 @@ async def _run_scrape_in_background(
         broadcast_sse("agent_error", {
             "query": clean_query,
             "error": str(e),
+            "pending_id": pending_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 

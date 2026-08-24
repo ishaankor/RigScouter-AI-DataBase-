@@ -188,36 +188,38 @@ class TavilyHardwareAgent:
                     print(f"[DEBUG Groq Analyzer] Raw JSON response: {raw_content}")
                     data = json.loads(raw_content)
 
-                    # Smart context fallback: if it's marked Not compatible, check if web context clarifies it as hardware
-                    if data.get('category') == 'Not compatible (N/A)' and self.get_tavily_key():
+                    # Smart context fallback: if it's marked Not compatible or GENERIC_QUERY_ERROR, check if web context clarifies the exact model
+                    if (data.get('category') == 'Not compatible (N/A)' or data.get('model') == 'GENERIC_QUERY_ERROR') and self.get_tavily_key():
                         try:
-                            print(f"[AI Analyzer] '{query}' marked Not compatible. Fetching web context...")
+                            print(f"[AI Analyzer] '{query}' returned {data.get('model', data.get('category'))}. Fetching web context...")
                             tavily_res = await client.post('https://api.tavily.com/search', json={
                                 "api_key": self.get_tavily_key(),
                                 "query": f"{query} specs computer hardware",
                                 "search_depth": "basic",
-                                "max_results": 1
-                            }, timeout=3.0)
+                                "max_results": 2
+                            }, timeout=4.0)
                             if tavily_res.status_code == 200:
                                 results = tavily_res.json().get('results', [])
-                                snippet = results[0].get('content', '') if results else ''
+                                snippet = ' '.join([r.get('title', '') + ' ' + r.get('content', '') for r in results])
                                 if snippet:
                                     res2 = await client.post(
                                         "https://api.groq.com/openai/v1/chat/completions",
                                         headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                                         json={
-                                            "model": "groq/compound-mini",
+                                            "model": "openai/gpt-oss-20b",
                                             "messages": [
-                                                {"role": "system", "content": system_prompt + "\nUse the search context to verify if this is a computer hardware item."},
-                                                {"role": "user", "content": f"Title: {query}\n\nSearch Context: {snippet}"}
+                                                {"role": "system", "content": system_prompt + "\nUse the search context to identify the exact GPU/CPU/hardware model if the query was an abbreviated trim name (e.g. Inno3D X3 OC -> Inno3D RTX 5090 X3 OC)."},
+                                                {"role": "user", "content": f"Query: {query}\n\nSearch Context: {snippet}"}
                                             ],
                                             "response_format": {"type": "json_object"},
                                             "temperature": 0
                                         },
-                                        timeout=5.0
+                                        timeout=6.0
                                     )
                                     if res2.status_code == 200:
-                                        data = json.loads(res2.json()["choices"][0]["message"]["content"])
+                                        data2 = json.loads(res2.json()["choices"][0]["message"]["content"])
+                                        if data2.get('model') and data2.get('model') != 'GENERIC_QUERY_ERROR':
+                                            return data2
                         except Exception as e:
                             print(f"[Tavily Fallback Error] {e}")
 
@@ -255,15 +257,26 @@ class TavilyHardwareAgent:
 
         if clean_prompt == 'GENERIC_QUERY_ERROR':
             print(f"[Generic Query Rejected] \"{prompt.strip()}\"")
-            state["summary"] = f"Your search '{prompt.strip()}' is too broad (e.g. a general chipset or product family). Please search for a specific model (e.g. 'ASUS ROG Strix X870-A') for accurate pricing."
+            state["summary"] = f"Your search '{prompt.strip()}' is too broad (e.g. a general chipset or product family). Please search for a specific model (e.g. 'ASUS ROG Strix RTX 4070' or 'Inno3D RTX 5090 X3 OC') for accurate pricing."
             if emit_fn:
+                emit_fn('agent_error', {
+                    "query": prompt.strip(),
+                    "original_query": prompt.strip(),
+                    "error_type": "GENERIC_QUERY_ERROR",
+                    "message": state["summary"],
+                    "pending_id": pending_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                })
                 emit_fn('agent_complete', {
                     "query": prompt.strip(),
                     "original_query": prompt.strip(),
                     "category": category,
                     "bestOffer": None,
                     "allOffers": [],
+                    "is_error": True,
+                    "error_type": "GENERIC_QUERY_ERROR",
                     "summary": state["summary"],
+                    "pending_id": pending_id,
                     "timestamp": datetime.now(timezone.utc).isoformat()
                 })
             return state
@@ -275,15 +288,26 @@ class TavilyHardwareAgent:
 
         if category == 'Not compatible (N/A)' and not is_url:
             print(f"[Non-PC Part Query Rejected] \"{clean_prompt}\" is Not compatible (N/A)")
-            state["summary"] = f"Not compatible (N/A) — \"{clean_prompt}\" is not a recognized PC hardware component."
+            state["summary"] = f"Not compatible (N/A) — \"{clean_prompt}\" is not a recognized PC hardware component or peripheral."
             if emit_fn:
+                emit_fn('agent_error', {
+                    "query": clean_prompt,
+                    "original_query": prompt.strip(),
+                    "error_type": "INCOMPATIBLE_ITEM_ERROR",
+                    "message": state["summary"],
+                    "pending_id": pending_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                })
                 emit_fn('agent_complete', {
                     "query": clean_prompt,
                     "original_query": prompt.strip(),
                     "category": 'Not compatible (N/A)',
                     "bestOffer": None,
                     "allOffers": [],
+                    "is_error": True,
+                    "error_type": "INCOMPATIBLE_ITEM_ERROR",
                     "summary": state["summary"],
+                    "pending_id": pending_id,
                     "timestamp": datetime.now(timezone.utc).isoformat()
                 })
             return state
@@ -505,7 +529,16 @@ class TavilyHardwareAgent:
             emit_fn('agent_complete', {
                 "query": clean_prompt,
                 "original_query": prompt.strip(),
-                            "timestamp": datetime.now(timezone.utc).isoformat()
+                "category": category,
+                "bestOffer": state.get("bestOffer"),
+                "allOffers": state.get("scrapedOffers", []),
+                "summary": state.get("summary", ""),
+                "priceChange": state.get("priceChange"),
+                "previousPrice": state.get("previousPrice"),
+                "is_error": not bool(state.get("bestOffer")),
+                "error_type": "NO_OFFERS_FOUND" if not state.get("bestOffer") else None,
+                "pending_id": pending_id,
+                "timestamp": datetime.now(timezone.utc).isoformat()
             })
 
         return state
