@@ -461,13 +461,12 @@ class TavilyHardwareAgent:
                         r_id = row['id']
                         r_user_id = row.get('user_id')
                         target_price = float(row.get('target_price') or 0)
-                        prior_price = row.get('current_price') or row.get('all_time_low')
+                        prior_price = row.get('previous_price_24h') or row.get('all_time_low')
                         prior_atl = float(row.get('all_time_low') or best['price'])
                         alerts_on = row.get('notify_on_flash_drop', True)
 
                         # Update row's price tracking
                         update_payload = {
-                            "current_price": best['price'],
                             "all_time_low": min(prior_atl, best['price']),
                         }
                         if prior_price and prior_price != best['price']:

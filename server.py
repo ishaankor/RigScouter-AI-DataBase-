@@ -1,6 +1,8 @@
 import os
+import re
 import json
 import asyncio
+import httpx
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request, Query, BackgroundTasks, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
@@ -76,23 +78,46 @@ async def get_dynamic_parts_queue() -> list[dict]:
     seen_names: set[str] = set()
 
     try:
-        # 1. Fetch hardware components first to build product_url lookup index
+        # 1. Fetch all catalog hardware components to build full URL index
         hw_res = await asyncio.to_thread(
             supabase.table('hardware_components')
             .select('id, name, model, category, brand, current_price, msrp, retailer, product_url, lowest_price_90d')
             .order('deal_score', desc=True)
-            .limit(50)
+            .limit(500)
             .execute
         )
         hw_data = hw_res.data or []
-        hw_by_id = {r['id']: r for r in hw_data if r.get('id')}
-        hw_by_model = {r['model'].lower(): r for r in hw_data if r.get('model')}
+
+        def find_best_hw_match(w_row: dict) -> dict | None:
+            c_id = (w_row.get('component_id') or '').lower()
+            c_name = (w_row.get('component_name') or '').lower()
+
+            # 1. Exact or prefix/suffix component ID match
+            for h in hw_data:
+                h_id = h.get('id', '').lower()
+                if h_id and c_id and (h_id == c_id or h_id.startswith(c_id) or c_id.startswith(h_id)):
+                    return h
+
+            # 2. Extract key alphanumeric tokens (e.g. 2080, 4090, 7800x3d, nexxxos, q270m, vengeance)
+            clean_name = re.sub(r'[^a-z0-9\s]', ' ', c_name)
+            tokens = [t for t in clean_name.split() if len(t) > 2 and t not in ['the', 'and', 'for', 'with', 'edition', 'gaming', 'series', 'black', 'white', 'super', 'dual', 'triple']]
+
+            best_h = None
+            best_score = 0
+            for h in hw_data:
+                h_text = f"{h.get('name', '')} {h.get('model', '')} {h.get('id', '')}".lower()
+                score = sum(1 for t in tokens if t in h_text)
+                if score > best_score and score >= 2:
+                    best_score = score
+                    best_h = h
+
+            return best_h
 
         # 2. Fetch user watchlist items (highest priority)
         wl_res = await asyncio.to_thread(
             supabase.table('watchlist_items')
             .select('id, user_id, component_name, component_id, category, target_price, all_time_low')
-            .limit(50)
+            .limit(100)
             .execute
         )
         for r in (wl_res.data or []):
@@ -100,18 +125,7 @@ async def get_dynamic_parts_queue() -> list[dict]:
             if not name:
                 continue
 
-            comp_id = r.get('component_id') or ''
-            # Look up linked hardware component
-            matched_hw = hw_by_id.get(comp_id)
-            if not matched_hw and comp_id:
-                # Try prefix match (e.g. comp-asus-prime-q270m matches comp-asus-prime-q270m-amazon)
-                for h_id, h_row in hw_by_id.items():
-                    if h_id.startswith(comp_id) or comp_id.startswith(h_id):
-                        matched_hw = h_row
-                        break
-            if not matched_hw:
-                matched_hw = hw_by_model.get(name.lower())
-
+            matched_hw = find_best_hw_match(r)
             url = matched_hw.get('product_url') if matched_hw else None
             retailer = matched_hw.get('retailer') if matched_hw else 'Amazon'
             current_price = float(matched_hw.get('current_price') or r.get('all_time_low') or 0.0) if matched_hw else float(r.get('all_time_low') or 0.0)
@@ -134,7 +148,7 @@ async def get_dynamic_parts_queue() -> list[dict]:
                     "notify": True
                 })
 
-        # 3. Append remaining top catalog components
+        # 3. Append remaining catalog components
         for r in hw_data:
             name = r.get('model') or r.get('name')
             url = r.get('product_url')
