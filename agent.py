@@ -35,6 +35,11 @@ def clean_hardware_query(query: str, category: str = None) -> str:
     s = re.sub(r'(?i)(ryzen|core)(\d+)', r'\1 \2', s)
     s = re.sub(r'(\d+)(gb|tb|w|mhz|ghz)\b', r'\1\2', s, flags=re.I)
     
+    # Strip long retail listing suffixes after delimiters (e.g. " - 1x HDMI & 3X DisplayPort...", ", 4-Monitor Support...")
+    s = re.sub(r'\s*[-–—|]\s*(?:\d+x\s*hdmi|pcie\s*4|4k\s*gaming|ray\s*tracing|dlss|triple\s*fan|oem\b|non\s*retail|vr\s*ready|rgb\b|high[- ]performance).*$', '', s, flags=re.I)
+    s = re.sub(r'[,.]\s*(?:pcie\s*4|4k\s*gaming|ray\s*tracing|dlss|triple\s*fan|oem\b|non\s*retail|vr\s*ready|4-monitor|high[- ]performance).*$', '', s, flags=re.I)
+    s = re.sub(r'\bOEM\s*\([^)]*\)', '', s, flags=re.I)
+
     # Strip marketing filler while preserving all model, brand, capacity, and spec tokens
     FLUFF_PATTERNS = [
         r'(?i)\b(?:desktop\s+processor|boxed\s+processor|unlocked\s+desktop\s+processor)\b',
@@ -396,7 +401,9 @@ class TavilyHardwareAgent:
                         state["scrapedOffers"].append(offer)
                         
                         try:
-                            comp_id = f"comp-{re.sub(r'[^a-z0-9]+', '-', clean_prompt.lower())}-{offer['retailer'].lower().replace(' ', '-')}"
+                            clean_slug = re.sub(r'[^a-z0-9]+', '-', clean_prompt.lower())[:70].strip('-')
+                            ret_slug = offer['retailer'].lower().replace(' ', '-')[:20]
+                            comp_id = f"comp-{clean_slug}-{ret_slug}"[:95]
                             
                             # Preserve and append to PriceHistory
                             existing_specs = {}
@@ -432,10 +439,10 @@ class TavilyHardwareAgent:
 
                             query1 = supabase.table('hardware_components').upsert({
                                 "id": comp_id,
-                                "name": offer['title'],
-                                "category": category,
-                                "brand": offer['title'].split()[0] if offer['title'] else "Hardware",
-                                "model": clean_prompt,
+                                "name": (offer['title'] or "Hardware Component")[:250],
+                                "category": category[:50],
+                                "brand": (offer['title'].split()[0] if offer['title'] else "Hardware")[:50],
+                                "model": clean_prompt[:95],
                                 "specs": json.dumps({
                                     "AgentSummary": "Live Autonomous Scraping Engine",
                                     "InStock": offer['inStock'],
@@ -447,7 +454,7 @@ class TavilyHardwareAgent:
                                 "msrp": offer.get('originalPrice') or offer['price'],
                                 "current_price": offer['price'],
                                 "lowest_price_90d": offer_lowest_90d,
-                                "retailer": offer['retailer'],
+                                "retailer": offer['retailer'][:50],
                                 "product_url": offer['url'],
                                 "image_url": offer.get('imageUrl') or "https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=600&q=80",
                                 "rating": offer.get('rating'),
@@ -455,7 +462,7 @@ class TavilyHardwareAgent:
                                 "updated_at": datetime.now(timezone.utc).isoformat()
                             })
                             await asyncio.to_thread(query1.execute)
-                            print(f"[DB Persist Success] Saved \"{offer['retailer']}\" offer: \"{offer['title']}\" (${offer['price']:.2f}) with PriceHistory ({len(price_history)} snapshots)")
+                            print(f"[DB Persist Success] Saved \"{offer['retailer']}\" offer: \"{offer['title'][:60]}\" (${offer['price']:.2f}) with PriceHistory ({len(price_history)} snapshots)")
                         except Exception as e:
                             print(f"[Agent Incremental Persistence Error]: {e}")
                             
@@ -492,17 +499,25 @@ class TavilyHardwareAgent:
         if state.get("bestOffer"):
             try:
                 best = state["bestOffer"]
-                primary_comp_id = f"comp-{re.sub(r'[^a-z0-9]+', '-', clean_prompt.lower())}"
+                primary_comp_id = f"comp-{re.sub(r'[^a-z0-9]+', '-', clean_prompt.lower())[:70].strip('-')}"
                 
-                # Fetch all watchlist rows for this component across all users
-                all_wl_res = await asyncio.to_thread(
-                    supabase.table('watchlist_items')
-                    .select('*')
-                    .or_(f"component_id.eq.{primary_comp_id},component_name.ilike.%{clean_prompt}%")
-                    .execute
-                )
+                # Sanitize search term without commas, periods, or special characters to prevent PostgREST parse errors
+                clean_keyword = re.sub(r'[^a-zA-Z0-9\s]', ' ', clean_prompt).strip()
+                short_keyword = re.sub(r'\s+', ' ', clean_keyword).split(' - ')[0].strip()[:30]
 
-                if all_wl_res.data and len(all_wl_res.data) > 0:
+                # Fetch matching watchlist rows across all users
+                try:
+                    all_wl_res = await asyncio.to_thread(
+                        supabase.table('watchlist_items')
+                        .select('*')
+                        .ilike('component_name', f"%{short_keyword}%")
+                        .execute
+                    )
+                except Exception as query_err:
+                    print(f"[Watchlist Query Notice]: {query_err}")
+                    all_wl_res = None
+
+                if all_wl_res and all_wl_res.data and len(all_wl_res.data) > 0:
                     frontend_url = os.environ.get("FRONTEND_URL", "https://rigscouter.ishaankoradia.com")
                     for row in all_wl_res.data:
                         r_id = row['id']
@@ -550,7 +565,7 @@ class TavilyHardwareAgent:
         if user_id and pending_id and state.get("bestOffer"):
             try:
                 best = state["bestOffer"]
-                primary_comp_id = f"comp-{re.sub(r'[^a-z0-9]+', '-', clean_prompt.lower())}"
+                primary_comp_id = f"comp-{re.sub(r'[^a-z0-9]+', '-', clean_prompt.lower())[:70].strip('-')}"
                 
                 # Check if this user already has an entry for this clean_prompt / component_id
                 existing_check = supabase.table('watchlist_items').select('*').eq('component_id', primary_comp_id)
