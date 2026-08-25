@@ -69,28 +69,101 @@ DEFAULT_PARTS_CATALOG = [
     'WD Black SN850X 1TB',
 ]
 
-async def get_dynamic_parts_queue() -> list[str]:
-    """Dynamically fetches active user-monitored watchlist items and trending components."""
+async def get_dynamic_parts_queue() -> list[dict]:
+    """Dynamically fetches active user-monitored watchlist items and catalog components with exact product URLs."""
+    items: list[dict] = []
+    seen_urls: set[str] = set()
+    seen_names: set[str] = set()
+
     try:
-        wl_res = await asyncio.to_thread(
-            supabase.table('watchlist_items').select('component_name').limit(50).execute
-        )
-        parts = [r['component_name'] for r in (wl_res.data or []) if r.get('component_name')]
-
+        # 1. Fetch hardware components first to build product_url lookup index
         hw_res = await asyncio.to_thread(
-            supabase.table('hardware_components').select('model, name').order('deal_score', desc=True).limit(25).execute
+            supabase.table('hardware_components')
+            .select('id, name, model, category, brand, current_price, msrp, retailer, product_url, lowest_price_90d')
+            .order('deal_score', desc=True)
+            .limit(50)
+            .execute
         )
-        for r in (hw_res.data or []):
-            item_name = r.get('model') or r.get('name')
-            if item_name and item_name not in parts:
-                parts.append(item_name)
+        hw_data = hw_res.data or []
+        hw_by_id = {r['id']: r for r in hw_data if r.get('id')}
+        hw_by_model = {r['model'].lower(): r for r in hw_data if r.get('model')}
 
-        if parts:
-            return parts
+        # 2. Fetch user watchlist items (highest priority)
+        wl_res = await asyncio.to_thread(
+            supabase.table('watchlist_items')
+            .select('id, user_id, component_name, component_id, category, target_price, all_time_low')
+            .limit(50)
+            .execute
+        )
+        for r in (wl_res.data or []):
+            name = r.get('component_name')
+            if not name:
+                continue
+
+            comp_id = r.get('component_id') or ''
+            # Look up linked hardware component
+            matched_hw = hw_by_id.get(comp_id)
+            if not matched_hw and comp_id:
+                # Try prefix match (e.g. comp-asus-prime-q270m matches comp-asus-prime-q270m-amazon)
+                for h_id, h_row in hw_by_id.items():
+                    if h_id.startswith(comp_id) or comp_id.startswith(h_id):
+                        matched_hw = h_row
+                        break
+            if not matched_hw:
+                matched_hw = hw_by_model.get(name.lower())
+
+            url = matched_hw.get('product_url') if matched_hw else None
+            retailer = matched_hw.get('retailer') if matched_hw else 'Amazon'
+            current_price = float(matched_hw.get('current_price') or r.get('all_time_low') or 0.0) if matched_hw else float(r.get('all_time_low') or 0.0)
+
+            clean_url = url.strip() if (url and url.startswith('http') and url != '#') else None
+            key = clean_url or name.lower()
+            if key not in seen_urls and key not in seen_names:
+                if clean_url:
+                    seen_urls.add(clean_url)
+                seen_names.add(name.lower())
+                items.append({
+                    "id": r.get('id'),
+                    "userId": r.get('user_id'),
+                    "name": name,
+                    "category": r.get('category') or 'GPU',
+                    "targetPrice": float(r['target_price']) if r.get('target_price') else 0.0,
+                    "currentPrice": current_price,
+                    "retailer": retailer,
+                    "url": clean_url,
+                    "notify": True
+                })
+
+        # 3. Append remaining top catalog components
+        for r in hw_data:
+            name = r.get('model') or r.get('name')
+            url = r.get('product_url')
+            if not name:
+                continue
+
+            clean_url = url.strip() if (url and url.startswith('http') and url != '#') else None
+            key = clean_url or name.lower()
+            if key not in seen_urls and key not in seen_names:
+                if clean_url:
+                    seen_urls.add(clean_url)
+                seen_names.add(name.lower())
+                items.append({
+                    "id": r.get('id'),
+                    "name": name,
+                    "category": r.get('category') or 'GPU',
+                    "currentPrice": float(r.get('current_price') or 0.0),
+                    "retailer": r.get('retailer') or 'Amazon',
+                    "url": clean_url,
+                    "notify": False
+                })
+
+        if items:
+            return items
     except Exception as e:
         print(f"[Dynamic Parts Queue Notice]: {e}")
 
-    return DEFAULT_PARTS_CATALOG
+    # Fallback to DEFAULT_PARTS_CATALOG if DB is empty
+    return [{"name": part, "url": None, "retailer": "Amazon", "category": "GPU"} for part in DEFAULT_PARTS_CATALOG]
 
 # ─── Scheduler State ──────────────────────────────────────────────────────────
 scheduler_state = {
@@ -107,23 +180,49 @@ async def run_scheduler_tick():
 
     scheduler_state["schedulerRunning"] = True
     queue = await get_dynamic_parts_queue()
-    part = queue[scheduler_state["schedulerQueueIndex"] % len(queue)]
+    if not queue:
+        scheduler_state["schedulerRunning"] = False
+        return
+
+    item = queue[scheduler_state["schedulerQueueIndex"] % len(queue)]
     scheduler_state["schedulerQueueIndex"] += 1
     scheduler_state["lastSchedulerRun"] = datetime.now(timezone.utc).isoformat()
 
-    print(f"\n[Scheduler] ⏱ Auto-updating daily prices for: \"{part}\" ({scheduler_state['schedulerQueueIndex']}/{len(queue)})")
+    item_name = item.get("name") if isinstance(item, dict) else str(item)
+    item_url = item.get("url") if isinstance(item, dict) else None
+    retailer = item.get("retailer") if isinstance(item, dict) else "Online Retailer"
+
+    print(f"\n[Scheduler] ⏱ Auto-updating daily prices for: \"{item_name}\" ({scheduler_state['schedulerQueueIndex']}/{len(queue)})")
     broadcast_sse('scheduler_tick', {
-        "query": part,
+        "query": item_name,
+        "url": item_url,
+        "retailer": retailer,
         "queueIndex": scheduler_state["schedulerQueueIndex"],
         "timestamp": scheduler_state["lastSchedulerRun"]
     })
 
     try:
-        await agent.run(part, agent_sse_emitter)
+        direct_success = False
+        # Phase 1: Try Direct Product URL scraping first (instant, 100% accurate, zero search credits)
+        if item_url and item_url.startswith('http'):
+            print(f"[Scheduler Direct URL] 🎯 Checking exact product URL ({retailer}): {item_url}")
+            try:
+                offer = await agent.refresh_direct_item(item, agent_sse_emitter)
+                if offer and offer.get('price', 0) > 0:
+                    print(f"✅ [Scheduler Direct URL Success] Refreshed \"{item_name}\" -> ${offer['price']:.2f} at {offer.get('retailer', retailer)}")
+                    direct_success = True
+            except Exception as direct_err:
+                print(f"⚠️ [Scheduler Direct URL Notice] Failed direct URL refresh for \"{item_name}\": {direct_err}")
+
+        # Phase 2: Fallback to Multi-Retailer Agent Search if no direct URL or direct scrape failed
+        if not direct_success:
+            print(f"[Scheduler Multi-Retailer Search] Running full agent search across retailers for: \"{item_name}\"")
+            await agent.run(item_name, agent_sse_emitter, user_id=item.get('userId') if isinstance(item, dict) else None)
+
     except Exception as e:
-        print(f"[Scheduler Error] \"{part}\":", str(e))
+        print(f"[Scheduler Error] \"{item_name}\":", str(e))
         broadcast_sse('scheduler_error', {
-            "query": part,
+            "query": item_name,
             "error": str(e),
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
@@ -143,13 +242,15 @@ async def scheduler_loop():
 @app.get("/")
 async def root():
     queue = await get_dynamic_parts_queue()
+    next_item = queue[scheduler_state["schedulerQueueIndex"] % len(queue)] if queue else None
+    next_name = next_item.get('name') if isinstance(next_item, dict) else str(next_item) if next_item else "N/A"
     return {
         "status": "ok",
         "service": "RigScouter-AI Backend Proxy & Autonomous Tavily Agent",
         "databaseConnected": True,
         "schedulerActive": True,
         "intervalMinutes": SCHEDULER_INTERVAL_SECONDS / 60,
-        "nextScheduledPart": queue[scheduler_state["schedulerQueueIndex"] % len(queue)],
+        "nextScheduledPart": next_name,
         "trackedCount": len(queue),
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
@@ -165,12 +266,14 @@ async def health():
 @app.get("/api/status")
 async def api_status():
     queue = await get_dynamic_parts_queue()
+    next_item = queue[scheduler_state["schedulerQueueIndex"] % len(queue)] if queue else None
+    next_name = next_item.get('name') if isinstance(next_item, dict) else str(next_item) if next_item else None
     return {
         "schedulerRunning": scheduler_state["schedulerRunning"],
         "lastSchedulerRun": scheduler_state["lastSchedulerRun"],
         "schedulerQueueIndex": scheduler_state["schedulerQueueIndex"],
-        "nextPart": queue[scheduler_state["schedulerQueueIndex"] % len(queue)] if queue else None,
-        "partsQueue": queue,
+        "nextPart": next_name,
+        "partsQueue": [item.get('name') if isinstance(item, dict) else str(item) for item in queue],
         "totalParts": len(queue),
         "intervalMinutes": SCHEDULER_INTERVAL_SECONDS / 60,
         "connectedSseClients": len(sse_clients),
@@ -182,13 +285,20 @@ async def api_status():
 async def trigger_daily_update(background_tasks: BackgroundTasks, limit: int = 10):
     """Refreshes live prices across tracked hardware components and records timestamped PriceHistory snapshots."""
     queue = await get_dynamic_parts_queue()
-    items_to_update = queue[:limit] if queue else DEFAULT_PARTS_CATALOG[:limit]
+    items_to_update = queue[:limit] if queue else [{"name": p, "url": None} for p in DEFAULT_PARTS_CATALOG[:limit]]
     
     async def run_batch():
         print(f"\n[Batch Update] 🚀 Starting daily refresh for {len(items_to_update)} components...")
-        for item_name in items_to_update:
+        for item in items_to_update:
+            item_name = item.get("name") if isinstance(item, dict) else str(item)
+            item_url = item.get("url") if isinstance(item, dict) else None
             try:
-                print(f"[Batch Update] Scraping: \"{item_name}\" across Amazon, Newegg, Micro Center, B&H, eBay...")
+                if item_url and item_url.startswith('http'):
+                    print(f"[Batch Update Direct URL] Checking exact URL: {item_url}")
+                    offer = await agent.refresh_direct_item(item, agent_sse_emitter)
+                    if offer and offer.get('price', 0) > 0:
+                        continue
+                print(f"[Batch Update Search] Scraping: \"{item_name}\" across retailers...")
                 await agent.run(item_name, agent_sse_emitter)
             except Exception as err:
                 print(f"[Batch Update Error] \"{item_name}\": {err}")
@@ -198,7 +308,7 @@ async def trigger_daily_update(background_tasks: BackgroundTasks, limit: int = 1
     return {
         "status": "started",
         "message": f"Daily price update initiated for {len(items_to_update)} component(s) in background.",
-        "components": items_to_update,
+        "components": [item.get('name') if isinstance(item, dict) else str(item) for item in items_to_update],
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
@@ -210,7 +320,8 @@ async def stream(request: Request):
     async def event_generator():
         try:
             queue = await get_dynamic_parts_queue()
-            next_part = queue[scheduler_state["schedulerQueueIndex"] % len(queue)] if queue else "N/A"
+            next_item = queue[scheduler_state["schedulerQueueIndex"] % len(queue)] if queue else None
+            next_part = next_item.get('name') if isinstance(next_item, dict) else str(next_item) if next_item else "N/A"
             # Initial connection event
             yield {
                 "event": "connected",

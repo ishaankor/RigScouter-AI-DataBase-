@@ -358,6 +358,9 @@ class TavilyHardwareAgent:
             clean_prompt = cat_result.get('model') or offer.get('title', clean_prompt)
             state["userQuery"] = clean_prompt
 
+            # Persist direct page offer to hardware_components & PriceHistory
+            await self.persist_hardware_offer(offer, clean_prompt, category)
+
             if emit_fn:
                 emit_fn('retailer_found', {
                     "query": clean_prompt,
@@ -399,72 +402,7 @@ class TavilyHardwareAgent:
 
                     if offer and offer.get('price', 0) > 0:
                         state["scrapedOffers"].append(offer)
-                        
-                        try:
-                            clean_slug = re.sub(r'[^a-z0-9]+', '-', clean_prompt.lower())[:70].strip('-')
-                            ret_slug = offer['retailer'].lower().replace(' ', '-')[:20]
-                            comp_id = f"comp-{clean_slug}-{ret_slug}"[:95]
-                            
-                            # Preserve and append to PriceHistory
-                            existing_specs = {}
-                            offer_lowest_90d = offer['price']
-                            try:
-                                exist_check = await asyncio.to_thread(supabase.table('hardware_components').select('specs, lowest_price_90d').eq('id', comp_id).execute)
-                                if exist_check.data and len(exist_check.data) > 0:
-                                    raw_s = exist_check.data[0].get('specs')
-                                    existing_specs = json.loads(raw_s) if isinstance(raw_s, str) else (raw_s or {})
-                                    if exist_check.data[0].get('lowest_price_90d'):
-                                        offer_lowest_90d = min(float(exist_check.data[0]['lowest_price_90d']), float(offer['price']))
-                            except Exception:
-                                pass
-
-                            price_history = existing_specs.get('PriceHistory', [])
-                            price_history.append({
-                                "price": offer['price'],
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                                "inStock": offer['inStock']
-                            })
-                            if len(price_history) > 180:
-                                price_history = price_history[-180:]
-
-                            # Calculate deal score for offer
-                            orig_p = offer.get('originalPrice') or offer['price']
-                            if orig_p and orig_p > offer['price']:
-                                discount_pct = (orig_p - offer['price']) / orig_p
-                                offer_deal_score = min(99, int(60 + discount_pct * 100))
-                            elif offer['price'] <= offer_lowest_90d:
-                                offer_deal_score = 90
-                            else:
-                                offer_deal_score = 60
-
-                            query1 = supabase.table('hardware_components').upsert({
-                                "id": comp_id,
-                                "name": (offer['title'] or "Hardware Component")[:250],
-                                "category": category[:50],
-                                "brand": (offer['title'].split()[0] if offer['title'] else "Hardware")[:50],
-                                "model": clean_prompt[:95],
-                                "specs": json.dumps({
-                                    "AgentSummary": "Live Autonomous Scraping Engine",
-                                    "InStock": offer['inStock'],
-                                    "IsRefurbished": offer.get('isRefurbished', False),
-                                    "OriginalPrice": offer.get('originalPrice'),
-                                    "ScrapedAt": datetime.now(timezone.utc).isoformat(),
-                                    "PriceHistory": price_history
-                                }),
-                                "msrp": offer.get('originalPrice') or offer['price'],
-                                "current_price": offer['price'],
-                                "lowest_price_90d": offer_lowest_90d,
-                                "retailer": offer['retailer'][:50],
-                                "product_url": offer['url'],
-                                "image_url": offer.get('imageUrl') or "https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=600&q=80",
-                                "rating": offer.get('rating'),
-                                "deal_score": offer_deal_score,
-                                "updated_at": datetime.now(timezone.utc).isoformat()
-                            })
-                            await asyncio.to_thread(query1.execute)
-                            print(f"[DB Persist Success] Saved \"{offer['retailer']}\" offer: \"{offer['title'][:60]}\" (${offer['price']:.2f}) with PriceHistory ({len(price_history)} snapshots)")
-                        except Exception as e:
-                            print(f"[Agent Incremental Persistence Error]: {e}")
+                        await self.persist_hardware_offer(offer, clean_prompt, category)
                             
                         if emit_fn:
                             emit_fn('retailer_found', {
@@ -665,7 +603,200 @@ class TavilyHardwareAgent:
                 "timestamp": datetime.now(timezone.utc).isoformat()
             })
 
-        return state
+    async def persist_hardware_offer(self, offer: dict, model_name: str, category: str, comp_id_override: str = None) -> dict | None:
+        """Saves or updates a retailer offer in hardware_components, recording timestamped PriceHistory."""
+        if not offer or offer.get('price', 0) <= 0:
+            return None
+
+        try:
+            clean_slug = re.sub(r'[^a-z0-9]+', '-', (model_name or 'hardware').lower())[:70].strip('-')
+            ret_slug = (offer.get('retailer') or 'retailer').lower().replace(' ', '-')[:20]
+            comp_id = comp_id_override if comp_id_override and str(comp_id_override).startswith('comp-') else f"comp-{clean_slug}-{ret_slug}"[:95]
+
+            # Preserve and append to PriceHistory
+            existing_specs = {}
+            offer_lowest_90d = float(offer['price'])
+            try:
+                exist_check = await asyncio.to_thread(supabase.table('hardware_components').select('specs, lowest_price_90d').eq('id', comp_id).execute)
+                if exist_check.data and len(exist_check.data) > 0:
+                    raw_s = exist_check.data[0].get('specs')
+                    existing_specs = json.loads(raw_s) if isinstance(raw_s, str) else (raw_s or {})
+                    if exist_check.data[0].get('lowest_price_90d'):
+                        offer_lowest_90d = min(float(exist_check.data[0]['lowest_price_90d']), float(offer['price']))
+            except Exception:
+                pass
+
+            price_history = existing_specs.get('PriceHistory', [])
+            now_iso = datetime.now(timezone.utc).isoformat()
+            price_history.append({
+                "price": float(offer['price']),
+                "timestamp": now_iso,
+                "inStock": bool(offer.get('inStock', True))
+            })
+            if len(price_history) > 180:
+                price_history = price_history[-180:]
+
+            # Calculate deal score
+            orig_p = float(offer.get('originalPrice') or offer['price'])
+            current_p = float(offer['price'])
+            if orig_p and orig_p > current_p:
+                discount_pct = (orig_p - current_p) / orig_p
+                offer_deal_score = min(99, int(60 + discount_pct * 100))
+            elif current_p <= offer_lowest_90d:
+                offer_deal_score = 90
+            else:
+                offer_deal_score = 60
+
+            hw_payload = {
+                "id": comp_id,
+                "name": (offer.get('title') or model_name or "Hardware Component")[:250],
+                "category": category[:50],
+                "brand": (offer.get('title', '').split()[0] if offer.get('title') else "Hardware")[:50],
+                "model": (model_name or "Hardware Component")[:95],
+                "specs": json.dumps({
+                    "AgentSummary": "Live Autonomous Scraping Engine",
+                    "InStock": bool(offer.get('inStock', True)),
+                    "IsRefurbished": bool(offer.get('isRefurbished', False)),
+                    "OriginalPrice": orig_p,
+                    "ScrapedAt": now_iso,
+                    "PriceHistory": price_history
+                }),
+                "msrp": orig_p,
+                "current_price": current_p,
+                "lowest_price_90d": offer_lowest_90d,
+                "retailer": (offer.get('retailer') or 'Retailer')[:50],
+                "product_url": offer.get('url') or '',
+                "image_url": offer.get('imageUrl') or "https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=600&q=80",
+                "rating": offer.get('rating') or 4.8,
+                "deal_score": offer_deal_score,
+                "updated_at": now_iso
+            }
+            await asyncio.to_thread(supabase.table('hardware_components').upsert(hw_payload).execute)
+            print(f"[DB Persist Success] Saved \"{offer.get('retailer')}\" offer: \"{offer.get('title', '')[:60]}\" (${current_p:.2f}) with PriceHistory ({len(price_history)} snapshots)")
+            return hw_payload
+        except Exception as e:
+            print(f"[Agent Incremental Persistence Error]: {e}")
+            return None
+
+    async def refresh_direct_item(self, item: dict, emit_fn=None) -> dict | None:
+        """
+        Directly refreshes a single item from its verified product_url:
+        - Extracts price and stock status via direct HTTP (fallback to Firecrawl)
+        - Upserts hardware_components with PriceHistory append
+        - Updates matching watchlist_items (current_price, all_time_low, previous_price_24h)
+        - Dispatches instant target-met email notifications if threshold reached
+        - Emits real-time SSE events
+        """
+        url = item.get('url') or item.get('product_url')
+        if not url or not (url.startswith('http://') or url.startswith('https://')):
+            return None
+
+        component_name = item.get('name') or item.get('component_name') or item.get('model') or 'Hardware Component'
+        category = item.get('category') or 'GPU'
+        retailer_name = item.get('retailer') or self.detect_retailer(url)
+
+        print(f"[Direct URL Scraper] 🎯 Fetching exact URL for: \"{component_name}\" ({retailer_name}) -> {url}")
+        
+        offer = await self.extract_direct_page(url, retailer_name, category, model_query=None)
+        if not offer or offer.get('blocked') or offer.get('price', 0) <= 0:
+            print(f"⚠️ [Direct URL Scraper Notice] Unable to extract live price from: {url}")
+            return None
+
+        clean_title = offer.get('title') or component_name
+        price = float(offer['price'])
+        in_stock = bool(offer.get('inStock', True))
+        is_refurbished = bool(offer.get('isRefurbished', False))
+        original_price = float(offer.get('originalPrice') or price)
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # Persist to hardware_components with PriceHistory
+        await self.persist_hardware_offer(offer, component_name, category, comp_id_override=item.get('id'))
+
+        # Update watchlist_items across matching users
+        try:
+            clean_keyword = re.sub(r'[^a-zA-Z0-9\s]', ' ', component_name).strip()
+            short_keyword = re.sub(r'\s+', ' ', clean_keyword).split(' - ')[0].strip()[:30]
+            
+            wl_query = supabase.table('watchlist_items').select('*')
+            if item.get('userId'):
+                wl_query = wl_query.eq('user_id', item['userId'])
+            if short_keyword:
+                wl_query = wl_query.ilike('component_name', f"%{short_keyword}%")
+            
+            wl_res = await asyncio.to_thread(wl_query.execute)
+            if wl_res.data:
+                frontend_url = os.environ.get("FRONTEND_URL", "https://rigscouter.ishaankoradia.com")
+                for row in wl_res.data:
+                    r_id = row['id']
+                    r_user_id = row.get('user_id')
+                    target_price = float(row.get('target_price') or 0)
+                    prior_price = row.get('current_price') or row.get('all_time_low')
+                    prior_atl = float(row.get('all_time_low') or price)
+                    alerts_on = row.get('notify_on_flash_drop', True)
+
+                    update_payload = {
+                        "all_time_low": min(prior_atl, price),
+                    }
+                    if prior_price and prior_price != price:
+                        update_payload["previous_price_24h"] = prior_price
+
+                    await asyncio.to_thread(supabase.table('watchlist_items').update(update_payload).eq('id', r_id).execute)
+
+                    # Trigger instant email notification if target met
+                    if target_price > 0 and price <= target_price and alerts_on:
+                        try:
+                            async with httpx.AsyncClient(timeout=4.0) as client:
+                                await client.post(
+                                    f"{frontend_url}/api/notifications/target-met",
+                                    json={
+                                        "userId": r_user_id,
+                                        "componentName": row.get('component_name') or clean_title,
+                                        "category": category,
+                                        "targetPrice": target_price,
+                                        "currentPrice": price,
+                                        "retailer": retailer_name,
+                                        "productUrl": url,
+                                    }
+                                )
+                                print(f"[ASAP Alert Dispatched] Scraped price ${price:.2f} <= target ${target_price:.2f} for user {r_user_id} on '{clean_title}'")
+                        except Exception as alert_e:
+                            print(f"[ASAP Alert Dispatch Warning]: {alert_e}")
+        except Exception as wl_err:
+            print(f"[Direct URL Watchlist Update Warning]: {wl_err}")
+
+        # Emit SSE
+        if emit_fn:
+            emit_fn('retailer_found', {
+                "query": component_name,
+                "original_query": component_name,
+                "retailer": retailer_name,
+                "price": price,
+                "title": clean_title,
+                "url": url,
+                "inStock": in_stock,
+                "isRefurbished": is_refurbished,
+                "timestamp": now_iso
+            })
+            emit_fn('agent_complete', {
+                "query": component_name,
+                "original_query": component_name,
+                "category": category,
+                "bestOffer": {
+                    "retailer": retailer_name,
+                    "price": price,
+                    "title": clean_title,
+                    "url": url,
+                    "inStock": in_stock,
+                    "isRefurbished": is_refurbished,
+                    "originalPrice": original_price
+                },
+                "allOffers": [offer],
+                "is_error": False,
+                "summary": f"Direct product URL updated: ${price:.2f} at {retailer_name} ({'In Stock' if in_stock else 'Out of Stock'}).",
+                "timestamp": now_iso
+            })
+
+        return offer
 
     async def extract_direct_page(self, url: str, retailer_name: str, category: str, model_query: str = None) -> dict:
         offer = await self.direct_http_extract(url, retailer_name, category, model_query)
