@@ -314,8 +314,57 @@ class TavilyHardwareAgent:
 
         if is_url:
             offer = await self.extract_direct_page(clean_prompt, self.detect_retailer(clean_prompt), category)
-            if offer:
-                state["scrapedOffers"].append(offer)
+            if not offer or offer.get('blocked') or offer.get('price', 0) <= 0:
+                print(f"⚠️ [Direct Page Extraction Failed] Could not extract price from {clean_prompt}")
+                state["summary"] = f"Unable to extract live pricing from \"{clean_prompt}\". The retailer page may be bot-protected or unavailable."
+                if emit_fn:
+                    emit_fn('agent_error', {
+                        "query": clean_prompt,
+                        "original_query": prompt.strip(),
+                        "error_type": "NO_OFFERS_FOUND",
+                        "message": state["summary"],
+                        "pending_id": pending_id,
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    })
+                    emit_fn('agent_complete', {
+                        "query": clean_prompt,
+                        "original_query": prompt.strip(),
+                        "category": category,
+                        "bestOffer": None,
+                        "allOffers": [],
+                        "is_error": True,
+                        "error_type": "NO_OFFERS_FOUND",
+                        "summary": state["summary"],
+                        "pending_id": pending_id,
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    })
+                return state
+
+            state["scrapedOffers"].append(offer)
+            # Classify the actual product title extracted from the page
+            cat_result = await self.analyze_query_with_groq(offer.get('title', ''))
+            if cat_result and cat_result.get('category') and cat_result.get('category') != 'Not compatible (N/A)':
+                category = cat_result['category']
+            else:
+                detected_cat = await self.detect_category(offer.get('title', ''))
+                if detected_cat:
+                    category = detected_cat
+            state["category"] = category
+            clean_prompt = cat_result.get('model') or offer.get('title', clean_prompt)
+            state["userQuery"] = clean_prompt
+
+            if emit_fn:
+                emit_fn('retailer_found', {
+                    "query": clean_prompt,
+                    "original_query": prompt.strip(),
+                    "retailer": offer.get('retailer', 'Online Retailer'),
+                    "price": offer['price'],
+                    "title": offer['title'],
+                    "url": offer['url'],
+                    "inStock": offer.get('inStock', True),
+                    "isRefurbished": offer.get('isRefurbished', False),
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                })
         else:
             RETAILERS = [
                 {'name': 'Micro Center', 'domain': 'microcenter.com'},
@@ -428,7 +477,7 @@ class TavilyHardwareAgent:
 
         # Sort all scraped retailer offers: Available (inStock) items first, then lowest price
         def sort_offers(offer):
-            return (0 if offer['inStock'] else 1, offer['price'])
+            return (0 if offer.get('inStock', True) else 1, offer.get('price', 999999))
 
         state["scrapedOffers"].sort(key=sort_offers)
 
@@ -439,7 +488,65 @@ class TavilyHardwareAgent:
         else:
             state["summary"] = f"No live prices found across retailers for \"{clean_prompt}\"."
 
-        # Single consolidated user watchlist entry
+        # Check all users in watchlist_items tracking this component and dispatch alerts ASAP
+        if state.get("bestOffer"):
+            try:
+                best = state["bestOffer"]
+                primary_comp_id = f"comp-{re.sub(r'[^a-z0-9]+', '-', clean_prompt.lower())}"
+                
+                # Fetch all watchlist rows for this component across all users
+                all_wl_res = await asyncio.to_thread(
+                    supabase.table('watchlist_items')
+                    .select('*')
+                    .or_(f"component_id.eq.{primary_comp_id},component_name.ilike.%{clean_prompt}%")
+                    .execute
+                )
+
+                if all_wl_res.data and len(all_wl_res.data) > 0:
+                    frontend_url = os.environ.get("FRONTEND_URL", "https://rigscouter.ishaankoradia.com")
+                    for row in all_wl_res.data:
+                        r_id = row['id']
+                        r_user_id = row.get('user_id')
+                        target_price = float(row.get('target_price') or 0)
+                        prior_price = row.get('current_price') or row.get('all_time_low')
+                        prior_atl = float(row.get('all_time_low') or best['price'])
+                        alerts_on = row.get('notify_on_flash_drop', True)
+
+                        # Update row's price tracking
+                        update_payload = {
+                            "current_price": best['price'],
+                            "all_time_low": min(prior_atl, best['price']),
+                        }
+                        if prior_price and prior_price != best['price']:
+                            update_payload["previous_price_24h"] = prior_price
+
+                        await asyncio.to_thread(
+                            supabase.table('watchlist_items').update(update_payload).eq('id', r_id).execute
+                        )
+
+                        # If new price meets target price AND alerts enabled -> send email ASAP!
+                        if target_price > 0 and best['price'] <= target_price and alerts_on:
+                            try:
+                                async with httpx.AsyncClient(timeout=4.0) as client:
+                                    await client.post(
+                                        f"{frontend_url}/api/notifications/target-met",
+                                        json={
+                                            "userId": r_user_id,
+                                            "componentName": row.get('component_name') or best.get('title') or clean_prompt,
+                                            "category": category,
+                                            "targetPrice": target_price,
+                                            "currentPrice": float(best['price']),
+                                            "retailer": best.get('retailer', 'Amazon'),
+                                            "productUrl": best.get('url', '#'),
+                                        }
+                                    )
+                                    print(f"[ASAP Alert Dispatched] Scraped price ${best['price']:.2f} <= target ${target_price:.2f} for user {r_user_id} on '{clean_prompt}'")
+                            except Exception as alert_e:
+                                print(f"[ASAP Alert Dispatch Warning]: {alert_e}")
+            except Exception as glob_wl_e:
+                print(f"[Global Watchlist Check Warning]: {glob_wl_e}")
+
+        # Single consolidated user watchlist entry for on-demand additions
         if user_id and pending_id and state.get("bestOffer"):
             try:
                 best = state["bestOffer"]
@@ -457,10 +564,12 @@ class TavilyHardwareAgent:
                     prior_price = existing_row.get('current_price') or existing_row.get('all_time_low')
                     prior_atl = existing_row.get('all_time_low') or best['price']
 
+                    existing_target = existing_row.get('target_price')
+                    effective_target = float(existing_target) if existing_target and float(existing_target) > 0 else round(best['price'] * 0.9, 2)
                     wl_row = {
                         "component_name": best.get('title') or clean_prompt,
                         "category": category,
-                        "target_price": round(best['price'] * 0.9, 2),
+                        "target_price": effective_target,
                         "previous_price_24h": prior_price if prior_price and prior_price != best['price'] else existing_row.get('previous_price_24h', best['price']),
                         "all_time_low": min(prior_atl, best['price']),
                     }
@@ -1002,7 +1111,7 @@ class TavilyHardwareAgent:
                 async with httpx.AsyncClient() as client:
                     res = await client.post('https://api.tavily.com/search', json={
                         "api_key": self.get_tavily_key(),
-                        "query": f"buy {model_query} price",
+                        "query": f"buy {model_query} lowest price in stock",
                         "search_depth": "advanced",
                         "include_domains": [domain_pattern],
                         "include_raw_content": False,
@@ -1030,16 +1139,34 @@ class TavilyHardwareAgent:
                         continue
                         
                     clean_url = full_url.replace('/reviews/', '').split('?')[0]
+                    
+                    # Extract price hint from search blurb to prioritize evaluating lowest priced listings first
+                    price_hint = 999999.0
+                    combined_text = (hit.get('content', '') or '') + ' ' + (hit.get('title', '') or '')
+                    pm = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', combined_text)
+                    if pm:
+                        try:
+                            val = float(pm.group(1).replace(',', ''))
+                            if val > 5.0: # filter out $0 or $1 coupon text
+                                price_hint = val
+                        except ValueError:
+                            pass
+
                     valid_hits.append({
                         'url': clean_url,
-                        'title': hit.get('title', '')
+                        'title': hit.get('title', ''),
+                        'price_hint': price_hint
                     })
 
                 if not valid_hits:
                     return None
                     
-                # Try direct extraction on candidate URLs
-                for candidate in valid_hits[:5]:
+                # Sort candidate product URLs by lowest price hint first
+                valid_hits.sort(key=lambda x: x.get('price_hint', 999999.0))
+
+                # Evaluate top 2 lowest-priced candidate URLs
+                valid_offers = []
+                for candidate in valid_hits[:2]:
                     # 1. Try Direct HTTP fetch first (fast, browser headers, 0 credit cost)
                     offer = await self.direct_http_extract(candidate['url'], retailer_name, category, model_query)
                     
@@ -1048,12 +1175,21 @@ class TavilyHardwareAgent:
                         offer = await self.firecrawl_extract(candidate['url'], retailer_name, category, model_query)
 
                     if offer:
+                        if offer.get('blocked'):
+                            # WAF / HTTP2 block — abort remaining candidates for this retailer immediately
+                            break
                         if offer.get('out_of_stock') or not offer.get('inStock', True):
                             print(f"⚠️ [Confirmed Out of Stock] {retailer_name}: '{offer.get('title', candidate['title'])}' is out of stock / discontinued. Skipping to next candidate...")
                             continue
                         if offer.get('price', 0) > 0:
-                            print(f"✅ [CHEAPEST AVAILABLE {retailer_name.upper()} OFFER] \"${offer['price']}\" -> {offer['title'][:60]}")
-                            return offer
+                            valid_offers.append(offer)
+
+                if valid_offers:
+                    # Select the lowest priced verified in-stock offer for this retailer
+                    valid_offers.sort(key=lambda x: x['price'])
+                    lowest_offer = valid_offers[0]
+                    print(f"✅ [LOWEST CONFIRMED {retailer_name.upper()} OFFER] \"${lowest_offer['price']:.2f}\" (from {len(valid_offers)} option(s)) -> {lowest_offer['title'][:60]}")
+                    return lowest_offer
 
                 # Zero snippet guessing: If direct page scraping could not confirm an in-stock offer, return None
                 return None
@@ -1079,7 +1215,7 @@ class TavilyHardwareAgent:
             "Upgrade-Insecure-Requests": "1"
         }
         try:
-            async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=10.0) as client:
+            async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=8.0) as client:
                 res = await client.get(url)
                 if res.status_code == 200:
                     return await self.parse_page_content(res.text, "", url, retailer_name, category, model_query)
@@ -1097,7 +1233,7 @@ class TavilyHardwareAgent:
         try:
             try:
                 res = await asyncio.wait_for(
-                    asyncio.to_thread(lambda: app.scrape_url(url, formats=['html', 'markdown'])),
+                    asyncio.to_thread(lambda: app.scrape_url(url, formats=['html'])),
                     timeout=scrape_timeout
                 )
             except asyncio.TimeoutError:
@@ -1105,6 +1241,9 @@ class TavilyHardwareAgent:
                 return None
             except Exception as e:
                 error_str = str(e).lower()
+                if "err_http2_protocol_error" in error_str or "protocol_error" in error_str or "waf" in error_str:
+                    print(f"⚠️ [Bot WAF Block] {retailer_name} rejected scraper connection — skipping domain")
+                    return {"blocked": True}
                 if "payment" in error_str or "credits" in error_str or "401" in error_str or "402" in error_str or "rate limit" in error_str or "429" in error_str:
                     print(f"[Firecrawl] Rate/credit limit — skipping {url}")
                     return None
