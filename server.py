@@ -442,6 +442,47 @@ async def delete_watchlist(id: str):
     except Exception as e:
         return {"error": str(e)}
 
+@app.patch("/api/watchlist")
+@app.post("/api/watchlist/update-target")
+async def update_watchlist_target(request: Request):
+    try:
+        body = await request.json()
+        item_id = body.get("id")
+        ids = body.get("ids", [])
+        user_id = body.get("userId")
+        component_name = body.get("componentName")
+        target_price = body.get("targetPrice")
+        notify = body.get("notifyOnFlashDrop")
+
+        payload = {}
+        if target_price is not None:
+            payload["target_price"] = float(target_price)
+        if notify is not None:
+            payload["notify_on_flash_drop"] = bool(notify)
+
+        if not payload:
+            return {"error": "No updates provided"}
+
+        uuid_regex = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
+        target_ids = [item_id] + (ids if isinstance(ids, list) else [])
+        for tid in target_ids:
+            if not tid:
+                continue
+            clean_id = re.sub(r'^(w-|hw-|comp-)', '', str(tid))
+            if uuid_regex.match(clean_id):
+                q = supabase.table('watchlist_items').update(payload).eq('id', clean_id)
+                await asyncio.to_thread(q.execute)
+
+        if user_id and component_name:
+            clean_name = re.sub(r'[^a-zA-Z0-9\s]', ' ', component_name).strip()[:30]
+            if clean_name:
+                q2 = supabase.table('watchlist_items').update(payload).eq('user_id', user_id).ilike('component_name', f"%{clean_name}%")
+                await asyncio.to_thread(q2.execute)
+
+        return {"success": True, "updates": payload}
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.delete("/api/components/{id}")
 async def delete_component(id: str):
     try:
