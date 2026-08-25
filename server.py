@@ -465,21 +465,46 @@ async def update_watchlist_target(request: Request):
 
         uuid_regex = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
         target_ids = [item_id] + (ids if isinstance(ids, list) else [])
+        valid_uuids = []
         for tid in target_ids:
             if not tid:
                 continue
             clean_id = re.sub(r'^(w-|hw-|comp-)', '', str(tid))
             if uuid_regex.match(clean_id):
-                q = supabase.table('watchlist_items').update(payload).eq('id', clean_id)
-                await asyncio.to_thread(q.execute)
+                valid_uuids.append(clean_id)
 
-        if user_id and component_name:
+        matched_rows = []
+        if valid_uuids:
+            res = await asyncio.to_thread(supabase.table('watchlist_items').select('*').in_('id', valid_uuids).execute)
+            if res.data:
+                matched_rows.extend(res.data)
+
+        if user_id and component_name and not matched_rows:
             clean_name = re.sub(r'[^a-zA-Z0-9\s]', ' ', component_name).strip()[:30]
             if clean_name:
-                q2 = supabase.table('watchlist_items').update(payload).eq('user_id', user_id).ilike('component_name', f"%{clean_name}%")
-                await asyncio.to_thread(q2.execute)
+                res2 = await asyncio.to_thread(supabase.table('watchlist_items').select('*').eq('user_id', user_id).ilike('component_name', f"%{clean_name}%").execute)
+                if res2.data:
+                    matched_rows.extend(res2.data)
 
-        return {"success": True, "updates": payload}
+        # Atomic replace
+        for row in matched_rows:
+            await asyncio.to_thread(supabase.table('watchlist_items').delete().eq('id', row['id']).execute)
+            updated_row = {
+                "user_id": row.get("user_id"),
+                "component_id": row.get("component_id"),
+                "component_name": row.get("component_name"),
+                "category": row.get("category"),
+                "target_price": payload.get("target_price", row.get("target_price")),
+                "previous_price_24h": row.get("previous_price_24h"),
+                "previous_price_7d": row.get("previous_price_7d"),
+                "previous_price_30d": row.get("previous_price_30d"),
+                "all_time_low": row.get("all_time_low"),
+                "created_at": row.get("created_at"),
+                "added_at": row.get("added_at"),
+            }
+            await asyncio.to_thread(supabase.table('watchlist_items').insert(updated_row).execute)
+
+        return {"success": True, "updates": payload, "updatedCount": len(matched_rows)}
     except Exception as e:
         return {"error": str(e)}
 
