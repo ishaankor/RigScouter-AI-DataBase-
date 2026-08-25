@@ -1006,24 +1006,20 @@ class TavilyHardwareAgent:
             if t_elem: title = t_elem.text.strip()
 
         elif retailer_name == 'Newegg':
-            for sp in soup.select('[class*="sponsored"], .item-sponsored, .recommended-box, .swiper, .carousel, .featured-seller'):
+            for sp in soup.select('[class*="sponsored"], .item-sponsored, .recommended-box, .swiper, .carousel'):
                 sp.decompose()
-            main_pane = soup.select_one('.product-pane, .product-buy-box, .product-main, #product-details') or soup
-            price_elem = main_pane.select_one('.price-current')
-            if price_elem:
-                price_strong = price_elem.select_one('strong')
-                price_sup = price_elem.select_one('sup')
-                if price_strong:
-                    price_str = price_strong.text.replace('$', '').replace(',', '').strip()
-                    frac = price_sup.text.strip() if price_sup else ".00"
-                    try: price = float(f"{price_str}{frac}")
-                    except ValueError: pass
-                else:
-                    m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', price_elem.text)
-                    if m:
-                        try: price = float(m.group(1).replace(',', ''))
-                        except ValueError: pass
-            t_elem = main_pane.select_one('.product-title, h1.product-title, h1')
+            for price_elem in soup.select('.price-current, div.product-price, .price-product-cells'):
+                p_text = price_elem.text.replace('\xa0', ' ').strip()
+                m = re.search(r'\$?([0-9]{1,6}(?:\.[0-9]{2})?)', p_text)
+                if m:
+                    try:
+                        p_val = float(m.group(1).replace(',', ''))
+                        if p_val > 0:
+                            price = p_val
+                            break
+                    except ValueError:
+                        pass
+            t_elem = soup.select_one('h1.product-title, h1')
             if t_elem: title = t_elem.text.strip()
 
             inv = soup.select_one('.product-inventory')

@@ -88,30 +88,39 @@ async def get_dynamic_parts_queue() -> list[dict]:
         )
         hw_data = hw_res.data or []
 
+        retailer_priority = {'Amazon': 1, 'Micro Center': 2, 'Newegg': 3, 'B&H': 4, 'Best Buy': 5, 'eBay': 6}
+
         def find_best_hw_match(w_row: dict) -> dict | None:
             c_id = (w_row.get('component_id') or '').lower()
             c_name = (w_row.get('component_name') or '').lower()
 
+            matches = []
             # 1. Exact or prefix/suffix component ID match
             for h in hw_data:
                 h_id = h.get('id', '').lower()
                 if h_id and c_id and (h_id == c_id or h_id.startswith(c_id) or c_id.startswith(h_id)):
-                    return h
+                    matches.append(h)
 
             # 2. Extract key alphanumeric tokens (e.g. 2080, 4090, 7800x3d, nexxxos, q270m, vengeance)
-            clean_name = re.sub(r'[^a-z0-9\s]', ' ', c_name)
-            tokens = [t for t in clean_name.split() if len(t) > 2 and t not in ['the', 'and', 'for', 'with', 'edition', 'gaming', 'series', 'black', 'white', 'super', 'dual', 'triple']]
+            if not matches:
+                clean_name = re.sub(r'[^a-z0-9\s]', ' ', c_name)
+                tokens = [t for t in clean_name.split() if len(t) > 2 and t not in ['the', 'and', 'for', 'with', 'edition', 'gaming', 'series', 'black', 'white', 'super', 'dual', 'triple']]
+                for h in hw_data:
+                    h_text = f"{h.get('name', '')} {h.get('model', '')} {h.get('id', '')}".lower()
+                    score = sum(1 for t in tokens if t in h_text)
+                    if score >= 2:
+                        matches.append(h)
 
-            best_h = None
-            best_score = 0
-            for h in hw_data:
-                h_text = f"{h.get('name', '')} {h.get('model', '')} {h.get('id', '')}".lower()
-                score = sum(1 for t in tokens if t in h_text)
-                if score > best_score and score >= 2:
-                    best_score = score
-                    best_h = h
+            if not matches:
+                return None
 
-            return best_h
+            # Sort by retailer reliability (Amazon/Micro Center first) and presence of valid product URL
+            matches.sort(key=lambda m: (
+                0 if (m.get('product_url') and m.get('product_url').startswith('http') and m.get('product_url') != '#') else 1,
+                retailer_priority.get(m.get('retailer'), 99),
+                float(m.get('current_price') or 999999)
+            ))
+            return matches[0]
 
         # 2. Fetch user watchlist items (highest priority)
         wl_res = await asyncio.to_thread(
