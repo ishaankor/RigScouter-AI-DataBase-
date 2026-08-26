@@ -823,16 +823,19 @@ class TavilyHardwareAgent:
             return False
 
         # 2. Reject accessory and part replacement listings unless query explicitly requested it
-        ACCESSORY_KEYWORDS = [
-            'cable', '12vhpwr', 'adapter', 'bracket', 'backplate', 'anti-sag', 'holder', 'support bracket',
-            'water block', 'waterblock', 'block only', 'heatsink only', 'cooler only', 'shroud', 'replacement fan',
-            'gpu fan', 'case badge', 'sticker', 'poster', 'skin', 'wrap', 'keycap', 'mining rig', 'dummy card',
-            'chassis frame', 'riser cable', 'extension cable', 'sleeved cable', 'mounting kit', 'liquid cooler block',
-            'thermal pad', 'copper shim', 'stand only', 'empty box', 'decal'
-        ]
-        if not any(k in lower_q for k in ['cable', 'adapter', 'bracket', 'backplate', 'block', 'shroud', 'fan', 'pad', 'shim', 'mount', 'accessory']):
-            if any(re.search(r'\b' + re.escape(ak) + r'\b', lower_t) for ak in ACCESSORY_KEYWORDS):
-                return False
+        is_query_for_accessory = any(k in lower_q for k in ['cable', 'adapter', 'bracket', 'backplate', 'block', 'shroud', 'fan', 'pad', 'shim', 'mount', 'accessory', 'stand', 'holder'])
+        if not is_query_for_accessory:
+            accessory_indicators = [
+                r'\b(?:bracket|backplate|cable|adapter|shroud|heatsink|water\s*block|waterblock|gpu\s*fan|thermal\s*pad|copper\s*shim|holder|stand|mounting\s*kit)\s+(?:only|for\b)',
+                r'^(?:bracket|backplate|cable|adapter|shroud|heatsink|waterblock|fan|thermal\s*pad|holder|stand)\b',
+                r'\b(?:bracket|backplate|cable|adapter|shroud|heatsink|waterblock|fan|holder|stand)\s+only\b',
+                r'\b(?:riser\s*cable|extension\s*cable|12vhpwr\s*cable|12vhpwr\s*adapter|anti-sag\s*bracket|anti-sag\s*holder|gpu\s*support\s*bracket|gpu\s*holder|gpu\s*stand|power\s*cable)\b'
+            ]
+            is_full_card = any(w in lower_t for w in ['graphics card', 'video card', 'geforce rtx', 'geforce gtx', 'radeon rx', 'desktop processor', 'motherboard', 'desktop memory', 'solid state drive'])
+            has_exclusive_accessory = any(w in lower_t for w in ['only', 'stand for', 'bracket for', 'cable for', 'holder for', 'block for', 'cooler for'])
+            if not (is_full_card and not has_exclusive_accessory):
+                if any(re.search(pat, lower_t) for pat in accessory_indicators):
+                    return False
 
         # 3. Reject multi-model keyword stuffing spam (e.g. "RTX 5070 Ti 5080 5090" in title)
         found_gpus = re.findall(r'\b(5090|5080|5070\s*ti|5070|5060\s*ti|5060|4090|4080|4070\s*ti|4070|4060\s*ti|4060|3090|3080|3070|3060)\b', lower_t)
@@ -1008,17 +1011,30 @@ class TavilyHardwareAgent:
         elif retailer_name == 'Newegg':
             for sp in soup.select('[class*="sponsored"], .item-sponsored, .recommended-box, .swiper, .carousel'):
                 sp.decompose()
-            for price_elem in soup.select('.price-current, div.product-price, .price-product-cells'):
-                p_text = price_elem.text.replace('\xa0', ' ').strip()
-                m = re.search(r'\$?([0-9]{1,6}(?:\.[0-9]{2})?)', p_text)
-                if m:
+            for price_elem in soup.select('li.price-current, .product-buy-box .price-current, div.product-price .price-current, .price-current'):
+                price_strong = price_elem.select_one('strong')
+                price_sup = price_elem.select_one('sup')
+                if price_strong:
+                    price_str = price_strong.text.replace('$', '').replace(',', '').strip()
+                    frac = price_sup.text.strip() if price_sup else ".00"
                     try:
-                        p_val = float(m.group(1).replace(',', ''))
-                        if p_val > 0:
+                        p_val = float(f"{price_str}{frac}")
+                        if p_val >= 10.0:
                             price = p_val
                             break
                     except ValueError:
                         pass
+                else:
+                    p_text = price_elem.text.replace('\xa0', ' ').strip()
+                    m = re.search(r'\$?([0-9,]+(?:\.[0-9]{2})?)', p_text)
+                    if m:
+                        try:
+                            p_val = float(m.group(1).replace(',', ''))
+                            if p_val >= 10.0:
+                                price = p_val
+                                break
+                        except ValueError:
+                            pass
             t_elem = soup.select_one('h1.product-title, h1')
             if t_elem: title = t_elem.text.strip()
 
@@ -1219,6 +1235,24 @@ class TavilyHardwareAgent:
         if not offer or offer.get('price', 0) <= 0:
             return {"out_of_stock": True} if page_oos else None
 
+        price_val = float(offer.get('price', 0))
+
+        # Sanity Price Guard: Discard false positive promo/shipping/rebate micro-prices
+        MIN_CATEGORY_PRICES = {
+            'GPU': 45.00,
+            'CPU': 30.00,
+            'Motherboard': 25.00,
+            'RAM': 15.00,
+            'Storage': 15.00,
+            'Power Supply': 20.00,
+            'Case': 20.00,
+            'Cooling': 8.00,
+        }
+        min_allowed = MIN_CATEGORY_PRICES.get(category, 5.00)
+        if price_val < min_allowed:
+            print(f"⚠️ [Sanity Price Guard] Price ${price_val:.2f} is suspiciously low for {category} (min ${min_allowed:.2f}) — ignoring false positive")
+            return None
+
         title = offer.get('title') or model_query or ''
         full_title_for_check = f"{title} {url}"
 
@@ -1365,12 +1399,15 @@ class TavilyHardwareAgent:
         return None
 
     async def firecrawl_extract(self, url: str, retailer_name: str, category: str, model_query: str = None) -> dict:
+        if time.time() < getattr(self, '_firecrawl_disabled_until', 0):
+            return None
+
         app = self.get_firecrawl_app()
         if not app:
             return None
             
         print(f"[Firecrawl] Extracting {url} ...")
-        scrape_timeout = 10.0
+        scrape_timeout = 2.5
         try:
             try:
                 res = await asyncio.wait_for(
@@ -1378,7 +1415,8 @@ class TavilyHardwareAgent:
                     timeout=scrape_timeout
                 )
             except asyncio.TimeoutError:
-                print(f"⚠️ [Firecrawl Timeout] {retailer_name} took >{scrape_timeout}s — skipping URL")
+                print(f"⚠️ [Firecrawl Timeout] {retailer_name} took >{scrape_timeout}s — disabling Firecrawl for session")
+                self._firecrawl_disabled_until = time.time() + 300
                 return None
             except Exception as e:
                 error_str = str(e).lower()
@@ -1386,7 +1424,8 @@ class TavilyHardwareAgent:
                     print(f"⚠️ [Bot WAF Block] {retailer_name} rejected scraper connection — skipping domain")
                     return {"blocked": True}
                 if "payment" in error_str or "credits" in error_str or "401" in error_str or "402" in error_str or "rate limit" in error_str or "429" in error_str:
-                    print(f"[Firecrawl] Rate/credit limit — skipping {url}")
+                    print(f"[Firecrawl] Rate/credit limit — disabling Firecrawl for session")
+                    self._firecrawl_disabled_until = time.time() + 300
                     return None
                 else:
                     print(f"[Firecrawl Error] {retailer_name}: {e}")
