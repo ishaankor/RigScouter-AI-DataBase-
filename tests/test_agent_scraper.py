@@ -103,6 +103,33 @@ def test_scraper():
     assert_eq(res_ne['price'], 1349.99, "Newegg DOM buybox price")
     assert_eq(res_ne['inStock'], True, "Newegg inStock")
 
+    # 4b. Newegg 2026 Layout with Sponsored Headline Ad Banner & price-current_2026
+    newegg_2026_html = """
+    <html><body>
+    <div class="product-headline is-new">
+      <div class="item-container">
+        <a class="item-title">GIGABYTE 27 inch QHD Monitor</a>
+        <li class="price-current">$<strong>129</strong><sup>.99</sup></li>
+        <div class="item-sponsored">Sponsored</div>
+      </div>
+    </div>
+    <div class="product-buy-box is-product-blackfriday-first">
+      <h1 class="product-title">ASUS PRIME GeForce RTX 5080 16GB GDDR7 Graphics Card</h1>
+      <div class="product-price">
+        <div class="price-current_2026">$<strong>1,745</strong><sup>.99</sup></div>
+      </div>
+    </div>
+    <div class="product-sellers">
+      <div class="seller-price">
+        <li class="price-current">$<strong>2,450</strong><sup>.00</sup></li>
+      </div>
+    </div>
+    </body></html>
+    """
+    res_ne26 = asyncio.run(a.parse_page_content(newegg_2026_html, "", "https://newegg.com/asus-prime-rtx5080-16g/p/1FT-000Y-00BS2", "Newegg", "GPU", "RTX 5080"))
+    assert_eq(res_ne26['price'], 1745.99, "Newegg 2026 buybox correctly ignores headline ad and sellers")
+    assert_eq(res_ne26['inStock'], True, "Newegg 2026 inStock")
+
     # 5. Out of stock item test
     oos_html = """
     <html><head>

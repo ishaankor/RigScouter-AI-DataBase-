@@ -318,7 +318,7 @@ class TavilyHardwareAgent:
             return state
 
         if is_url:
-            offer = await self.extract_direct_page(clean_prompt, self.detect_retailer(clean_prompt), category)
+            offer = await self.extract_direct_page(clean_prompt, self.detect_retailer(clean_prompt), category, model_query=model_name)
             if not offer or offer.get('blocked') or offer.get('price', 0) <= 0:
                 print(f"⚠️ [Direct Page Extraction Failed] Could not extract price from {clean_prompt}")
                 state["summary"] = f"Unable to extract live pricing from \"{clean_prompt}\". The retailer page may be bot-protected or unavailable."
@@ -696,7 +696,7 @@ class TavilyHardwareAgent:
 
         print(f"[Direct URL Scraper] 🎯 Fetching exact URL for: \"{component_name}\" ({retailer_name}) -> {url}")
         
-        offer = await self.extract_direct_page(url, retailer_name, category, model_query=None)
+        offer = await self.extract_direct_page(url, retailer_name, category, model_query=component_name)
         if not offer or offer.get('blocked') or offer.get('price', 0) <= 0:
             print(f"⚠️ [Direct URL Scraper Notice] Unable to extract live price from: {url}")
             return None
@@ -829,7 +829,7 @@ class TavilyHardwareAgent:
                 r'\b(?:bracket|backplate|cable|adapter|shroud|heatsink|water\s*block|waterblock|gpu\s*fan|thermal\s*pad|copper\s*shim|holder|stand|mounting\s*kit)\s+(?:only|for\b)',
                 r'^(?:bracket|backplate|cable|adapter|shroud|heatsink|waterblock|fan|thermal\s*pad|holder|stand)\b',
                 r'\b(?:bracket|backplate|cable|adapter|shroud|heatsink|waterblock|fan|holder|stand)\s+only\b',
-                r'\b(?:riser\s*cable|extension\s*cable|12vhpwr\s*cable|12vhpwr\s*adapter|anti-sag\s*bracket|anti-sag\s*holder|gpu\s*support\s*bracket|gpu\s*holder|gpu\s*stand|power\s*cable)\b'
+                r'\b(?:riser\s*cable|extension\s*cable|12vhpwr\s*cable|12vhpwr\s*adapter|anti-sag\s*bracket|anti-sag\s*holder|gpu\s*support\s*bracket|gpu\s*holder|gpu\s*stand|power\s*cable|water\s*block|waterblock|backplate|heatsink)\b'
             ]
             is_full_card = any(w in lower_t for w in ['graphics card', 'video card', 'geforce rtx', 'geforce gtx', 'radeon rx', 'desktop processor', 'motherboard', 'desktop memory', 'solid state drive'])
             has_exclusive_accessory = any(w in lower_t for w in ['only', 'stand for', 'bracket for', 'cable for', 'holder for', 'block for', 'cooler for'])
@@ -1009,9 +1009,13 @@ class TavilyHardwareAgent:
             if t_elem: title = t_elem.text.strip()
 
         elif retailer_name == 'Newegg':
-            for sp in soup.select('[class*="sponsored"], .item-sponsored, .recommended-box, .swiper, .carousel'):
+            for sp in soup.select('.product-headline, .product-sellers, [class*="sponsored"], .item-sponsored, .recommended-box, .swiper, .carousel, [class*="protection"], [class*="warranty"], #Buy_Together, #PDP_product-recommend, .item-cells-wrap, .product-similar-links, .product-similar-link, .modal-intermediary, .objCombo'):
                 sp.decompose()
-            for price_elem in soup.select('li.price-current, .product-buy-box .price-current, div.product-price .price-current, .price-current'):
+
+            buybox = soup.select_one('.product-buy-box, #ProductBuy, .product-pane, .product-main')
+            search_scope = buybox if buybox else soup
+
+            for price_elem in search_scope.select('.price-current_2026, [class*="price-current"], li.price-current, .price-current'):
                 price_strong = price_elem.select_one('strong')
                 price_sup = price_elem.select_one('sup')
                 if price_strong:
@@ -1038,8 +1042,8 @@ class TavilyHardwareAgent:
             t_elem = soup.select_one('h1.product-title, h1')
             if t_elem: title = t_elem.text.strip()
 
-            inv = soup.select_one('.product-inventory')
-            if inv and 'out of stock' in inv.text.lower():
+            inv = soup.select_one('.product-inventory, .product-buy-box')
+            if inv and any(s in inv.text.lower() for s in ['out of stock', 'sold out', 'discontinued', 'auto notify']):
                 return {"out_of_stock": True}
 
         elif retailer_name == 'Best Buy':
