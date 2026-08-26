@@ -3,7 +3,7 @@ import re
 import json
 import asyncio
 import httpx
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, Query, BackgroundTasks, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
@@ -185,95 +185,138 @@ async def get_dynamic_parts_queue() -> list[dict]:
     except Exception as e:
         print(f"[Dynamic Parts Queue Notice]: {e}")
 
-    # Fallback to DEFAULT_PARTS_CATALOG if DB is empty
-    return [{"name": part, "url": None, "retailer": "Amazon", "category": "GPU"} for part in DEFAULT_PARTS_CATALOG]
-
-# ─── Scheduler State ──────────────────────────────────────────────────────────
+    # Fallback to DEFAULT_PARTS_CATALOG if DB # ─── Scheduler State (Daily at 12:00 AM UTC) ──────────────────────────────────
 scheduler_state = {
     "schedulerRunning": False,
     "lastSchedulerRun": None,
-    "schedulerQueueIndex": 0,
+    "nextScheduledRun": None,
+    "scheduleMode": "Daily at 12:00 AM UTC (00:00 UTC)",
+    "lastBatchSummary": None,
 }
-SCHEDULER_INTERVAL_SECONDS = 15 * 60
 
-async def run_scheduler_tick():
+def get_seconds_until_next_midnight_utc() -> float:
+    now = datetime.now(timezone.utc)
+    # Next midnight (00:00:00 UTC tomorrow)
+    tomorrow_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return max(1.0, (tomorrow_midnight - now).total_seconds())
+
+async def run_full_daily_batch():
     if scheduler_state["schedulerRunning"]:
-        print("[Scheduler] Previous run still in progress — skipping tick")
-        return
+        print("[Daily Scheduler] Previous refresh batch is still running — skipping invocation")
+        return {"status": "in_progress", "message": "Daily scheduler is currently running"}
 
     scheduler_state["schedulerRunning"] = True
-    queue = await get_dynamic_parts_queue()
-    if not queue:
-        scheduler_state["schedulerRunning"] = False
-        return
-
-    item = queue[scheduler_state["schedulerQueueIndex"] % len(queue)]
-    scheduler_state["schedulerQueueIndex"] += 1
-    scheduler_state["lastSchedulerRun"] = datetime.now(timezone.utc).isoformat()
-
-    item_name = item.get("name") if isinstance(item, dict) else str(item)
-    item_url = item.get("url") if isinstance(item, dict) else None
-    retailer = item.get("retailer") if isinstance(item, dict) else "Online Retailer"
-
-    print(f"\n[Scheduler] ⏱ Auto-updating daily prices for: \"{item_name}\" ({scheduler_state['schedulerQueueIndex']}/{len(queue)})")
-    broadcast_sse('scheduler_tick', {
-        "query": item_name,
-        "url": item_url,
-        "retailer": retailer,
-        "queueIndex": scheduler_state["schedulerQueueIndex"],
-        "timestamp": scheduler_state["lastSchedulerRun"]
-    })
+    start_time = datetime.now(timezone.utc)
+    scheduler_state["lastSchedulerRun"] = start_time.isoformat()
 
     try:
-        direct_success = False
-        # Phase 1: Try Direct Product URL scraping first (instant, 100% accurate, zero search credits)
-        if item_url and item_url.startswith('http'):
-            print(f"[Scheduler Direct URL] 🎯 Checking exact product URL ({retailer}): {item_url}")
-            try:
-                offer = await agent.refresh_direct_item(item, agent_sse_emitter)
-                if offer and offer.get('price', 0) > 0:
-                    print(f"✅ [Scheduler Direct URL Success] Refreshed \"{item_name}\" -> ${offer['price']:.2f} at {offer.get('retailer', retailer)}")
-                    direct_success = True
-            except Exception as direct_err:
-                print(f"⚠️ [Scheduler Direct URL Notice] Failed direct URL refresh for \"{item_name}\": {direct_err}")
+        queue = await get_dynamic_parts_queue()
+        total_items = len(queue)
+        print(f"\n[Daily Scheduler] 🌟 [12:00 AM UTC Daily Refresh Started] Updating all {total_items} tracked items in catalog...")
+        
+        broadcast_sse('daily_refresh_start', {
+            "totalItems": total_items,
+            "timestamp": scheduler_state["lastSchedulerRun"]
+        })
 
-        # Phase 2: Fallback to Multi-Retailer Agent Search if no direct URL or direct scrape failed
-        if not direct_success:
-            print(f"[Scheduler Multi-Retailer Search] Running full agent search across retailers for: \"{item_name}\"")
-            await agent.run(item_name, agent_sse_emitter, user_id=item.get('userId') if isinstance(item, dict) else None)
+        success_count = 0
+        for i, item in enumerate(queue):
+            item_name = item.get("name") if isinstance(item, dict) else str(item)
+            item_url = item.get("url") if isinstance(item, dict) else None
+            retailer = item.get("retailer") if isinstance(item, dict) else "Online Retailer"
+            pos = i + 1
 
+            print(f"\n[Daily Scheduler] ⏱ ({pos}/{total_items}) Auto-updating: \"{item_name}\" ({retailer})")
+            broadcast_sse('scheduler_tick', {
+                "query": item_name,
+                "url": item_url,
+                "retailer": retailer,
+                "itemPosition": pos,
+                "totalQueue": total_items,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            })
+
+            direct_success = False
+            # Phase 1: Try Direct Product URL scraping first (instant, 100% accurate, zero search credits)
+            if item_url and item_url.startswith('http'):
+                print(f"[Daily Scheduler Direct URL] 🎯 Checking exact URL ({retailer}): {item_url}")
+                try:
+                    offer = await agent.refresh_direct_item(item, agent_sse_emitter)
+                    if offer and offer.get('price', 0) > 0:
+                        print(f"✅ [Daily Scheduler Direct URL Success] Refreshed \"{item_name}\" -> ${offer['price']:.2f} at {offer.get('retailer', retailer)}")
+                        direct_success = True
+                        success_count += 1
+                except Exception as direct_err:
+                    print(f"⚠️ [Daily Scheduler Direct URL Notice] Failed direct refresh for \"{item_name}\": {direct_err}")
+
+            # Phase 2: Fallback to Multi-Retailer Agent Search if no direct URL or direct scrape failed
+            if not direct_success:
+                try:
+                    print(f"[Daily Scheduler Multi-Retailer Search] Running full agent search for: \"{item_name}\"")
+                    res = await agent.run(item_name, agent_sse_emitter, user_id=item.get('userId') if isinstance(item, dict) else None)
+                    if res and not res.get('is_error'):
+                        success_count += 1
+                except Exception as search_err:
+                    print(f"⚠️ [Daily Scheduler Search Notice] Error for \"{item_name}\": {search_err}")
+
+            # Gentle pause between items to prevent rate-limits
+            if i < total_items - 1:
+                await asyncio.sleep(2.0)
+
+        end_time = datetime.now(timezone.utc)
+        duration_secs = round((end_time - start_time).total_seconds(), 1)
+        summary_msg = f"Refreshed {success_count}/{total_items} items in {duration_secs}s"
+        scheduler_state["lastBatchSummary"] = summary_msg
+        print(f"\n[Daily Scheduler] 🎉 [12:00 AM UTC Daily Refresh Completed] {summary_msg}.")
+
+        broadcast_sse('daily_refresh_complete', {
+            "totalItems": total_items,
+            "successCount": success_count,
+            "durationSeconds": duration_secs,
+            "timestamp": end_time.isoformat()
+        })
+        return {
+            "status": "completed",
+            "totalItems": total_items,
+            "successCount": success_count,
+            "durationSeconds": duration_secs,
+            "timestamp": end_time.isoformat()
+        }
     except Exception as e:
-        print(f"[Scheduler Error] \"{item_name}\":", str(e))
+        print(f"[Daily Scheduler Error]: {e}")
         broadcast_sse('scheduler_error', {
-            "query": item_name,
             "error": str(e),
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
+        return {"status": "error", "error": str(e)}
     finally:
         scheduler_state["schedulerRunning"] = False
 
 async def scheduler_loop():
-    print(f"[Scheduler] Starting dynamic price updater — scraping every {SCHEDULER_INTERVAL_SECONDS / 60} minutes")
-    await asyncio.sleep(5)
-    await run_scheduler_tick()
+    print("[Daily Scheduler] Initialized daily price updater — runs across ALL tracked items at 12:00 AM UTC (00:00 UTC) every day.")
     while True:
-        await asyncio.sleep(SCHEDULER_INTERVAL_SECONDS)
-        await run_scheduler_tick()
+        secs = get_seconds_until_next_midnight_utc()
+        next_run_dt = datetime.now(timezone.utc) + timedelta(seconds=secs)
+        scheduler_state["nextScheduledRun"] = next_run_dt.isoformat()
+        hours = secs / 3600
+        print(f"[Daily Scheduler] ⏳ Next 12:00 AM UTC catalog refresh in {hours:.2f} hours ({int(secs)}s) at {scheduler_state['nextScheduledRun']}")
+        await asyncio.sleep(secs)
+        await run_full_daily_batch()
 
 # ─── Pure API Endpoints ──────────────────────────────────────────
 
 @app.get("/")
 async def root():
     queue = await get_dynamic_parts_queue()
-    next_item = queue[scheduler_state["schedulerQueueIndex"] % len(queue)] if queue else None
-    next_name = next_item.get('name') if isinstance(next_item, dict) else str(next_item) if next_item else "N/A"
     return {
         "status": "ok",
         "service": "RigScouter-AI Backend Proxy & Autonomous Tavily Agent",
         "databaseConnected": True,
         "schedulerActive": True,
-        "intervalMinutes": SCHEDULER_INTERVAL_SECONDS / 60,
-        "nextScheduledPart": next_name,
+        "schedule": "Daily at 12:00 AM UTC (00:00 UTC)",
+        "nextScheduledRun": scheduler_state.get("nextScheduledRun"),
+        "lastSchedulerRun": scheduler_state.get("lastSchedulerRun"),
+        "lastBatchSummary": scheduler_state.get("lastBatchSummary"),
         "trackedCount": len(queue),
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
@@ -289,49 +332,28 @@ async def health():
 @app.get("/api/status")
 async def api_status():
     queue = await get_dynamic_parts_queue()
-    next_item = queue[scheduler_state["schedulerQueueIndex"] % len(queue)] if queue else None
-    next_name = next_item.get('name') if isinstance(next_item, dict) else str(next_item) if next_item else None
     return {
         "schedulerRunning": scheduler_state["schedulerRunning"],
         "lastSchedulerRun": scheduler_state["lastSchedulerRun"],
-        "schedulerQueueIndex": scheduler_state["schedulerQueueIndex"],
-        "nextPart": next_name,
+        "nextScheduledRun": scheduler_state.get("nextScheduledRun"),
+        "scheduleMode": scheduler_state.get("scheduleMode"),
+        "lastBatchSummary": scheduler_state.get("lastBatchSummary"),
         "partsQueue": [item.get('name') if isinstance(item, dict) else str(item) for item in queue],
         "totalParts": len(queue),
-        "intervalMinutes": SCHEDULER_INTERVAL_SECONDS / 60,
         "connectedSseClients": len(sse_clients),
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
 @app.get("/api/cron/trigger-daily-update")
 @app.post("/api/cron/trigger-daily-update")
-async def trigger_daily_update(background_tasks: BackgroundTasks, limit: int = 10):
-    """Refreshes live prices across tracked hardware components and records timestamped PriceHistory snapshots."""
+async def trigger_daily_update(background_tasks: BackgroundTasks):
+    """Refreshes live prices across ALL tracked hardware components and records timestamped PriceHistory snapshots."""
     queue = await get_dynamic_parts_queue()
-    items_to_update = queue[:limit] if queue else [{"name": p, "url": None} for p in DEFAULT_PARTS_CATALOG[:limit]]
-    
-    async def run_batch():
-        print(f"\n[Batch Update] 🚀 Starting daily refresh for {len(items_to_update)} components...")
-        for item in items_to_update:
-            item_name = item.get("name") if isinstance(item, dict) else str(item)
-            item_url = item.get("url") if isinstance(item, dict) else None
-            try:
-                if item_url and item_url.startswith('http'):
-                    print(f"[Batch Update Direct URL] Checking exact URL: {item_url}")
-                    offer = await agent.refresh_direct_item(item, agent_sse_emitter)
-                    if offer and offer.get('price', 0) > 0:
-                        continue
-                print(f"[Batch Update Search] Scraping: \"{item_name}\" across retailers...")
-                await agent.run(item_name, agent_sse_emitter)
-            except Exception as err:
-                print(f"[Batch Update Error] \"{item_name}\": {err}")
-        print(f"[Batch Update] ✅ Completed refresh for {len(items_to_update)} components.")
-
-    background_tasks.add_task(run_batch)
+    background_tasks.add_task(run_full_daily_batch)
     return {
         "status": "started",
-        "message": f"Daily price update initiated for {len(items_to_update)} component(s) in background.",
-        "components": [item.get('name') if isinstance(item, dict) else str(item) for item in items_to_update],
+        "message": f"Full daily price update initiated for all {len(queue)} component(s) in background.",
+        "components": [item.get('name') if isinstance(item, dict) else str(item) for item in queue],
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
@@ -343,8 +365,6 @@ async def stream(request: Request):
     async def event_generator():
         try:
             queue = await get_dynamic_parts_queue()
-            next_item = queue[scheduler_state["schedulerQueueIndex"] % len(queue)] if queue else None
-            next_part = next_item.get('name') if isinstance(next_item, dict) else str(next_item) if next_item else "N/A"
             # Initial connection event
             yield {
                 "event": "connected",
@@ -352,7 +372,8 @@ async def stream(request: Request):
                     "message": "Connected to RigScouter-AI live price feed",
                     "schedulerRunning": scheduler_state["schedulerRunning"],
                     "lastSchedulerRun": scheduler_state["lastSchedulerRun"],
-                    "nextPart": next_part,
+                    "nextScheduledRun": scheduler_state.get("nextScheduledRun"),
+                    "scheduleMode": scheduler_state.get("scheduleMode"),
                     "totalTracked": len(queue),
                     "timestamp": datetime.now(timezone.utc).isoformat()
                 })
@@ -653,8 +674,8 @@ async def delete_component(id: str):
 
 @app.post("/api/scheduler/run-now")
 async def run_scheduler_now(background_tasks: BackgroundTasks):
-    background_tasks.add_task(run_scheduler_tick)
-    return {"message": "Scheduler tick triggered", "timestamp": datetime.now(timezone.utc).isoformat()}
+    background_tasks.add_task(run_full_daily_batch)
+    return {"message": "Full daily price refresh triggered across all tracked components", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 @app.get("/api/keep-alive")
 @app.get("/health/supabase")
