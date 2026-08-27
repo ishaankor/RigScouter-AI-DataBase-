@@ -391,10 +391,10 @@ class TavilyHardwareAgent:
                     try:
                         offer = await asyncio.wait_for(
                             self.scrape_retailer_accurate_offer(clean_prompt, r['name'], r['domain'], category),
-                            timeout=32.0
+                            timeout=45.0
                         )
                     except asyncio.TimeoutError:
-                        print(f"⚠️ [Retailer Timeout] {r['name']} exceeded 32s — proceeding with other retailers")
+                        print(f"⚠️ [Retailer Timeout] {r['name']} exceeded 45s — proceeding with other retailers")
                         offer = None
                     except Exception as e:
                         print(f"⚠️ [Retailer Error] {r['name']}: {e}")
@@ -601,6 +601,8 @@ class TavilyHardwareAgent:
                 "pending_id": pending_id,
                 "timestamp": datetime.now(timezone.utc).isoformat()
             })
+
+        return state
 
     async def persist_hardware_offer(self, offer: dict, model_name: str, category: str, comp_id_override: str = None) -> dict | None:
         """Saves or updates a retailer offer in hardware_components, recording timestamped PriceHistory."""
@@ -845,11 +847,16 @@ class TavilyHardwareAgent:
         # 4. Reject prebuilt PCs / Laptops when looking for individual components
         if category in ['GPU', 'CPU', 'Motherboard', 'RAM', 'Storage', 'Power Supply', 'Case', 'Cooling'] or not category:
             if not any(k in lower_q for k in ['pc', 'desktop', 'prebuilt', 'laptop', 'system', 'notebook']):
-                if any(p in lower_t for p in ['desktop pc', 'gaming pc', 'gaming desktop', 'laptop', 'prebuilt pc', 'complete pc', 'all-in-one', 'notebook']):
+                if any(p in lower_t for p in ['gaming laptop', 'laptop computer', 'prebuilt pc', 'complete pc', 'all-in-one desktop', 'desktop computer', 'notebook pc']):
+                    return False
+                is_component_indicator = any(w in lower_t for w in ['graphics card', 'video card', 'geforce', 'radeon', 'desktop processor', 'motherboard', 'solid state drive', 'power supply', 'internal ssd', 'gddr', 'pci express', 'pcie', 'gpu for', 'graphics cards'])
+                if not is_component_indicator and any(p in lower_t for p in ['desktop pc', 'gaming pc', 'gaming desktop', 'laptop', 'notebook']):
                     return False
 
         # 5. Extract core numeric/model identifiers from query and verify presence
-        q_raw = re.sub(r'([a-zA-Z]{2,})(\d+)', r'\1 \2', query)
+        # Strip capacity/spec units (e.g. 6gb, 16gb, 2tb, 32gb) so memory sizes don't turn into isolated required digits
+        q_clean = re.sub(r'\b\d+\s*(?:gb|tb|mb|mhz|ghz|w|mm|slot|pin|bit)\b', '', query.lower())
+        q_raw = re.sub(r'([a-zA-Z]{2,})(\d+)', r'\1 \2', q_clean)
         q_raw = re.sub(r'(\d+)([a-zA-Z]{2,})', r'\1 \2', q_raw)
         q_tokens = [w for w in re.sub(r'[^a-z0-9\s]', ' ', q_raw.lower()).split() if len(w) > 0]
         
@@ -860,7 +867,8 @@ class TavilyHardwareAgent:
 
         # 6. If query specifies critical modifiers (e.g. 'ti', 'super', 'wifi', 'white', 'ddr5', '2tb'), ensure title matches
         CRITICAL_MODIFIERS = {'plus', 'super', 'ti', 'xt', 'xtx', 'wifi', 'white', 'liquid', 'wireless', 'ddr4', 'ddr5', '1tb', '2tb', '4tb', '32gb', '64gb'}
-        query_modifiers = [w for w in q_tokens if w in CRITICAL_MODIFIERS]
+        q_orig_tokens = [w for w in re.sub(r'[^a-z0-9\s]', ' ', query.lower()).split() if len(w) > 0]
+        query_modifiers = [w for w in q_orig_tokens if w in CRITICAL_MODIFIERS]
         if query_modifiers and not all(m in clean_t for m in query_modifiers):
             return False
 
@@ -1394,7 +1402,7 @@ class TavilyHardwareAgent:
             "Upgrade-Insecure-Requests": "1"
         }
         try:
-            async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=8.0) as client:
+            async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=12.0) as client:
                 res = await client.get(url)
                 if res.status_code == 200:
                     return await self.parse_page_content(res.text, "", url, retailer_name, category, model_query)
@@ -1411,7 +1419,7 @@ class TavilyHardwareAgent:
             return None
             
         print(f"[Firecrawl] Extracting {url} ...")
-        scrape_timeout = 2.5
+        scrape_timeout = 15.0
         try:
             try:
                 res = await asyncio.wait_for(
@@ -1419,8 +1427,7 @@ class TavilyHardwareAgent:
                     timeout=scrape_timeout
                 )
             except asyncio.TimeoutError:
-                print(f"⚠️ [Firecrawl Timeout] {retailer_name} took >{scrape_timeout}s — disabling Firecrawl for session")
-                self._firecrawl_disabled_until = time.time() + 300
+                print(f"⚠️ [Firecrawl Timeout] {retailer_name} took >{scrape_timeout}s on {url} — skipping this URL")
                 return None
             except Exception as e:
                 error_str = str(e).lower()
