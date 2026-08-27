@@ -827,16 +827,26 @@ class TavilyHardwareAgent:
         # 2. Reject accessory and part replacement listings unless query explicitly requested it
         is_query_for_accessory = any(k in lower_q for k in ['cable', 'adapter', 'bracket', 'backplate', 'block', 'shroud', 'fan', 'pad', 'shim', 'mount', 'accessory', 'stand', 'holder'])
         if not is_query_for_accessory:
+            clean_acc_t = re.sub(r'\b(?:heatsink|cooler)\s+not\s+included\b', '', lower_t)
+            clean_acc_t = re.sub(r'\b(?:with|w/|integrated)\s+heatsink\b', '', clean_acc_t)
+            
             accessory_indicators = [
                 r'\b(?:bracket|backplate|cable|adapter|shroud|heatsink|water\s*block|waterblock|gpu\s*fan|thermal\s*pad|copper\s*shim|holder|stand|mounting\s*kit)\s+(?:only|for\b)',
                 r'^(?:bracket|backplate|cable|adapter|shroud|heatsink|waterblock|fan|thermal\s*pad|holder|stand)\b',
                 r'\b(?:bracket|backplate|cable|adapter|shroud|heatsink|waterblock|fan|holder|stand)\s+only\b',
-                r'\b(?:riser\s*cable|extension\s*cable|12vhpwr\s*cable|12vhpwr\s*adapter|anti-sag\s*bracket|anti-sag\s*holder|gpu\s*support\s*bracket|gpu\s*holder|gpu\s*stand|power\s*cable|water\s*block|waterblock|backplate|heatsink)\b'
+                r'\b(?:riser\s*cable|extension\s*cable|12vhpwr|anti-sag|gpu\s*support|gpu\s*holder|gpu\s*stand|power\s*cable|water\s*block|waterblock|backplate)\b'
             ]
-            is_full_card = any(w in lower_t for w in ['graphics card', 'video card', 'geforce rtx', 'geforce gtx', 'radeon rx', 'desktop processor', 'motherboard', 'desktop memory', 'solid state drive'])
-            has_exclusive_accessory = any(w in lower_t for w in ['only', 'stand for', 'bracket for', 'cable for', 'holder for', 'block for', 'cooler for'])
-            if not (is_full_card and not has_exclusive_accessory):
-                if any(re.search(pat, lower_t) for pat in accessory_indicators):
+            is_full_component = any(w in lower_t for w in [
+                'graphics card', 'video card', 'geforce rtx', 'geforce gtx', 'radeon rx', 
+                'desktop processor', 'boxed processor', 'processor', 'motherboard', 'desktop memory', 
+                'solid state drive', 'internal ssd', 'nvme m.2', 'power supply', 'atx power supply'
+            ])
+            has_exclusive_accessory = any(w in lower_t for w in [
+                'only', 'stand for', 'bracket for', 'cable for', 'holder for', 'block for', 
+                'cooler for', 'anti-sag', 'support bracket', 'support holder'
+            ])
+            if not (is_full_component and not has_exclusive_accessory):
+                if any(re.search(pat, clean_acc_t) for pat in accessory_indicators):
                     return False
 
         # 3. Reject multi-model keyword stuffing spam (e.g. "RTX 5070 Ti 5080 5090" in title)
@@ -1295,10 +1305,11 @@ class TavilyHardwareAgent:
         for attempt in range(len(TAVILY_API_KEYS)):
             try:
                 # 1. Search with Tavily to get candidate URLs
+                search_query = f"buy {model_query} lowest price in stock"
                 async with httpx.AsyncClient() as client:
                     res = await client.post('https://api.tavily.com/search', json={
                         "api_key": self.get_tavily_key(),
-                        "query": f"buy {model_query} lowest price in stock",
+                        "query": search_query,
                         "search_depth": "advanced",
                         "include_domains": [domain_pattern],
                         "include_raw_content": False,
@@ -1342,6 +1353,7 @@ class TavilyHardwareAgent:
                     valid_hits.append({
                         'url': clean_url,
                         'title': hit.get('title', ''),
+                        'content': hit.get('content', ''),
                         'price_hint': price_hint
                     })
 
@@ -1351,9 +1363,9 @@ class TavilyHardwareAgent:
                 # Sort candidate product URLs by lowest price hint first
                 valid_hits.sort(key=lambda x: x.get('price_hint', 999999.0))
 
-                # Evaluate top 2 lowest-priced candidate URLs
+                # Evaluate top 3 candidate URLs
                 valid_offers = []
-                for candidate in valid_hits[:2]:
+                for candidate in valid_hits[:3]:
                     # 1. Try Direct HTTP fetch first (fast, browser headers, 0 credit cost)
                     offer = await self.direct_http_extract(candidate['url'], retailer_name, category, model_query)
                     
@@ -1361,10 +1373,11 @@ class TavilyHardwareAgent:
                     if not offer or (offer.get('price', 0) == 0 and not offer.get('out_of_stock')):
                         offer = await self.firecrawl_extract(candidate['url'], retailer_name, category, model_query)
 
+                    # 3. If Direct HTTP & Firecrawl both failed or were blocked by WAF (e.g. Best Buy on Render), use AI snippet extraction
+                    if not offer or (offer.get('price', 0) == 0 and not offer.get('out_of_stock')):
+                        offer = await self.extract_snippet_offer(candidate, retailer_name, category, model_query)
+
                     if offer:
-                        if offer.get('blocked'):
-                            # WAF / HTTP2 block — abort remaining candidates for this retailer immediately
-                            break
                         if offer.get('out_of_stock') or not offer.get('inStock', True):
                             print(f"⚠️ [Confirmed Out of Stock] {retailer_name}: '{offer.get('title', candidate['title'])}' is out of stock / discontinued. Skipping to next candidate...")
                             continue
@@ -1378,7 +1391,6 @@ class TavilyHardwareAgent:
                     print(f"✅ [LOWEST CONFIRMED {retailer_name.upper()} OFFER] \"${lowest_offer['price']:.2f}\" (from {len(valid_offers)} option(s)) -> {lowest_offer['title'][:60]}")
                     return lowest_offer
 
-                # Zero snippet guessing: If direct page scraping could not confirm an in-stock offer, return None
                 return None
             except Exception as e:
                 print(f"[Tavily Search Error] {retailer_name}: {e}")
@@ -1401,8 +1413,9 @@ class TavilyHardwareAgent:
             "Sec-Fetch-User": "?1",
             "Upgrade-Insecure-Requests": "1"
         }
+        http_timeout = 2.5 if "bestbuy.com" in url.lower() else 12.0
         try:
-            async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=12.0) as client:
+            async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=http_timeout) as client:
                 res = await client.get(url)
                 if res.status_code == 200:
                     return await self.parse_page_content(res.text, "", url, retailer_name, category, model_query)
@@ -1467,6 +1480,115 @@ class TavilyHardwareAgent:
             print(f"⚠️ [Firecrawl Extraction Error] {url}: {e}")
             return None
 
+    async def extract_snippet_offer(self, candidate: dict, retailer_name: str, category: str, model_query: str = None) -> dict | None:
+        """
+        AI & Regex fallback parser when direct HTTP & Firecrawl are blocked by retailer WAF (e.g. Best Buy on Render).
+        Extracts verified pricing and in-stock status from the search engine result snippet.
+        """
+        url = candidate.get('url', '')
+        raw_title = candidate.get('title', '')
+        content = candidate.get('content', '') or ''
+        combined_text = f"{raw_title} {content}"
+
+        if not content and not raw_title:
+            return None
+
+        # Clean monthly financing e.g. "$94.45/mo"
+        no_monthly = re.sub(r'\$\d+(?:\.\d+)?\s*/\s*(?:mo|month|yr)\b', '', combined_text, flags=re.I)
+        
+        # Look for explicit out of stock indicators in snippet
+        is_oos = any(s in combined_text.lower() for s in ['out of stock', 'sold out', 'currently unavailable', 'no longer available', 'discontinued'])
+
+        price = None
+        # Try Groq AI extraction first if available
+        if GROQ_API_KEY:
+            try:
+                system_prompt = (
+                    f"You are an expert product data extraction agent parsing a {retailer_name} search result. "
+                    f"Target item: '{model_query or raw_title}' ({category}). "
+                    "CRITICAL RULES:\n"
+                    "1. Extract the current active selling price for the MAIN product from the snippet.\n"
+                    "2. NEVER extract protection plans, monthly financing (e.g. '$55/mo'), or shipping fees.\n"
+                    "3. Return ONLY valid JSON: {\"price\": float, \"inStock\": bool, \"title\": str}"
+                )
+                models_to_try = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b", "groq/compound"]
+                for model_name in models_to_try:
+                    try:
+                        async with httpx.AsyncClient() as client:
+                            res = await client.post(
+                                "https://api.groq.com/openai/v1/chat/completions",
+                                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                                json={
+                                    "model": model_name,
+                                    "messages": [
+                                        {"role": "system", "content": system_prompt},
+                                        {"role": "user", "content": f"URL: {url}\nTitle: {raw_title}\nSnippet: {content}"}
+                                    ],
+                                    "response_format": {"type": "json_object"},
+                                    "temperature": 0
+                                },
+                                timeout=4.0
+                            )
+                            if res.status_code == 200:
+                                parsed = json.loads(res.json()["choices"][0]["message"]["content"])
+                                if parsed.get('price') and float(parsed['price']) > 5.0:
+                                    price = float(parsed['price'])
+                                    if 'inStock' in parsed:
+                                        is_oos = not bool(parsed.get('inStock', True))
+                                    if parsed.get('title'):
+                                        raw_title = parsed['title']
+                                    break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        # Regex fallback if AI didn't return a price
+        if not price:
+            m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', no_monthly)
+            if m:
+                try:
+                    p_val = float(m.group(1).replace(',', ''))
+                    if p_val > 5.0:
+                        price = p_val
+                except ValueError:
+                    pass
+
+        if not price or price <= 0:
+            return None
+
+        # Sanity floor check
+        MIN_CATEGORY_PRICES = {
+            'GPU': 45.00, 'CPU': 30.00, 'Motherboard': 25.00, 'RAM': 15.00,
+            'Storage': 15.00, 'Power Supply': 20.00, 'Case': 20.00, 'Cooling': 8.00,
+        }
+        min_allowed = MIN_CATEGORY_PRICES.get(category, 5.00)
+        if price < min_allowed:
+            return None
+
+        clean_title = raw_title.replace(' - Best Buy', '').replace(' | Best Buy', '').strip()
+        
+        # Semantic check
+        if model_query and not self.is_semantic_product_match(f"{clean_title} {url}", model_query, category):
+            return None
+
+        if is_oos:
+            return {"out_of_stock": True, "title": clean_title}
+
+        print(f"✅ [SNIPPET-AI HIT] {retailer_name}: Found price ${price:.2f} (InStock: True) -> {clean_title[:60]}")
+        return {
+            "retailer": retailer_name,
+            "title": clean_title,
+            "price": price,
+            "originalPrice": None,
+            "inStock": True,
+            "isRefurbished": False,
+            "url": url,
+            "imageUrl": None,
+            "brand": None,
+            "source": "snippet-ai"
+        }
+
     async def parse_with_groq(self, markdown_content: str, query: str, retailer: str, category: str) -> dict:
         if not GROQ_API_KEY:
             return {}
@@ -1487,7 +1609,7 @@ class TavilyHardwareAgent:
             "4. Return ONLY valid JSON with keys: price (float), originalPrice (float or null), title (str), brand (str or null), inStock (bool)."
         )
 
-        models_to_try = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"]
+        models_to_try = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b", "groq/compound"]
         for model_name in models_to_try:
             try:
                 async with httpx.AsyncClient() as client:
@@ -1517,13 +1639,13 @@ class TavilyHardwareAgent:
 
     def is_valid_direct_product_url(self, url: str, domain_pattern: str) -> bool:
         lower = url.lower()
-        if any(x in lower for x in ['/reviews/', 'reviews', 'questions', '/forum/', '/blog/', 'searchpage.jsp', '/s?k=', '/p/pl', '/openbox']):
+        if any(x in lower for x in ['/reviews/', '/questions/', '/forum/', '/blog/', 'searchpage.jsp', '/s?k=', '/p/pl', '/openbox']):
             return False
             
         if 'microcenter.com' in domain_pattern: return '/product/' in lower
         if 'amazon.com' in domain_pattern: return '/dp/' in lower or '/gp/product/' in lower
         if 'newegg.com' in domain_pattern: return '/p/' in lower and not '/p/pl' in lower
-        if 'bestbuy.com' in domain_pattern: return ('/site/' in lower and '.p' in lower) or '/product/' in lower
+        if 'bestbuy.com' in domain_pattern: return ('/site/' in lower and '.p' in lower) or '/product/' in lower or ('/click/' in lower and '/pdp' in lower)
         if 'bhphotovideo.com' in domain_pattern: return '/c/product/' in lower and not '/accessories' in lower
         if 'ebay.com' in domain_pattern: return '/itm/' in lower
         return True
@@ -1547,7 +1669,7 @@ class TavilyHardwareAgent:
             "If it is NOT a computer component or peripheral, return EXACTLY: Not compatible (N/A). "
             "Return ONLY the category name. Do not include any other text."
         )
-        models_to_try = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+        models_to_try = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b", "groq/compound"]
         for model_name in models_to_try:
             try:
                 async with httpx.AsyncClient() as client:
