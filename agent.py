@@ -610,9 +610,13 @@ class TavilyHardwareAgent:
             return None
 
         try:
-            clean_slug = re.sub(r'[^a-z0-9]+', '-', (model_name or 'hardware').lower())[:70].strip('-')
+            canonical_model = model_name or "Hardware Component"
+            if offer.get('title') and model_name and not self.is_semantic_product_match(offer['title'], model_name, category):
+                canonical_model = clean_hardware_query(offer['title'], category)
+
+            clean_slug = re.sub(r'[^a-z0-9]+', '-', (canonical_model or 'hardware').lower())[:70].strip('-')
             ret_slug = (offer.get('retailer') or 'retailer').lower().replace(' ', '-')[:20]
-            comp_id = comp_id_override if comp_id_override and str(comp_id_override).startswith('comp-') else f"comp-{clean_slug}-{ret_slug}"[:95]
+            comp_id = comp_id_override if comp_id_override and str(comp_id_override).startswith('comp-') and canonical_model == model_name else f"comp-{clean_slug}-{ret_slug}"[:95]
 
             # Preserve and append to PriceHistory
             existing_specs = {}
@@ -650,10 +654,10 @@ class TavilyHardwareAgent:
 
             hw_payload = {
                 "id": comp_id,
-                "name": (offer.get('title') or model_name or "Hardware Component")[:250],
+                "name": (offer.get('title') or canonical_model or "Hardware Component")[:250],
                 "category": category[:50],
                 "brand": (offer.get('title', '').split()[0] if offer.get('title') else "Hardware")[:50],
-                "model": (model_name or "Hardware Component")[:95],
+                "model": (canonical_model or "Hardware Component")[:95],
                 "specs": json.dumps({
                     "AgentSummary": "Live Autonomous Scraping Engine",
                     "InStock": bool(offer.get('inStock', True)),
@@ -715,21 +719,39 @@ class TavilyHardwareAgent:
 
         # Update watchlist_items across matching users
         try:
-            clean_keyword = re.sub(r'[^a-zA-Z0-9\s]', ' ', component_name).strip()
-            short_keyword = re.sub(r'\s+', ' ', clean_keyword).split(' - ')[0].strip()[:30]
-            
-            wl_query = supabase.table('watchlist_items').select('*')
-            if item.get('userId'):
-                wl_query = wl_query.eq('user_id', item['userId'])
-            if short_keyword:
-                wl_query = wl_query.ilike('component_name', f"%{short_keyword}%")
-            
-            wl_res = await asyncio.to_thread(wl_query.execute)
-            if wl_res.data:
+            item_db_id = item.get('id')
+            is_watchlist_item = item.get('isWatchlist') or bool(item.get('userId'))
+
+            target_rows = []
+            if is_watchlist_item and item_db_id:
+                wl_res = await asyncio.to_thread(supabase.table('watchlist_items').select('*').eq('id', item_db_id).execute)
+                target_rows = wl_res.data or []
+
+            if not target_rows:
+                clean_keyword = re.sub(r'[^a-zA-Z0-9\s]', ' ', component_name).strip()
+                short_keyword = re.sub(r'\s+', ' ', clean_keyword).split(' - ')[0].strip()[:30]
+                
+                wl_query = supabase.table('watchlist_items').select('*')
+                if item.get('userId'):
+                    wl_query = wl_query.eq('user_id', item['userId'])
+                if short_keyword:
+                    wl_query = wl_query.ilike('component_name', f"%{short_keyword}%")
+                
+                wl_res = await asyncio.to_thread(wl_query.execute)
+                target_rows = wl_res.data or []
+
+            if target_rows:
                 frontend_url = os.environ.get("FRONTEND_URL", "https://rigscouter.ishaankoradia.com")
-                for row in wl_res.data:
+                for row in target_rows:
                     r_id = row['id']
                     r_user_id = row.get('user_id')
+                    row_name = row.get('component_name') or component_name
+
+                    # Semantic Match Guard: Ensure scraped page matches the tracked watchlist item
+                    if not self.is_semantic_product_match(clean_title, row_name, category):
+                        print(f"⚠️ [Watchlist Mismatch Safeguard] Scraped title \"{clean_title}\" does not match watchlist component \"{row_name}\" — skipping watchlist update for ID {r_id}")
+                        continue
+
                     target_price = float(row.get('target_price') or 0)
                     prior_price = row.get('current_price') or row.get('all_time_low')
                     prior_atl = float(row.get('all_time_low') or price)
@@ -737,14 +759,16 @@ class TavilyHardwareAgent:
 
                     update_payload = {
                         "all_time_low": min(prior_atl, price),
+                        "retailer": retailer_name,
+                        "product_url": url,
                     }
                     if prior_price and prior_price != price:
                         update_payload["previous_price_24h"] = prior_price
 
                     await asyncio.to_thread(supabase.table('watchlist_items').update(update_payload).eq('id', r_id).execute)
 
-                    # Trigger instant email notification if target met
-                    if target_price > 0 and price <= target_price and alerts_on:
+                    # Trigger instant email notification ONLY if target met AND semantic product match verified AND in stock
+                    if target_price > 0 and price <= target_price and alerts_on and in_stock:
                         try:
                             async with httpx.AsyncClient(timeout=4.0) as client:
                                 await client.post(
@@ -808,6 +832,8 @@ class TavilyHardwareAgent:
     def is_semantic_product_match(self, title: str, query: str, category: str = None) -> bool:
         """
         Adaptable semantic match: verifies title matches requested product without arbitrary price bounds.
+        Enforces strict brand consistency, trim/model line consistency, chipset/model numbers,
+        and eliminates accessory/parts/prebuilt false positives.
         """
         if not title or not query:
             return False
@@ -863,9 +889,46 @@ class TavilyHardwareAgent:
                 if not is_component_indicator and any(p in lower_t for p in ['desktop pc', 'gaming pc', 'gaming desktop', 'laptop', 'notebook']):
                     return False
 
-        # 5. Extract core numeric/model identifiers from query and verify presence
-        # Strip capacity/spec units (e.g. 6gb, 16gb, 2tb, 32gb) so memory sizes don't turn into isolated required digits
-        q_clean = re.sub(r'\b\d+\s*(?:gb|tb|mb|mhz|ghz|w|mm|slot|pin|bit)\b', '', query.lower())
+        # 5. Strict Brand Consistency Check
+        PRIMARY_BRANDS = [
+            'asus', 'gigabyte', 'msi', 'zotac', 'pny', 'evga', 'sapphire', 'powercolor', 'xfx', 
+            'asrock', 'inno3d', 'gainward', 'palit', 'galax', 'kfa2', 'samsung', 'western digital', 
+            'wd', 'seagate', 'crucial', 'sk hynix', 'sabrent', 'corsair', 'g.skill', 'gskill', 
+            'kingston', 'teamgroup', 'patriot', 'adata', 'noctua', 'be quiet', 'lian li', 'nzxt', 
+            'fractal design', 'fractal', 'thermalright', 'deepcool', 'arctic', 'seasonic', 'super flower', 
+            'thermaltake', 'silverstone', 'cooler master', 'montech', 'phanteks', 'antec', 'logitech', 
+            'razer', 'steelseries', 'wooting', 'keychron', 'hyperx', 'shure', 'elgato', 'rode', 
+            'audio-technica', 'ducky', 'epomaker', 'glorious'
+        ]
+        
+        query_brands = [b for b in PRIMARY_BRANDS if re.search(r'\b' + re.escape(b) + r'\b', lower_q)]
+        if query_brands:
+            has_matching_brand = any(re.search(r'\b' + re.escape(b) + r'\b', lower_t) for b in query_brands)
+            title_conflicts = [b for b in PRIMARY_BRANDS if b not in query_brands and re.search(r'\b' + re.escape(b) + r'\b', lower_t)]
+            if not has_matching_brand and title_conflicts:
+                return False
+
+        # 6. Trim / Sub-Model Line Matching (e.g. Prime, TUF, Strix, Windforce, Gaming OC, AORUS, Suprim, Ventus)
+        TRIM_LINES = [
+            'prime', 'tuf', 'strix', 'rog', 'proart', 'dual', 'ko', 'aorus', 'windforce', 'eagle', 
+            'gaming oc', 'aero', 'master', 'xtreme', 'suprim', 'ventus', 'gaming x', 'gaming trio', 
+            'vanguard', 'trinity', 'amp extreme', 'speedster', 'merc', 'qick', 'swft', 'nitro', 
+            'pulse', 'pure', 'hellhound', 'red devil', 'fighter', 'taichi', 'phantom gaming', 
+            'steel legend', 'challenger', 'ichill', 'twin x2', 'trident z', 'ripjaws', 'flare x', 
+            'vengeance', 'dominator', 'fury beast', 'black sn850x', 'blue sn580', '990 pro', '980 pro'
+        ]
+        query_trims = [t for t in TRIM_LINES if re.search(r'\b' + re.escape(t) + r'\b', lower_q)]
+        if query_trims:
+            has_matching_trim = any(re.search(r'\b' + re.escape(t) + r'\b', lower_t) for t in query_trims)
+            title_conflicting_trims = [t for t in TRIM_LINES if t not in query_trims and re.search(r'\b' + re.escape(t) + r'\b', lower_t)]
+            if not has_matching_trim and title_conflicting_trims:
+                return False
+
+        # 7. Extract core numeric/model identifiers from query and verify presence
+        # Strip spec units, bus widths (e.g. 256-bit), interface versions (PCIe 5.0, DLSS 4.0, GDDR7), and capacities (16gb, 2tb)
+        q_clean = re.sub(r'\b(?:pcie|pci[- ]?e|pci[- ]?express|dlss|gen|bluetooth|bt|wifi|wi[- ]?fi|hdmi|dp|displayport|type[- ]?c|usb|gddr|m\.2|nvme)[- ]?\d+(?:\.\d+)?\b', '', query.lower())
+        q_clean = re.sub(r'\b\d+(?:\.\d+)?[- ]*(?:gb|tb|mb|mhz|ghz|w|mm|slot|pin|bit|fan|rpm)\b', '', q_clean)
+        q_clean = re.sub(r'\b\d+\.\d+\b', '', q_clean)
         q_raw = re.sub(r'([a-zA-Z]{2,})(\d+)', r'\1 \2', q_clean)
         q_raw = re.sub(r'(\d+)([a-zA-Z]{2,})', r'\1 \2', q_raw)
         q_tokens = [w for w in re.sub(r'[^a-z0-9\s]', ' ', q_raw.lower()).split() if len(w) > 0]
@@ -875,8 +938,8 @@ class TavilyHardwareAgent:
         if pure_digits and not all(d in clean_t for d in pure_digits):
             return False
 
-        # 6. If query specifies critical modifiers (e.g. 'ti', 'super', 'wifi', 'white', 'ddr5', '2tb'), ensure title matches
-        CRITICAL_MODIFIERS = {'plus', 'super', 'ti', 'xt', 'xtx', 'wifi', 'white', 'liquid', 'wireless', 'ddr4', 'ddr5', '1tb', '2tb', '4tb', '32gb', '64gb'}
+        # 8. If query specifies critical modifiers (e.g. 'ti', 'super', 'wifi', 'white', 'ddr5', '2tb'), ensure title matches
+        CRITICAL_MODIFIERS = {'plus', 'super', 'ti', 'xt', 'xtx', 'wifi', 'white', 'liquid', 'wireless', 'ddr4', 'ddr5', '500gb', '1tb', '2tb', '4tb', '8tb', '16gb', '32gb', '64gb'}
         q_orig_tokens = [w for w in re.sub(r'[^a-z0-9\s]', ' ', query.lower()).split() if len(w) > 0]
         query_modifiers = [w for w in q_orig_tokens if w in CRITICAL_MODIFIERS]
         if query_modifiers and not all(m in clean_t for m in query_modifiers):

@@ -90,6 +90,17 @@ async def get_dynamic_parts_queue() -> list[dict]:
 
         retailer_priority = {'Amazon': 1, 'Micro Center': 2, 'Newegg': 3, 'B&H': 4, 'Best Buy': 5, 'eBay': 6}
 
+        PRIMARY_BRANDS = [
+            'asus', 'gigabyte', 'msi', 'zotac', 'pny', 'evga', 'sapphire', 'powercolor', 'xfx', 
+            'asrock', 'inno3d', 'gainward', 'palit', 'galax', 'kfa2', 'samsung', 'western digital', 
+            'wd', 'seagate', 'crucial', 'sk hynix', 'sabrent', 'corsair', 'g.skill', 'gskill', 
+            'kingston', 'teamgroup', 'patriot', 'adata', 'noctua', 'be quiet', 'lian li', 'nzxt', 
+            'fractal', 'thermalright', 'deepcool', 'arctic', 'seasonic', 'super flower', 
+            'thermaltake', 'silverstone', 'cooler master', 'montech', 'phanteks', 'antec', 'logitech', 
+            'razer', 'steelseries', 'wooting', 'keychron', 'hyperx', 'shure', 'elgato', 'rode', 
+            'audio-technica', 'ducky', 'epomaker', 'glorious'
+        ]
+
         def find_best_hw_match(w_row: dict) -> dict | None:
             c_id = (w_row.get('component_id') or '').lower()
             c_name = (w_row.get('component_name') or '').lower()
@@ -101,20 +112,44 @@ async def get_dynamic_parts_queue() -> list[dict]:
                 if h_id and c_id and (h_id == c_id or h_id.startswith(c_id) or c_id.startswith(h_id)):
                     matches.append(h)
 
-            # 2. Extract key alphanumeric tokens (e.g. 2080, 4090, 7800x3d, nexxxos, q270m, vengeance)
             if not matches:
+                # Brand extraction and conflict check
+                c_brands = [b for b in PRIMARY_BRANDS if re.search(r'\b' + re.escape(b) + r'\b', c_name)]
+                
+                # Extract key alphanumeric model tokens (e.g. 5080, 4080, 7800x3d, 990, sn850x)
                 clean_name = re.sub(r'[^a-z0-9\s]', ' ', c_name)
-                tokens = [t for t in clean_name.split() if len(t) > 2 and t not in ['the', 'and', 'for', 'with', 'edition', 'gaming', 'series', 'black', 'white', 'super', 'dual', 'triple']]
+                clean_no_units = re.sub(r'\b\d+\s*(?:gb|tb|mb|mhz|ghz|w|bit)\b', '', clean_name)
+                q_tokens = [t for t in clean_no_units.split() if len(t) > 2 and t not in [
+                    'the', 'and', 'for', 'with', 'edition', 'gaming', 'series', 'black', 'white', 
+                    'super', 'dual', 'triple', 'graphics', 'card', 'desktop', 'processor', 'solid', 
+                    'state', 'drive', 'internal', 'nvme', 'power', 'supply', 'memory'
+                ]]
+                model_tokens = [t for t in q_tokens if re.search(r'\d', t) or len(t) >= 4]
+
                 for h in hw_data:
-                    h_text = f"{h.get('name', '')} {h.get('model', '')} {h.get('id', '')}".lower()
-                    score = sum(1 for t in tokens if t in h_text)
-                    if score >= 2:
-                        matches.append(h)
+                    h_text = f"{h.get('name', '')} {h.get('model', '')} {h.get('id', '')} {h.get('brand', '')}".lower()
+                    
+                    # Brand conflict check: If watchlist specifies brand A, do not match candidate with brand B
+                    if c_brands:
+                        has_brand = any(re.search(r'\b' + re.escape(b) + r'\b', h_text) for b in c_brands)
+                        h_conflicts = [b for b in PRIMARY_BRANDS if b not in c_brands and re.search(r'\b' + re.escape(b) + r'\b', h_text)]
+                        if not has_brand and h_conflicts:
+                            continue
+
+                    # Model token check: ALL critical digit tokens from query must exist in candidate
+                    if model_tokens:
+                        digit_tokens = [t for t in model_tokens if re.search(r'\d', t)]
+                        if digit_tokens and not all(d in h_text for d in digit_tokens):
+                            continue
+                        
+                        score = sum(1 for t in model_tokens if t in h_text)
+                        if score >= max(1, len(model_tokens) - 1):
+                            matches.append(h)
 
             if not matches:
                 return None
 
-            # Sort by retailer reliability (Amazon/Micro Center first) and presence of valid product URL
+            # Sort by presence of valid product URL, retailer reliability, and price
             matches.sort(key=lambda m: (
                 0 if (m.get('product_url') and m.get('product_url').startswith('http') and m.get('product_url') != '#') else 1,
                 retailer_priority.get(m.get('retailer'), 99),
@@ -154,7 +189,8 @@ async def get_dynamic_parts_queue() -> list[dict]:
                     "currentPrice": current_price,
                     "retailer": retailer,
                     "url": clean_url,
-                    "notify": True
+                    "notify": True,
+                    "isWatchlist": True
                 })
 
         # 3. Append remaining catalog components
@@ -177,7 +213,8 @@ async def get_dynamic_parts_queue() -> list[dict]:
                     "currentPrice": float(r.get('current_price') or 0.0),
                     "retailer": r.get('retailer') or 'Amazon',
                     "url": clean_url,
-                    "notify": False
+                    "notify": False,
+                    "isWatchlist": False
                 })
 
         if items:
@@ -185,7 +222,10 @@ async def get_dynamic_parts_queue() -> list[dict]:
     except Exception as e:
         print(f"[Dynamic Parts Queue Notice]: {e}")
 
-    # Fallback to DEFAULT_PARTS_CATALOG if DB # ─── Scheduler State (Daily at 12:00 AM UTC) ──────────────────────────────────
+    # Fallback to DEFAULT_PARTS_CATALOG if DB is empty
+    return [{"id": f"default-{i}", "name": name, "category": "GPU", "currentPrice": 0.0, "retailer": "Amazon", "url": None, "notify": False, "isWatchlist": False} for i, name in enumerate(DEFAULT_PARTS_CATALOG)]
+
+# ─── Scheduler State (Daily at 12:00 AM UTC) ──────────────────────────────────
 scheduler_state = {
     "schedulerRunning": False,
     "lastSchedulerRun": None,
@@ -307,7 +347,6 @@ async def scheduler_loop():
 
 @app.get("/")
 async def root():
-    queue = await get_dynamic_parts_queue()
     return {
         "status": "ok",
         "service": "RigScouter-AI Backend Proxy & Autonomous Tavily Agent",
@@ -317,7 +356,6 @@ async def root():
         "nextScheduledRun": scheduler_state.get("nextScheduledRun"),
         "lastSchedulerRun": scheduler_state.get("lastSchedulerRun"),
         "lastBatchSummary": scheduler_state.get("lastBatchSummary"),
-        "trackedCount": len(queue),
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
