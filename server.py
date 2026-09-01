@@ -81,7 +81,7 @@ async def get_dynamic_parts_queue() -> list[dict]:
         # 1. Fetch all catalog hardware components to build full URL index
         hw_res = await asyncio.to_thread(
             supabase.table('hardware_components')
-            .select('id, name, model, category, brand, current_price, msrp, retailer, product_url, lowest_price_90d')
+            .select('id, name, model, category, brand, current_price, msrp, retailer, product_url, lowest_price_90d, updated_at')
             .order('deal_score', desc=True)
             .limit(500)
             .execute
@@ -160,7 +160,7 @@ async def get_dynamic_parts_queue() -> list[dict]:
         # 2. Fetch user watchlist items (highest priority)
         wl_res = await asyncio.to_thread(
             supabase.table('watchlist_items')
-            .select('id, user_id, component_name, component_id, category, target_price, all_time_low')
+            .select('id, user_id, component_name, component_id, category, target_price, all_time_low, added_at')
             .limit(100)
             .execute
         )
@@ -173,6 +173,7 @@ async def get_dynamic_parts_queue() -> list[dict]:
             url = matched_hw.get('product_url') if matched_hw else None
             retailer = matched_hw.get('retailer') if matched_hw else 'Amazon'
             current_price = float(matched_hw.get('current_price') or r.get('all_time_low') or 0.0) if matched_hw else float(r.get('all_time_low') or 0.0)
+            updated_at_val = matched_hw.get('updated_at') if matched_hw else r.get('added_at')
 
             clean_url = url.strip() if (url and url.startswith('http') and url != '#') else None
             key = clean_url or name.lower()
@@ -190,7 +191,8 @@ async def get_dynamic_parts_queue() -> list[dict]:
                     "retailer": retailer,
                     "url": clean_url,
                     "notify": True,
-                    "isWatchlist": True
+                    "isWatchlist": True,
+                    "updatedAt": updated_at_val
                 })
 
         # 3. Append remaining catalog components
@@ -214,7 +216,8 @@ async def get_dynamic_parts_queue() -> list[dict]:
                     "retailer": r.get('retailer') or 'Amazon',
                     "url": clean_url,
                     "notify": False,
-                    "isWatchlist": False
+                    "isWatchlist": False,
+                    "updatedAt": r.get('updated_at')
                 })
 
         if items:
@@ -223,7 +226,7 @@ async def get_dynamic_parts_queue() -> list[dict]:
         print(f"[Dynamic Parts Queue Notice]: {e}")
 
     # Fallback to DEFAULT_PARTS_CATALOG if DB is empty
-    return [{"id": f"default-{i}", "name": name, "category": "GPU", "currentPrice": 0.0, "retailer": "Amazon", "url": None, "notify": False, "isWatchlist": False} for i, name in enumerate(DEFAULT_PARTS_CATALOG)]
+    return [{"id": f"default-{i}", "name": name, "category": "GPU", "currentPrice": 0.0, "retailer": "Amazon", "url": None, "notify": False, "isWatchlist": False, "updatedAt": None} for i, name in enumerate(DEFAULT_PARTS_CATALOG)]
 
 # ─── Scheduler State (Daily at 12:00 AM UTC) ──────────────────────────────────
 scheduler_state = {
@@ -248,11 +251,13 @@ async def run_full_daily_batch():
     scheduler_state["schedulerRunning"] = True
     start_time = datetime.now(timezone.utc)
     scheduler_state["lastSchedulerRun"] = start_time.isoformat()
+    # Disable Firecrawl in batch to preserve credits
+    agent._disable_firecrawl_in_batch = True
 
     try:
         queue = await get_dynamic_parts_queue()
         total_items = len(queue)
-        print(f"\n[Daily Scheduler] 🌟 [12:00 AM UTC Daily Refresh Started] Updating all {total_items} tracked items in catalog...")
+        print(f"\n[Daily Scheduler] 🌟 [12:00 AM UTC Daily Refresh Started] Updating {total_items} tracked items (Watchlists prioritized, 0-credit Direct HTTP for catalog)...")
         
         broadcast_sse('daily_refresh_start', {
             "totalItems": total_items,
@@ -264,9 +269,26 @@ async def run_full_daily_batch():
             item_name = item.get("name") if isinstance(item, dict) else str(item)
             item_url = item.get("url") if isinstance(item, dict) else None
             retailer = item.get("retailer") if isinstance(item, dict) else "Online Retailer"
+            is_watchlist = bool(item.get("isWatchlist") if isinstance(item, dict) else False)
+            updated_at_str = item.get("updatedAt") if isinstance(item, dict) else None
             pos = i + 1
 
-            print(f"\n[Daily Scheduler] ⏱ ({pos}/{total_items}) Auto-updating: \"{item_name}\" ({retailer})")
+            # Freshness TTL Check: Skip items updated < 18 hours ago that already have a valid price
+            if updated_at_str and isinstance(item, dict) and item.get("currentPrice", 0) > 0:
+                try:
+                    clean_iso = updated_at_str.replace("Z", "+00:00")
+                    item_dt = datetime.fromisoformat(clean_iso)
+                    if item_dt.tzinfo is None:
+                        item_dt = item_dt.replace(tzinfo=timezone.utc)
+                    hours_since = (datetime.now(timezone.utc) - item_dt).total_seconds() / 3600.0
+                    if hours_since < 18.0:
+                        print(f"[Daily Scheduler TTL] ⏭️ ({pos}/{total_items}) Skipping \"{item_name}\": already fresh ({hours_since:.1f}h ago)")
+                        success_count += 1
+                        continue
+                except Exception:
+                    pass
+
+            print(f"\n[Daily Scheduler] ⏱ ({pos}/{total_items}) Auto-updating: \"{item_name}\" ({retailer}) [Watchlist: {is_watchlist}]")
             broadcast_sse('scheduler_tick', {
                 "query": item_name,
                 "url": item_url,
@@ -277,7 +299,7 @@ async def run_full_daily_batch():
             })
 
             direct_success = False
-            # Phase 1: Try Direct Product URL scraping first (instant, 100% accurate, zero search credits)
+            # Phase 1: Direct Product URL scraping (instant, 100% accurate, 0 API search credits)
             if item_url and item_url.startswith('http'):
                 print(f"[Daily Scheduler Direct URL] 🎯 Checking exact URL ({retailer}): {item_url}")
                 try:
@@ -289,19 +311,22 @@ async def run_full_daily_batch():
                 except Exception as direct_err:
                     print(f"⚠️ [Daily Scheduler Direct URL Notice] Failed direct refresh for \"{item_name}\": {direct_err}")
 
-            # Phase 2: Fallback to Multi-Retailer Agent Search if no direct URL or direct scrape failed
+            # Phase 2: Web Search Fallback ONLY for active user watchlists
             if not direct_success:
-                try:
-                    print(f"[Daily Scheduler Multi-Retailer Search] Running full agent search for: \"{item_name}\"")
-                    res = await agent.run(item_name, agent_sse_emitter, user_id=item.get('userId') if isinstance(item, dict) else None)
-                    if res and not res.get('is_error'):
-                        success_count += 1
-                except Exception as search_err:
-                    print(f"⚠️ [Daily Scheduler Search Notice] Error for \"{item_name}\": {search_err}")
+                if is_watchlist:
+                    try:
+                        print(f"[Daily Scheduler Watchlist Search] 🔍 Unified search for user-tracked item: \"{item_name}\"")
+                        res = await agent.run(item_name, agent_sse_emitter, user_id=item.get('userId') if isinstance(item, dict) else None)
+                        if res and not res.get('is_error'):
+                            success_count += 1
+                    except Exception as search_err:
+                        print(f"⚠️ [Daily Scheduler Search Notice] Error for \"{item_name}\": {search_err}")
+                else:
+                    print(f"ℹ️ [Daily Scheduler Catalog Item] \"{item_name}\" (no direct URL/scrape unavailable). Skipping multi-retailer web search to preserve API credits.")
 
             # Gentle pause between items to prevent rate-limits
             if i < total_items - 1:
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(1.5)
 
         end_time = datetime.now(timezone.utc)
         duration_secs = round((end_time - start_time).total_seconds(), 1)
@@ -330,6 +355,7 @@ async def run_full_daily_batch():
         })
         return {"status": "error", "error": str(e)}
     finally:
+        agent._disable_firecrawl_in_batch = False
         scheduler_state["schedulerRunning"] = False
 
 async def scheduler_loop():

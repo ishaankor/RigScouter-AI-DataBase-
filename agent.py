@@ -61,6 +61,8 @@ class TavilyHardwareAgent:
     def __init__(self):
         self.current_key_index = 0
         self.current_firecrawl_index = 0
+        self._classification_cache = {}
+        self._disable_firecrawl_in_batch = False
 
     def get_tavily_key(self):
         return TAVILY_API_KEYS[self.current_key_index % len(TAVILY_API_KEYS)]
@@ -133,13 +135,20 @@ class TavilyHardwareAgent:
     ]
 
     def _fast_classify(self, query: str) -> dict | None:
-        """Return classification instantly if the query matches a known hardware pattern."""
+        """Return classification instantly if the query matches a known hardware pattern or cache."""
         text = query.strip()
+        cache_key = text.lower()
+        if hasattr(self, '_classification_cache') and cache_key in self._classification_cache:
+            return self._classification_cache[cache_key]
+
         for pattern, category in self._REGEX_RULES:
             if pattern.search(text):
                 cleaned = clean_hardware_query(text, category)
                 print(f"[Fast Classify] '{text}' → '{cleaned}' / {category} (regex)")
-                return {"model": cleaned, "category": category}
+                res = {"model": cleaned, "category": category}
+                if hasattr(self, '_classification_cache'):
+                    self._classification_cache[cache_key] = res
+                return res
         return None
 
     async def analyze_query_with_groq(self, query: str) -> dict:
@@ -148,9 +157,16 @@ class TavilyHardwareAgent:
         if fast:
             return fast
 
+        cache_key = query.strip().lower()
+        if hasattr(self, '_classification_cache') and cache_key in self._classification_cache:
+            return self._classification_cache[cache_key]
+
         if not GROQ_API_KEY:
             cleaned = clean_hardware_query(query)
-            return {"model": cleaned, "category": "Hardware"}
+            res = {"model": cleaned, "category": "Hardware"}
+            if hasattr(self, '_classification_cache'):
+                self._classification_cache[cache_key] = res
+            return res
 
         system_prompt = (
             "You are an expert PC hardware classifier and query normalizer. "
@@ -224,10 +240,14 @@ class TavilyHardwareAgent:
                                     if res2.status_code == 200:
                                         data2 = json.loads(res2.json()["choices"][0]["message"]["content"])
                                         if data2.get('model') and data2.get('model') != 'GENERIC_QUERY_ERROR':
+                                            if hasattr(self, '_classification_cache'):
+                                                self._classification_cache[cache_key] = data2
                                             return data2
                         except Exception as e:
                             print(f"[Tavily Fallback Error] {e}")
 
+                    if hasattr(self, '_classification_cache'):
+                        self._classification_cache[cache_key] = data
                     return data
                 else:
                     print(f"[Groq Analyzer] HTTP {res.status_code}: {res.text[:200]}")
@@ -235,7 +255,10 @@ class TavilyHardwareAgent:
             print(f"[Groq Analyzer Error] {e}")
 
         cleaned = clean_hardware_query(query)
-        return {"model": cleaned, "category": "Hardware"}
+        res = {"model": cleaned, "category": "Hardware"}
+        if hasattr(self, '_classification_cache'):
+            self._classification_cache[cache_key] = res
+        return res
 
     async def run(self, prompt: str, emit_fn=None, user_id: str = None, pending_id: str = None) -> dict:
         clean_prompt = prompt.strip()
@@ -374,51 +397,24 @@ class TavilyHardwareAgent:
                     "timestamp": datetime.now(timezone.utc).isoformat()
                 })
         else:
-            RETAILERS = [
-                {'name': 'Micro Center', 'domain': 'microcenter.com'},
-                {'name': 'Newegg', 'domain': 'newegg.com'},
-                {'name': 'Amazon', 'domain': 'amazon.com'},
-                {'name': 'Best Buy', 'domain': 'bestbuy.com'},
-                {'name': 'B&H', 'domain': 'bhphotovideo.com'},
-                {'name': 'eBay', 'domain': 'ebay.com'}
-            ]
-
-            # Launch concurrent scraping jobs using a semaphore to avoid hitting Tavily/Firecrawl concurrency limits too hard
-            sem = asyncio.Semaphore(3)
-
-            async def scrape_and_persist(r):
-                async with sem:
-                    try:
-                        offer = await asyncio.wait_for(
-                            self.scrape_retailer_accurate_offer(clean_prompt, r['name'], r['domain'], category),
-                            timeout=45.0
-                        )
-                    except asyncio.TimeoutError:
-                        print(f"⚠️ [Retailer Timeout] {r['name']} exceeded 45s — proceeding with other retailers")
-                        offer = None
-                    except Exception as e:
-                        print(f"⚠️ [Retailer Error] {r['name']}: {e}")
-                        offer = None
-
-                    if offer and offer.get('price', 0) > 0:
-                        state["scrapedOffers"].append(offer)
-                        await self.persist_hardware_offer(offer, clean_prompt, category)
-                            
-                        if emit_fn:
-                            emit_fn('retailer_found', {
-                                "query": clean_prompt,
-                                "original_query": prompt.strip(),
-                                "retailer": offer['retailer'],
-                                "price": offer['price'],
-                                "title": offer['title'],
-                                "url": offer['url'],
-                                "inStock": offer['inStock'],
-                                "isRefurbished": offer.get('isRefurbished', False),
-                                "timestamp": datetime.now(timezone.utc).isoformat()
-                            })
-
-            tasks = [scrape_and_persist(r) for r in RETAILERS]
-            await asyncio.gather(*tasks)
+            verified_offers = await self.scrape_all_retailers_unified(clean_prompt, category)
+            for offer in verified_offers:
+                if offer and offer.get('price', 0) > 0:
+                    state["scrapedOffers"].append(offer)
+                    await self.persist_hardware_offer(offer, clean_prompt, category)
+                        
+                    if emit_fn:
+                        emit_fn('retailer_found', {
+                            "query": clean_prompt,
+                            "original_query": prompt.strip(),
+                            "retailer": offer['retailer'],
+                            "price": offer['price'],
+                            "title": offer['title'],
+                            "url": offer['url'],
+                            "inStock": offer['inStock'],
+                            "isRefurbished": offer.get('isRefurbished', False),
+                            "timestamp": datetime.now(timezone.utc).isoformat()
+                        })
 
         # Sort all scraped retailer offers: Available (inStock) items first, then lowest price
         def sort_offers(offer):
@@ -1362,18 +1358,138 @@ class TavilyHardwareAgent:
             "source": offer.get('source')
         }
 
+    async def scrape_all_retailers_unified(self, model_query: str, category: str) -> list[dict]:
+        """
+        Executes a single, unified Tavily search across all top hardware retailers (Amazon, Newegg, 
+        Micro Center, Best Buy, B&H, eBay) using 'basic' search depth (1 credit total vs 12).
+        Clusters and parses candidate URLs per retailer using direct HTTP first (0 credits),
+        with fallback to snippet/Firecrawl only when necessary.
+        """
+        RETAILERS_MAP = {
+            'amazon.com': 'Amazon',
+            'microcenter.com': 'Micro Center',
+            'newegg.com': 'Newegg',
+            'bestbuy.com': 'Best Buy',
+            'bhphotovideo.com': 'B&H',
+            'ebay.com': 'eBay'
+        }
+        all_domains = list(RETAILERS_MAP.keys())
+        search_query = f"buy {model_query} lowest price in stock"
+        print(f"[Unified Tavily Search] 🔍 Querying all 6 retailers for \"{model_query}\" ({category}) in 1 single basic search (1 credit)...")
+
+        results = []
+        for attempt in range(len(TAVILY_API_KEYS)):
+            try:
+                async with httpx.AsyncClient() as client:
+                    res = await client.post('https://api.tavily.com/search', json={
+                        "api_key": self.get_tavily_key(),
+                        "query": search_query,
+                        "search_depth": "basic",
+                        "include_domains": all_domains,
+                        "include_raw_content": False,
+                        "max_results": 15
+                    }, timeout=15.0)
+                
+                if res.status_code != 200:
+                    raise Exception(f"Tavily search HTTP {res.status_code}: {res.text[:200]}")
+                
+                data = res.json()
+                results = data.get('results', [])
+                break
+            except Exception as e:
+                print(f"[Tavily Unified Search Error]: {e}")
+                self.rotate_tavily_key()
+
+        if not results:
+            print(f"[Unified Tavily Search] No raw search results returned for \"{model_query}\"")
+            return []
+
+        # Batch filter candidate titles with semantic matching
+        titles_to_check = [r.get('title', '') for r in results]
+        match_results = await self.filter_matching_titles(titles_to_check, model_query, category)
+
+        # Cluster candidate URLs by retailer
+        retailer_candidates: dict[str, list[dict]] = {}
+        for i, hit in enumerate(results):
+            if i < len(match_results) and not match_results[i]:
+                print(f"⚠️ [Tavily Title Mismatch] Skipping: {hit.get('title')}")
+                continue
+
+            full_url = hit.get('url', '')
+            matched_domain = None
+            for d in all_domains:
+                if d in full_url.lower():
+                    matched_domain = d
+                    break
+            
+            if not matched_domain:
+                continue
+
+            ret_name = RETAILERS_MAP[matched_domain]
+            if not self.is_valid_direct_product_url(full_url, matched_domain):
+                continue
+
+            clean_url = full_url.replace('/reviews/', '').split('?')[0]
+            
+            # Extract price hint from search snippet
+            price_hint = 999999.0
+            combined_text = (hit.get('content', '') or '') + ' ' + (hit.get('title', '') or '')
+            pm = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', combined_text)
+            if pm:
+                try:
+                    val = float(pm.group(1).replace(',', ''))
+                    if val > 5.0:
+                        price_hint = val
+                except ValueError:
+                    pass
+
+            item_candidate = {
+                'url': clean_url,
+                'title': hit.get('title', ''),
+                'content': hit.get('content', ''),
+                'price_hint': price_hint,
+                'retailer': ret_name,
+                'domain': matched_domain
+            }
+            retailer_candidates.setdefault(ret_name, []).append(item_candidate)
+
+        # Process each retailer's candidates
+        verified_offers = []
+        for ret_name, candidates in retailer_candidates.items():
+            candidates.sort(key=lambda x: x.get('price_hint', 999999.0))
+            # Evaluate top 2 candidates per retailer
+            for cand in candidates[:2]:
+                # 1. Try Direct HTTP first (0 API cost)
+                offer = await self.direct_http_extract(cand['url'], ret_name, category, model_query)
+                
+                # 2. Try snippet extraction if HTTP was blocked / no price found (0 scraping credits)
+                if not offer or (offer.get('price', 0) == 0 and not offer.get('out_of_stock')):
+                    offer = await self.extract_snippet_offer(cand, ret_name, category, model_query)
+                
+                # 3. Only fallback to Firecrawl if available and not disabled in batch
+                if not offer or (offer.get('price', 0) == 0 and not offer.get('out_of_stock')):
+                    if not getattr(self, '_disable_firecrawl_in_batch', False):
+                        offer = await self.firecrawl_extract(cand['url'], ret_name, category, model_query)
+
+                if offer and offer.get('price', 0) > 0 and not offer.get('out_of_stock') and offer.get('inStock', True):
+                    verified_offers.append(offer)
+                    print(f"✅ [{ret_name.upper()} OFFER EXTRACTED] ${offer['price']:.2f} -> {offer['title'][:60]}")
+                    break
+
+        return verified_offers
+
     async def scrape_retailer_accurate_offer(self, model_query: str, retailer_name: str, domain_pattern: str, category: str) -> dict:
         print(f"[Tavily Search] Querying {retailer_name} for \"{model_query}\" ({category})...")
         
         for attempt in range(len(TAVILY_API_KEYS)):
             try:
-                # 1. Search with Tavily to get candidate URLs
+                # 1. Search with Tavily to get candidate URLs using basic depth (1 credit)
                 search_query = f"buy {model_query} lowest price in stock"
                 async with httpx.AsyncClient() as client:
                     res = await client.post('https://api.tavily.com/search', json={
                         "api_key": self.get_tavily_key(),
                         "query": search_query,
-                        "search_depth": "advanced",
+                        "search_depth": "basic",
                         "include_domains": [domain_pattern],
                         "include_raw_content": False,
                         "max_results": 10
@@ -1432,9 +1548,10 @@ class TavilyHardwareAgent:
                     # 1. Try Direct HTTP fetch first (fast, browser headers, 0 credit cost)
                     offer = await self.direct_http_extract(candidate['url'], retailer_name, category, model_query)
                     
-                    # 2. If Direct HTTP failed or was blocked, try Firecrawl proxy
+                    # 2. If Direct HTTP failed or was blocked, try Firecrawl proxy (unless disabled in batch)
                     if not offer or (offer.get('price', 0) == 0 and not offer.get('out_of_stock')):
-                        offer = await self.firecrawl_extract(candidate['url'], retailer_name, category, model_query)
+                        if not getattr(self, '_disable_firecrawl_in_batch', False):
+                            offer = await self.firecrawl_extract(candidate['url'], retailer_name, category, model_query)
 
                     # 3. If Direct HTTP & Firecrawl both failed or were blocked by WAF (e.g. Best Buy on Render), use AI snippet extraction
                     if not offer or (offer.get('price', 0) == 0 and not offer.get('out_of_stock')):
