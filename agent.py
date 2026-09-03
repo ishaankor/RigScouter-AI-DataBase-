@@ -1629,6 +1629,9 @@ class TavilyHardwareAgent:
                     print(f"[Firecrawl] Rate/credit limit — disabling Firecrawl for session")
                     self._firecrawl_disabled_until = time.time() + 300
                     return None
+                elif "dns resolution failed" in error_str or "dns" in error_str:
+                    print(f"⚠️ [Firecrawl Cloud DNS Warning] {retailer_name}: Firecrawl cloud proxy DNS could not resolve domain — skipping Firecrawl for this URL")
+                    return None
                 else:
                     print(f"[Firecrawl Error] {retailer_name}: {e}")
                     return None
