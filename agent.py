@@ -1460,14 +1460,14 @@ class TavilyHardwareAgent:
                 # 1. Try Direct HTTP first (0 API cost)
                 offer = await self.direct_http_extract(cand['url'], ret_name, category, model_query)
                 
-                # 2. Try snippet extraction if HTTP was blocked / no price found (0 scraping credits)
-                if not offer or ((offer.get('price') or 0) == 0 and not offer.get('out_of_stock')):
-                    offer = await self.extract_snippet_offer(cand, ret_name, category, model_query)
-                
-                # 3. Only fallback to Firecrawl if available and not disabled in batch
+                # 2. Try Firecrawl to render exact live DOM if HTTP was blocked/unavailable
                 if not offer or ((offer.get('price') or 0) == 0 and not offer.get('out_of_stock')):
                     if not getattr(self, '_disable_firecrawl_in_batch', False):
                         offer = await self.firecrawl_extract(cand['url'], ret_name, category, model_query)
+
+                # 3. Last-resort fallback: Snippet extraction only if both direct HTTP and Firecrawl failed
+                if not offer or ((offer.get('price') or 0) == 0 and not offer.get('out_of_stock')):
+                    offer = await self.extract_snippet_offer(cand, ret_name, category, model_query)
 
                 if offer and (offer.get('price') or 0) > 0 and not offer.get('out_of_stock') and offer.get('inStock', True):
                     verified_offers.append(offer)
@@ -1756,14 +1756,15 @@ class TavilyHardwareAgent:
         if is_oos:
             return {"out_of_stock": True, "title": clean_title}
 
-        print(f"✅ [SNIPPET-AI HIT] {retailer_name}: Found price ${price:.2f} (InStock: True) -> {clean_title[:60]}")
+        is_refurb = retailer_name == 'eBay' or any(w in combined_text.lower() for w in ['refurbished', 'used', 'pre-owned', 'renewed'])
+        print(f"✅ [SNIPPET-AI HIT] {retailer_name}: Found price ${price:.2f} (InStock: True, Refurb: {is_refurb}) -> {clean_title[:60]}")
         return {
             "retailer": retailer_name,
             "title": clean_title,
             "price": price,
             "originalPrice": None,
             "inStock": True,
-            "isRefurbished": False,
+            "isRefurbished": is_refurb,
             "url": url,
             "imageUrl": None,
             "brand": None,
