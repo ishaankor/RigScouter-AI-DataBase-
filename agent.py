@@ -342,7 +342,7 @@ class TavilyHardwareAgent:
 
         if is_url:
             offer = await self.extract_direct_page(clean_prompt, self.detect_retailer(clean_prompt), category, model_query=model_name)
-            if not offer or offer.get('blocked') or offer.get('price', 0) <= 0:
+            if not offer or offer.get('blocked') or (offer.get('price') or 0) <= 0:
                 print(f"⚠️ [Direct Page Extraction Failed] Could not extract price from {clean_prompt}")
                 state["summary"] = f"Unable to extract live pricing from \"{clean_prompt}\". The retailer page may be bot-protected or unavailable."
                 if emit_fn:
@@ -399,7 +399,7 @@ class TavilyHardwareAgent:
         else:
             verified_offers = await self.scrape_all_retailers_unified(clean_prompt, category)
             for offer in verified_offers:
-                if offer and offer.get('price', 0) > 0:
+                if offer and (offer.get('price') or 0) > 0:
                     state["scrapedOffers"].append(offer)
                     await self.persist_hardware_offer(offer, clean_prompt, category)
                         
@@ -407,18 +407,18 @@ class TavilyHardwareAgent:
                         emit_fn('retailer_found', {
                             "query": clean_prompt,
                             "original_query": prompt.strip(),
-                            "retailer": offer['retailer'],
+                            "retailer": offer.get('retailer', 'Online Retailer'),
                             "price": offer['price'],
                             "title": offer['title'],
                             "url": offer['url'],
-                            "inStock": offer['inStock'],
+                            "inStock": offer.get('inStock', True),
                             "isRefurbished": offer.get('isRefurbished', False),
                             "timestamp": datetime.now(timezone.utc).isoformat()
                         })
 
         # Sort all scraped retailer offers: Available (inStock) items first, then lowest price
         def sort_offers(offer):
-            return (0 if offer.get('inStock', True) else 1, offer.get('price', 999999))
+            return (0 if offer.get('inStock', True) else 1, offer.get('price') or 999999)
 
         state["scrapedOffers"].sort(key=sort_offers)
 
@@ -602,7 +602,7 @@ class TavilyHardwareAgent:
 
     async def persist_hardware_offer(self, offer: dict, model_name: str, category: str, comp_id_override: str = None) -> dict | None:
         """Saves or updates a retailer offer in hardware_components, recording timestamped PriceHistory."""
-        if not offer or offer.get('price', 0) <= 0:
+        if not offer or (offer.get('price') or 0) <= 0:
             return None
 
         try:
@@ -699,7 +699,7 @@ class TavilyHardwareAgent:
         print(f"[Direct URL Scraper] 🎯 Fetching exact URL for: \"{component_name}\" ({retailer_name}) -> {url}")
         
         offer = await self.extract_direct_page(url, retailer_name, category, model_query=component_name)
-        if not offer or offer.get('blocked') or offer.get('price', 0) <= 0:
+        if not offer or offer.get('blocked') or (offer.get('price') or 0) <= 0:
             print(f"⚠️ [Direct URL Scraper Notice] Unable to extract live price from: {url}")
             return None
 
@@ -755,8 +755,6 @@ class TavilyHardwareAgent:
 
                     update_payload = {
                         "all_time_low": min(prior_atl, price),
-                        "retailer": retailer_name,
-                        "product_url": url,
                     }
                     if prior_price and prior_price != price:
                         update_payload["previous_price_24h"] = prior_price
@@ -1278,13 +1276,13 @@ class TavilyHardwareAgent:
         offer = self.extract_json_ld(soup, model_query)
 
         # Tier 2: OpenGraph & Microdata
-        if not offer or offer.get('price', 0) == 0:
+        if not offer or (offer.get('price') or 0) == 0:
             og_offer = self.extract_opengraph_microdata(soup)
-            if og_offer and og_offer.get('price', 0) > 0:
+            if og_offer and (og_offer.get('price') or 0) > 0:
                 offer = og_offer
 
         # Tier 3: Dedicated Retailer Buybox DOM
-        if not offer or offer.get('price', 0) == 0:
+        if not offer or (offer.get('price') or 0) == 0:
             dom_offer = self.extract_retailer_buybox_dom(soup, retailer_name)
             if dom_offer:
                 if dom_offer.get('out_of_stock'):
@@ -1292,9 +1290,9 @@ class TavilyHardwareAgent:
                 offer = dom_offer
 
         # Tier 4: AI Extraction on clean markdown if structured data missing
-        if not offer or offer.get('price', 0) == 0:
+        if not offer or (offer.get('price') or 0) == 0:
             groq_data = await self.parse_with_groq(markdown_content or html_content[:8000], model_query, retailer_name, category)
-            if groq_data and groq_data.get('price', 0) > 0:
+            if groq_data and (groq_data.get('price') or 0) > 0:
                 offer = {
                     "title": groq_data.get('title'),
                     "price": groq_data['price'],
@@ -1313,10 +1311,10 @@ class TavilyHardwareAgent:
             else:
                 return {"out_of_stock": True}
 
-        if not offer or offer.get('price', 0) <= 0:
+        if not offer or (offer.get('price') or 0) <= 0:
             return {"out_of_stock": True} if page_oos else None
 
-        price_val = float(offer.get('price', 0))
+        price_val = float(offer.get('price') or 0)
 
         # Sanity Price Guard: Discard false positive promo/shipping/rebate micro-prices
         MIN_CATEGORY_PRICES = {
@@ -1463,15 +1461,15 @@ class TavilyHardwareAgent:
                 offer = await self.direct_http_extract(cand['url'], ret_name, category, model_query)
                 
                 # 2. Try snippet extraction if HTTP was blocked / no price found (0 scraping credits)
-                if not offer or (offer.get('price', 0) == 0 and not offer.get('out_of_stock')):
+                if not offer or ((offer.get('price') or 0) == 0 and not offer.get('out_of_stock')):
                     offer = await self.extract_snippet_offer(cand, ret_name, category, model_query)
                 
                 # 3. Only fallback to Firecrawl if available and not disabled in batch
-                if not offer or (offer.get('price', 0) == 0 and not offer.get('out_of_stock')):
+                if not offer or ((offer.get('price') or 0) == 0 and not offer.get('out_of_stock')):
                     if not getattr(self, '_disable_firecrawl_in_batch', False):
                         offer = await self.firecrawl_extract(cand['url'], ret_name, category, model_query)
 
-                if offer and offer.get('price', 0) > 0 and not offer.get('out_of_stock') and offer.get('inStock', True):
+                if offer and (offer.get('price') or 0) > 0 and not offer.get('out_of_stock') and offer.get('inStock', True):
                     verified_offers.append(offer)
                     print(f"✅ [{ret_name.upper()} OFFER EXTRACTED] ${offer['price']:.2f} -> {offer['title'][:60]}")
                     break
@@ -1549,19 +1547,19 @@ class TavilyHardwareAgent:
                     offer = await self.direct_http_extract(candidate['url'], retailer_name, category, model_query)
                     
                     # 2. If Direct HTTP failed or was blocked, try Firecrawl proxy (unless disabled in batch)
-                    if not offer or (offer.get('price', 0) == 0 and not offer.get('out_of_stock')):
+                    if not offer or ((offer.get('price') or 0) == 0 and not offer.get('out_of_stock')):
                         if not getattr(self, '_disable_firecrawl_in_batch', False):
                             offer = await self.firecrawl_extract(candidate['url'], retailer_name, category, model_query)
 
                     # 3. If Direct HTTP & Firecrawl both failed or were blocked by WAF (e.g. Best Buy on Render), use AI snippet extraction
-                    if not offer or (offer.get('price', 0) == 0 and not offer.get('out_of_stock')):
+                    if not offer or ((offer.get('price') or 0) == 0 and not offer.get('out_of_stock')):
                         offer = await self.extract_snippet_offer(candidate, retailer_name, category, model_query)
 
                     if offer:
                         if offer.get('out_of_stock') or not offer.get('inStock', True):
                             print(f"⚠️ [Confirmed Out of Stock] {retailer_name}: '{offer.get('title', candidate['title'])}' is out of stock / discontinued. Skipping to next candidate...")
                             continue
-                        if offer.get('price', 0) > 0:
+                        if (offer.get('price') or 0) > 0:
                             valid_offers.append(offer)
 
                 if valid_offers:

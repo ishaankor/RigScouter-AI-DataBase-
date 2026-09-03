@@ -304,7 +304,7 @@ async def run_full_daily_batch():
                 print(f"[Daily Scheduler Direct URL] 🎯 Checking exact URL ({retailer}): {item_url}")
                 try:
                     offer = await agent.refresh_direct_item(item, agent_sse_emitter)
-                    if offer and offer.get('price', 0) > 0:
+                    if offer and (offer.get('price') or 0) > 0:
                         print(f"✅ [Daily Scheduler Direct URL Success] Refreshed \"{item_name}\" -> ${offer['price']:.2f} at {offer.get('retailer', retailer)}")
                         direct_success = True
                         success_count += 1
