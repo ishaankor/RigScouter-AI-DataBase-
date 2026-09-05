@@ -1,1889 +1,657 @@
 import os
+import re
 import json
+import base64
 import time
 import asyncio
-import requests
-import httpx
+import urllib.parse
 from datetime import datetime, timezone
-import random
-import re
+import httpx
 from bs4 import BeautifulSoup
-from firecrawl import FirecrawlApp
+from dotenv import load_dotenv
 
-from supabase_client import supabase
+load_dotenv()
 
-TAVILY_API_KEYS = [k.strip() for k in os.environ.get("TAVILY_API_KEYS", os.environ.get("TAVILY_API_KEY", "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")).split(',') if k.strip()]
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-FIRECRAWL_API_KEYS = [k.strip() for k in os.environ.get("FIRECRAWL_API_KEYS", os.environ.get("FIRECRAWL_API_KEY", "")).split(',') if k.strip()]
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+CANOPY_API_KEY = os.environ.get("CANOPY_API_KEY", "")
+EBAY_CLIENT_ID = os.environ.get("EBAY_CLIENT_ID", "")
+EBAY_CLIENT_SECRET = os.environ.get("EBAY_CLIENT_SECRET", "")
 
-firecrawl_apps = [FirecrawlApp(api_key=key) for key in FIRECRAWL_API_KEYS] if FIRECRAWL_API_KEYS else []
+# ─── 1. AI PRODUCT ANALYZER (No hardcoded brands or regexes) ──────────────────
 
-def clean_hardware_query(query: str, category: str = None) -> str:
-    s = query.strip()
-    # Normalize common hardware acronyms and casing
-    s = re.sub(r'(?i)\bgeforce\b', 'GeForce', s)
-    s = re.sub(r'(?i)\bradeon\b', 'Radeon', s)
-    s = re.sub(r'(?i)\bwi-?fi\b', 'WiFi', s)
-    s = re.sub(r'(?i)\bmini-?itx\b', 'ITX', s)
-    s = re.sub(r'(?i)\bmicro-?atx\b', 'mATX', s)
-    s = re.sub(r'(?i)\bgen\s*([345])\b', r'Gen\1', s)
-    
-    # Split glued tokens (e.g. Z890WiFi -> Z890 WiFi, RTX4070 -> RTX 4070, Ryzen7 -> Ryzen 7)
-    s = re.sub(r'(?i)(z\d{3}|b\d{3}|x\d{3}|a\d{3})(wifi|pro|plus|gaming|elite|hero|taichi|max)', r'\1 \2', s)
-    s = re.sub(r'(?i)(rtx|gtx|rx)(\d{3,4})', r'\1 \2', s)
-    s = re.sub(r'(?i)(ryzen|core)(\d+)', r'\1 \2', s)
-    s = re.sub(r'(\d+)(gb|tb|w|mhz|ghz)\b', r'\1\2', s, flags=re.I)
-    
-    # Strip long retail listing suffixes after delimiters (e.g. " - 1x HDMI & 3X DisplayPort...", ", 4-Monitor Support...")
-    s = re.sub(r'\s*[-–—|]\s*(?:\d+x\s*hdmi|pcie\s*4|4k\s*gaming|ray\s*tracing|dlss|triple\s*fan|oem\b|non\s*retail|vr\s*ready|rgb\b|high[- ]performance).*$', '', s, flags=re.I)
-    s = re.sub(r'[,.]\s*(?:pcie\s*4|4k\s*gaming|ray\s*tracing|dlss|triple\s*fan|oem\b|non\s*retail|vr\s*ready|4-monitor|high[- ]performance).*$', '', s, flags=re.I)
-    s = re.sub(r'\bOEM\s*\([^)]*\)', '', s, flags=re.I)
+class ProductAnalysis:
+    def __init__(self, raw_query: str, brand: str | None, model: str, category: str,
+                 is_pc_part: bool, retailer_search_query: str, negative_keywords: list[str],
+                 min_price: float | None = None):
+        self.raw_query = raw_query
+        self.brand = brand
+        self.model = model
+        self.category = category
+        self.is_pc_part = is_pc_part
+        self.retailer_search_query = retailer_search_query
+        self.negative_keywords = negative_keywords
+        self.min_price = min_price
 
-    # Strip marketing filler while preserving all model, brand, capacity, and spec tokens
-    FLUFF_PATTERNS = [
-        r'(?i)\b(?:desktop\s+processor|boxed\s+processor|unlocked\s+desktop\s+processor)\b',
-        r'(?i)\b(?:graphics\s+card|video\s+card|gaming\s+graphics\s+card)\b',
-        r'(?i)\b(?:gaming\s+motherboard|desktop\s+motherboard)\b',
-        r'(?i)\b(?:internal\s+solid\s+state\s+drive|solid\s+state\s+drive|internal\s+ssd)\b',
-        r'(?i)\b(?:desktop\s+memory|pc\s+gaming\s+memory|dram\s+desktop\s+memory)\b',
-        r'(?i)\b(?:power\s+supply\s+unit)\b',
-        r'(?i)\b(?:heatsink\s+not\s+included|cooler\s+not\s+included|no\s+cooler|without\s+cooler)\b',
-        r'(?i)\b(?:brand\s+new|sealed\s+in\s+box|factory\s+sealed)\b',
-    ]
-    for pattern in FLUFF_PATTERNS:
-        s = re.sub(pattern, ' ', s)
-        
-    s = re.sub(r'\s+', ' ', s).strip()
-    return s
+    def to_dict(self) -> dict:
+        return {
+            "raw_query": self.raw_query,
+            "brand": self.brand,
+            "model": self.model,
+            "category": self.category,
+            "is_pc_part": self.is_pc_part,
+            "retailer_search_query": self.retailer_search_query,
+            "negative_keywords": self.negative_keywords,
+            "min_price": self.min_price,
+        }
 
-class TavilyHardwareAgent:
-    def __init__(self):
-        self.current_key_index = 0
-        self.current_firecrawl_index = 0
-        self._classification_cache = {}
-        self._disable_firecrawl_in_batch = False
+class ProductAnalyzer:
+    """Uses LLM to understand PC components dynamically without hardcoded brand lists or chipsets."""
 
-    def get_tavily_key(self):
-        return TAVILY_API_KEYS[self.current_key_index % len(TAVILY_API_KEYS)]
-
-    def rotate_tavily_key(self):
-        if len(TAVILY_API_KEYS) > 1:
-            self.current_key_index = (self.current_key_index + 1) % len(TAVILY_API_KEYS)
-            print(f"[Tavily Key Rotated] Active key index: {self.current_key_index + 1}/{len(TAVILY_API_KEYS)}")
-
-    def get_firecrawl_app(self):
-        if not firecrawl_apps:
-            return None
-        return firecrawl_apps[self.current_firecrawl_index % len(firecrawl_apps)]
-
-    def rotate_firecrawl_key(self):
-        if len(firecrawl_apps) > 1:
-            self.current_firecrawl_index = (self.current_firecrawl_index + 1) % len(firecrawl_apps)
-            print(f"[Firecrawl Key Rotated] Active key index: {self.current_firecrawl_index + 1}/{len(firecrawl_apps)}")
-
-    # --------------------------------------------------------
-    # FAST REGEX PRE-FILTER
-    # Classifies all known hardware categories instantly.
-    # --------------------------------------------------------
-    _REGEX_RULES = [
-        # GPU — RTX / GTX / Titan / Quadro (NVIDIA)
-        (re.compile(r'\b(geforce\s+)?(rtx|gtx)\s*\d{3,4}(?:\s*(super|ti|xt))?\b', re.I), 'GPU'),
-        # GPU — Radeon RX (AMD)
-        (re.compile(r'\b(radeon\s+)?rx\s*\d{3,4}(?:\s*(xt|xtx|gre))?\b', re.I), 'GPU'),
-        # GPU — Intel Arc
-        (re.compile(r'\barc\s+[ab]\d{3,4}\b', re.I), 'GPU'),
-        # GPU — RX 9xxx / 8xxx
-        (re.compile(r'\brx\s*[89]\d{3}(?:\s*(xt|xtx))?\b', re.I), 'GPU'),
-        # CPU — AMD Ryzen & Threadripper
-        (re.compile(r'\b(?:amd\s+)?(ryzen\s*[3579]|threadripper)\s+\d{4,5}[a-z0-9]*(?:\s*x3d)?\b', re.I), 'CPU'),
-        # CPU — Intel Core Ultra
-        (re.compile(r'\b(?:intel\s+)?(?:core\s+)?ultra\s*[3579]\s*(?:series\s*2\s*)?[- ]?\d{3,4}[a-z]*(?:\s+plus)?\b', re.I), 'CPU'),
-        (re.compile(r'\b(?:intel\s+)?(?:core\s+)?(ultra\s*[3579]|i[3579])[- ]\d{3,6}[a-z]*(?:\s+plus)?\b', re.I), 'CPU'),
-        # CPU — Intel Core i-series
-        (re.compile(r'\b(?:intel\s+)?(?:core\s+)?i[3579][ -]\d{4,5}[a-z]*\b', re.I), 'CPU'),
-        # Motherboard — brand + chipset
-        (re.compile(r'\b(asrock|asus|msi|gigabyte|nzxt|biostar)\s+(z|b|x|a)\d{3}[a-z]*(?:\s+(?:wifi|pro|plus|gaming|elite|hero|taichi|extreme|max|tomahawk|aorus|strix|tuf))?\b', re.I), 'Motherboard'),
-        # Motherboard — chipset + form factor
-        (re.compile(r'\b(z\d{3}|b\d{3}|x\d{3}|a\d{3})\s*(e|f|p|m|a|plus|pro|max|wifi|gaming)?\s*(motherboard|atx|matx|itx|mainboard)?\b', re.I), 'Motherboard'),
-        # RAM — DDR capacity/speed / famous series
-        (re.compile(r'\b(trident\s*z\d?|dominator|vengeance|ripjaws|fury\s+beast|t-force|g\.?skill)\b', re.I), 'RAM'),
-        (re.compile(r'\b\d+gb\s+(?:kit\s+)?(?:\(\d+x\d+gb\)\s+)?(ddr[45]|so-?dimm)\b', re.I), 'RAM'),
-        (re.compile(r'\bddr[45][- ]\d{4,5}\b', re.I), 'RAM'),
-        (re.compile(r'\bddr[45]\s+\d+gb\b', re.I), 'RAM'),
-        # Storage — SSD / NVMe / HDD / famous models
-        (re.compile(r'\b(990\s+pro|980\s+pro|sn850x|sn770|t700|t500|kc3000|firecuda|ironwolf|barracuda)\b', re.I), 'Storage'),
-        (re.compile(r'\b\d+(?:\.\d+)?\s*(tb|gb)\s+(nvme|ssd|hdd|m\.2|solid\s+state|gen[45])\b', re.I), 'Storage'),
-        (re.compile(r'\b(nvme|ssd|m\.2)\s+\d+(?:\.\d+)?\s*(tb|gb)\b', re.I), 'Storage'),
-        # Power Supply — PSU models and wattages
-        (re.compile(r'\b(rm\d{3,4}[a-z]*|sf\d{3,4}|focus\s+gx|toughpower|dark\s+power|pure\s+power|supernova)\b', re.I), 'Power Supply'),
-        (re.compile(r'\b\d{3,4}\s*w\s+(psu|power\s+supply|modular|atx|sfx)\b', re.I), 'Power Supply'),
-        (re.compile(r'\b(psu|power\s+supply)\s+\d{3,4}\s*w\b', re.I), 'Power Supply'),
-        # Cooling — AIO / Air Coolers / Fans / Paste
-        (re.compile(r'\b(nh-d15|nh-u12a|peerless\s+assassin|phantom\s+spirit|ak620|lt720|kraken|liquid\s+freezer|galahad|icue\s+link|kryonaut|mx-[456]|nt-h[12]|uni\s+fan)\b', re.I), 'Cooling'),
-        (re.compile(r'\b(aio\s+liquid|liquid\s+cooler|cpu\s+cooler|air\s+cooler|thermal\s+paste|case\s+fan|case\s+fans|120mm\s+fan|140mm\s+fan)\b', re.I), 'Cooling'),
-        # Case — popular cases / form factors
-        (re.compile(r'\b(o11\s+dynamic|lancool|h[5679]\s+flow|fractal\s+north|meshify|pop\s+air|4000d|5000d|king\s+95|nv[57]|y[67]0)\b', re.I), 'Case'),
-        (re.compile(r'\b(pc\s+case|mid\s+tower|full\s+tower|mini\s+itx\s+case|atx\s+case|dual\s+chamber)\b', re.I), 'Case'),
-        # Monitor — specs & models
-        (re.compile(r'\b(ultragear|odyssey\s+g\d|alienware\s+aw\d{4}|rog\s+swift)\b', re.I), 'Monitor'),
-        (re.compile(r'\b\d{2,3}\s*(hz|inch\s+monitor|ips|oled|va|tn)\b', re.I), 'Monitor'),
-        (re.compile(r'\b\d{2,3}(?:\.\d)?["\u201d]?\s*(4k|1440p|1080p|ips|oled|va|tn)\s*(monitor|display|screen)?\b', re.I), 'Monitor'),
-        # Peripherals — Keyboards, Mice, Headsets, Mics, Stream Decks
-        (re.compile(r'\b(superlight|viper\s+v\d|deathadder|basilisk|g502|wooting|keychron|apex\s+pro|huntsman|stream\s+deck|wave:?\s*3|shure\s+sm7|blackshark)\b', re.I), 'Peripherals'),
-        (re.compile(r'\b(gaming\s+mouse|mechanical\s+keyboard|gaming\s+headset|usb\s+microphone|capture\s+card)\b', re.I), 'Peripherals'),
-    ]
-
-    def _fast_classify(self, query: str) -> dict | None:
-        """Return classification instantly if the query matches a known hardware pattern or cache."""
-        text = query.strip()
-        cache_key = text.lower()
-        if hasattr(self, '_classification_cache') and cache_key in self._classification_cache:
-            return self._classification_cache[cache_key]
-
-        for pattern, category in self._REGEX_RULES:
-            if pattern.search(text):
-                cleaned = clean_hardware_query(text, category)
-                print(f"[Fast Classify] '{text}' → '{cleaned}' / {category} (regex)")
-                res = {"model": cleaned, "category": category}
-                if hasattr(self, '_classification_cache'):
-                    self._classification_cache[cache_key] = res
-                return res
-        return None
-
-    async def analyze_query_with_groq(self, query: str) -> dict:
-        # Try fast pre-filter first
-        fast = self._fast_classify(query)
-        if fast:
-            return fast
-
-        cache_key = query.strip().lower()
-        if hasattr(self, '_classification_cache') and cache_key in self._classification_cache:
-            return self._classification_cache[cache_key]
+    @staticmethod
+    async def analyze_query(query: str) -> ProductAnalysis:
+        clean = query.strip()
+        if not clean:
+            return ProductAnalysis(clean, None, clean, "Other", False, clean, [])
 
         if not GROQ_API_KEY:
-            cleaned = clean_hardware_query(query)
-            res = {"model": cleaned, "category": "Hardware"}
-            if hasattr(self, '_classification_cache'):
-                self._classification_cache[cache_key] = res
-            return res
+            return ProductAnalysis(clean, None, clean, "Hardware", True, clean, [])
 
-        system_prompt = (
-            "You are an expert PC hardware classifier and query normalizer. "
-            "Given a user search query for computer hardware or peripherals, extract the canonical component name and classify it into an exact category. "
-            "Return ONLY a JSON object with two keys: 'model' and 'category'. "
-            "For 'model': Clean marketing fluff (e.g. 'Desktop Processor', 'Graphics Card') while PRESERVING brand, series, sub-model, capacities (e.g. '2TB', '850W', '32GB'), and colors. "
-            "Only set 'model' to EXACTLY 'GENERIC_QUERY_ERROR' if the query is a completely broad product family with no specific model number (e.g. 'RTX 40 series', 'Ryzen 5000 series', 'DDR5 RAM'). "
-            "For 'category': Classify into ONE of: GPU, CPU, RAM, Motherboard, Storage, Power Supply, Case, Cooling, Monitor, Peripherals, Accessories. "
-            "Only if the item is completely unrelated to computers or gaming (e.g. 'iPhone', 'Nike shoes', 'Car tires'), set 'category' to 'Not compatible (N/A)'. "
-            "Examples:\n"
-            "Input: ASUS ROG Strix GeForce RTX 4090 OC 24GB -> {\"model\": \"ASUS ROG Strix RTX 4090\", \"category\": \"GPU\"}\n"
-            "Input: Lian Li O11 Dynamic EVO RGB White -> {\"model\": \"Lian Li O11 Dynamic EVO RGB White\", \"category\": \"Case\"}\n"
-            "Input: Noctua NH-D15 chromax.black -> {\"model\": \"Noctua NH-D15 chromax.black\", \"category\": \"Cooling\"}\n"
-            "Input: Corsair RM850x 850W Gold PSU -> {\"model\": \"Corsair RM850x 850W\", \"category\": \"Power Supply\"}\n"
-            "Input: Samsung 990 Pro 2TB NVMe SSD -> {\"model\": \"Samsung 990 Pro 2TB\", \"category\": \"Storage\"}\n"
-            "Input: Wooting 60HE+ Mechanical Keyboard -> {\"model\": \"Wooting 60HE+\", \"category\": \"Peripherals\"}\n"
-            "Input: Logitech G Pro X Superlight 2 Wireless -> {\"model\": \"Logitech G Pro X Superlight 2\", \"category\": \"Peripherals\"}\n"
-            "Input: Thermal Grizzly Kryonaut 1g -> {\"model\": \"Thermal Grizzly Kryonaut 1g\", \"category\": \"Cooling\"}\n"
-            "Input: iPhone 15 Pro Max -> {\"model\": \"iPhone 15 Pro Max\", \"category\": \"Not compatible (N/A)\"}\n"
+        prompt = (
+            "You are an expert PC hardware and technology analyzer. "
+            "Given a user search query, extract structured information without relying on hardcoded lists. "
+            "Return valid JSON with:\n"
+            "- \"brand\": The hardware manufacturer or brand if known/implied (e.g. 'Montech', 'NVIDIA', 'AMD', 'ASUS', 'Corsair', 'Lian Li'), or null.\n"
+            "- \"model\": The core model / part name (e.g. 'King 95', 'RTX 5090', 'Ryzen 7 9800X3D', 'Trident Z5', 'RM850x').\n"
+            "- \"category\": Exactly one of: 'GPU', 'CPU', 'RAM', 'Motherboard', 'Storage', 'Power Supply', 'Case', 'Cooling', 'Monitor', 'Peripherals', or 'Other'.\n"
+            "- \"is_pc_part\": true if it is a PC component, computer part, or peripheral; false if food, clothing, or unrelated.\n"
+            "- \"min_price\": Realistic minimum market price in USD for a functional, genuine unit of this hardware component (e.g. 1400 for RTX 4090, 180 for RTX 3060, 220 for 7800X3D, 50 for King 95, 30 for 16GB RAM). Used to automatically discard dummy replicas, 1:1 scale toys, empty boxes, and brackets.\n"
+            "- \"retailer_search_query\": Clean search term optimized for retailer product catalogs (e.g. 'Montech King 95 PC Case', 'AMD Ryzen 7 9800X3D', 'RTX 5090').\n"
+            "- \"negative_keywords\": Array of terms that indicate a candidate result is the WRONG product, accessory, toy, or broken item. For instance:\n"
+            "   * If Case: reject ['Prebuilt', 'Gaming PC', 'Desktop PC', 'Cable', 'Bracket', 'Screws'].\n"
+            "   * If CPU: reject ['Prebuilt', 'Desktop PC', 'Cooler', 'Motherboard Combo', 'Keychain', 'Delid'].\n"
+            "   * If GPU: reject ['Prebuilt', 'Desktop PC', 'Bracket', 'Backplate', 'Heatsink', 'Shroud', 'Poster', 'Replica', 'Display Only', 'Dummy'].\n"
+            "   * If Cooler: reject ['Case', 'Prebuilt', 'Thermal Paste Only']."
         )
+
+        models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b", "groq/compound"]
+        for model_name in models:
+            try:
+                async with httpx.AsyncClient() as client:
+                    res = await client.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                        json={
+                            "model": model_name,
+                            "messages": [
+                                {"role": "system", "content": prompt},
+                                {"role": "user", "content": f"Query: {clean}"}
+                            ],
+                            "temperature": 0,
+                            "response_format": {"type": "json_object"}
+                        },
+                        timeout=7.0
+                    )
+                if res.status_code == 200:
+                    data = json.loads(res.json()["choices"][0]["message"]["content"])
+                    min_p = None
+                    if data.get("min_price"):
+                        try:
+                            min_p = float(data["min_price"])
+                        except (ValueError, TypeError):
+                            pass
+
+                    return ProductAnalysis(
+                        raw_query=clean,
+                        brand=data.get("brand"),
+                        model=data.get("model") or clean,
+                        category=data.get("category") or "Other",
+                        is_pc_part=bool(data.get("is_pc_part", True)),
+                        retailer_search_query=data.get("retailer_search_query") or clean,
+                        negative_keywords=data.get("negative_keywords") or [],
+                        min_price=min_p
+                    )
+            except Exception as e:
+                print(f"[ProductAnalyzer Error with {model_name}] {e}")
+
+        return ProductAnalysis(clean, None, clean, "Hardware", True, clean, [])
+
+    @staticmethod
+    def validate_offer(analysis: ProductAnalysis, title: str, price: float) -> tuple[bool, str]:
+        """Strictly validates whether a retailer product candidate is genuine."""
+        title_lower = title.lower()
+
+        # 1. Price check: reject $0 or negative
+        if price <= 0:
+            return False, "Price is 0 or negative"
+
+        # 2. Universal dummy / replica / toy / packaging / broken exclusion patterns
+        dummy_patterns = [
+            "replica", "scale replica", "scale model", "1:1 scale", "dummy", "mockup",
+            "toy", "miniature", "3d print", "3d printed", "prop", "fun display",
+            "display only", "display model", "box only", "empty box", "packaging only",
+            "for parts", "parts only", "not working", "broken", "as is", "as-is",
+            "poster", "keychain", "sticker", "t-shirt", "hoodie", "mug"
+        ]
+        for dp in dummy_patterns:
+            if re.search(r'\b' + re.escape(dp) + r'\b', title_lower):
+                if dp not in analysis.raw_query.lower():
+                    return False, f"Rejection pattern detected: '{dp}'"
+
+        # 3. Dynamic AI price floor (rejects accessories, toys, or brackets posing as main hardware)
+        if analysis.min_price and analysis.min_price > 0:
+            floor_threshold = analysis.min_price * 0.4
+            if price < floor_threshold:
+                return False, f"Price ${price:.2f} is suspiciously below minimum hardware threshold (${floor_threshold:.2f}) for {analysis.model}"
+
+        # 4. Rejection keywords check from analysis
+        for neg in analysis.negative_keywords:
+            neg_lower = neg.lower()
+            if re.search(r'\b' + re.escape(neg_lower) + r'\b', title_lower):
+                if neg_lower not in analysis.model.lower():
+                    return False, f"Matches negative keyword: '{neg}'"
+
+        # 5. Category sanity checks
+        if analysis.category == "Case":
+            if price > 600 and any(w in title_lower for w in ["gaming pc", "desktop pc", "ryzen", "rtx", "intel core"]):
+                return False, f"Prebuilt PC detected instead of standalone Case (${price:.2f})"
+        elif analysis.category == "CPU":
+            if any(w in title_lower for w in ["cooler only", "mounting bracket", "delid tool", "contact frame", "thermal paste"]):
+                return False, "Accessory / cooler detected instead of CPU"
+        elif analysis.category == "GPU":
+            gpu_accessories = [
+                "bracket", "gpu sag", "backplate", "fan replacement", "cooler only",
+                "heatsink", "shroud", "thermal pad", "water block"
+            ]
+            if any(re.search(r'\b' + re.escape(acc) + r'\b', title_lower) for acc in gpu_accessories):
+                if not any(acc in analysis.raw_query.lower() for acc in gpu_accessories):
+                    return False, "GPU accessory/parts detected instead of Graphics Card"
+
+        # 6. GPU Sub-tier modifier check (prevents 3060 matching 3060 Ti, or 4070 matching 4070 Super)
+        if analysis.category == "GPU":
+            modifiers = ["ti", "super", "xtx", "xt", "gre"]
+            for mod in modifiers:
+                mod_pat = r'\b' + re.escape(mod) + r'\b'
+                in_model = bool(re.search(mod_pat, analysis.model.lower()))
+                in_title = bool(re.search(mod_pat, title_lower))
+                if in_title and not in_model:
+                    return False, f"Title has sub-tier '{mod.upper()}' but query does not"
+                if in_model and not in_title:
+                    return False, f"Query requires sub-tier '{mod.upper()}' but title is missing it"
+
+        # 7. Whole PC / Laptop / System / Platform check for standalone components
+        if analysis.category in ["GPU", "CPU", "RAM", "Power Supply", "Storage", "Cooling", "Motherboard"]:
+            raw_lower = analysis.raw_query.lower()
+
+            # Direct platform/system keywords
+            system_words = [
+                "laptop", "notebook", "desktop pc", "gaming pc", "gaming desktop",
+                "computer", "barebone", "all-in-one", "aio pc", "gaming host",
+                "workstation pc"
+            ]
+            for sw in system_words:
+                if sw in title_lower and sw not in raw_lower:
+                    return False, f"System/platform keyword detected: '{sw}'"
+
+            # Motherboard check (if not searching for a Motherboard)
+            if analysis.category != "Motherboard" and any(w in title_lower for w in ["motherboard", "mobo", "mainboard"]):
+                if not any(w in raw_lower for w in ["motherboard", "mobo", "mainboard"]):
+                    return False, "Motherboard detected instead of standalone component"
+
+            # GPU-specific platform/laptop leak checks
+            if analysis.category == "GPU":
+                # Known laptop product lines
+                laptop_lines = [
+                    "loq", "legion", "yoga", "ideapad", "thinkpad", "alienware",
+                    "rog zephyrus", "rog strix scar", "razer blade", "omen", "victus",
+                    "pavilion", "dell g15", "dell xps", "acer nitro", "predator",
+                    "katana", "stealth", "sword", "cyborg", "thin gf63", "macbook", "chromebook"
+                ]
+                for line in laptop_lines:
+                    if re.search(r'\b' + re.escape(line) + r'\b', title_lower) and line not in raw_lower:
+                        return False, f"Laptop product line detected: '{line}'"
+
+                # Screen / display specs
+                screen_indicators = [
+                    r'\b(?:144|165|240|360|120)\s*hz\b',
+                    r'\b(?:fhd|qhd|uhd|wqhd|oled|ips)\s+display\b',
+                    r'\b(?:13\.3|14|15\.6|16|17\.3)[\"”\s]',
+                    r'\btouchscreen\b'
+                ]
+                for pat in screen_indicators:
+                    if re.search(pat, title_lower):
+                        return False, "Integrated display / laptop screen spec detected on GPU"
+
+                # CPU specs inside GPU search
+                cpu_indicators = [
+                    r'\bi[3579]-[\d]{4,5}[a-z]{0,2}\b',
+                    r'\bcore\s+ultra\s+[579]\b',
+                    r'\bintel\s+core\b',
+                    r'\bamd\s+ryzen\s+[3579]\b',
+                    r'\bryzen\s+[3579]\s+[\d]{4}[a-z]{0,2}\b'
+                ]
+                for pat in cpu_indicators:
+                    if re.search(pat, title_lower) and not re.search(pat, raw_lower):
+                        return False, "CPU specification detected inside standalone GPU search"
+
+                # System storage + RAM bundles
+                storage_patterns = [
+                    r'\b\d+\s*(?:gb|tb)\s*ssd\b',
+                    r'\b\d+\s*gb\s+\d+\s*(?:gb|tb)\b',
+                    r'\b\d+\s*gb\s+ram\b'
+                ]
+                for pat in storage_patterns:
+                    if re.search(pat, title_lower):
+                        return False, "System storage/RAM bundle detected inside standalone GPU search"
+
+                # Mobile/laptop GPU indicator
+                mobile_gpu = ["laptop gpu", "notebook gpu", "mobile gpu", "mobil gpu", "max-q"]
+                for mg in mobile_gpu:
+                    if mg in title_lower and mg not in raw_lower:
+                        return False, f"Mobile/Laptop-only GPU detected: '{mg}'"
+
+        # 8. Model match check
+        model_tokens = [t.lower() for t in re.split(r'[^a-zA-Z0-9]+', analysis.model) if len(t) > 1]
+        if model_tokens:
+            matches = sum(1 for tok in model_tokens if tok in title_lower)
+            digit_tokens = [tok for tok in model_tokens if any(c.isdigit() for c in tok)]
+            if digit_tokens and not all(dt in title_lower for dt in digit_tokens):
+                return False, f"Missing required model token: {digit_tokens}"
+            if matches < max(1, len(model_tokens) // 2):
+                return False, f"Insufficient model token match ({matches}/{len(model_tokens)})"
+
+        return True, "Valid offer"
+
+
+# ─── 2. AMAZON CLIENT (Direct HTTP/2 Engine - Unlimited & Zero-Quota) ─────────
+
+class AmazonClient:
+    """High-speed direct Amazon client with zero API rate-limits/credit costs."""
+
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1"
+    }
+
+    @staticmethod
+    def extract_asin(text: str) -> str | None:
+        m = re.search(r'(?:/dp/|/gp/product/|^)([A-Z0-9]{10})(?:[/?&]|$)', text.strip())
+        return m.group(1) if m else None
+
+    async def lookup_asin(self, asin: str) -> dict | None:
+        url = f"https://www.amazon.com/dp/{asin}"
+        print(f"[Amazon Direct] Fetching product page: {url}...")
+        try:
+            async with httpx.AsyncClient(headers=self.HEADERS, http2=True, follow_redirects=True, timeout=12.0) as client:
+                res = await client.get(url)
+                if res.status_code == 200:
+                    soup = BeautifulSoup(res.text, "html.parser")
+                    title_el = soup.find("span", id="productTitle")
+                    title = title_el.text.strip() if title_el else None
+                    if not title and soup.title:
+                        title = soup.title.string.replace("Amazon.com:", "").strip()
+
+                    # Extract price from buybox
+                    price_val = None
+                    for span in soup.find_all("span", class_="a-price"):
+                        off = span.find("span", class_="a-offscreen")
+                        if off and off.text:
+                            m = re.search(r'[\$]?([0-9,]+\.[0-9]{2})', off.text)
+                            if m:
+                                price_val = float(m.group(1).replace(",", ""))
+                                break
+
+                    img = soup.find("img", id="landingImage") or soup.find("img", class_="s-image")
+                    image_url = img.get("src") if img else None
+
+                    merchant_input = soup.find("input", id="merchantID") or soup.find("input", {"name": "merchantID"}) or soup.find("input", {"name": "merchantId"})
+                    merchant_id = merchant_input.get("value") if merchant_input else None
+                    product_url = f"https://www.amazon.com/dp/{asin}?smid={merchant_id}" if merchant_id else url
+
+                    if title and price_val:
+                        offer = {
+                            "retailer": "Amazon",
+                            "title": title,
+                            "price": price_val,
+                            "originalPrice": None,
+                            "inStock": True,
+                            "isRefurbished": "renewed" in title.lower() or "refurbished" in title.lower(),
+                            "url": product_url,
+                            "imageUrl": image_url,
+                            "brand": None,
+                            "source": "amazon-direct"
+                        }
+                        print(f"✅ [Amazon Hit] ${offer['price']:.2f} -> {offer['title'][:60]}")
+                        return offer
+        except Exception as e:
+            print(f"[Amazon Direct DP Error] {e}")
+        return None
+
+    async def search(self, analysis: ProductAnalysis) -> dict | None:
+        asin = self.extract_asin(analysis.raw_query)
+        if asin and ("amazon.com" in analysis.raw_query or len(analysis.raw_query.strip()) == 10):
+            return await self.lookup_asin(asin)
+
+        search_term = analysis.retailer_search_query
+        print(f"[Amazon Direct] Searching for '{search_term}'...")
+        encoded = urllib.parse.quote_plus(search_term)
+        url = f"https://www.amazon.com/s?k={encoded}"
+
+        try:
+            async with httpx.AsyncClient(headers=self.HEADERS, http2=True, follow_redirects=True, timeout=12.0) as client:
+                res = await client.get(url)
+                if res.status_code == 200:
+                    soup = BeautifulSoup(res.text, "html.parser")
+                    items = soup.find_all("div", {"data-component-type": "s-search-result"})
+                    valid_offers = []
+                    for it in items:
+                        item_asin = it.get("data-asin")
+                        if not item_asin:
+                            continue
+
+                        # Extract title
+                        title = None
+                        for a in it.find_all("a", class_="a-link-normal"):
+                            txt = a.text.strip()
+                            if len(txt) > 20 and not txt.startswith("("):
+                                title = txt
+                                break
+                        if not title:
+                            img = it.find("img", class_="s-image")
+                            if img and img.get("alt"):
+                                title = img.get("alt")
+
+                        # Extract price
+                        price_el = it.find("span", class_="a-price")
+                        price_offscreen = price_el.find("span", class_="a-offscreen") if price_el else None
+                        if not price_offscreen or not title:
+                            continue
+                        m = re.search(r'[\$]?([0-9,]+\.[0-9]{2})', price_offscreen.text)
+                        if not m:
+                            continue
+                        price_val = float(m.group(1).replace(",", ""))
+
+                        # Semantic validation
+                        is_valid, reason = ProductAnalyzer.validate_offer(analysis, title, price_val)
+                        if not is_valid:
+                            continue
+
+                        img = it.find("img", class_="s-image")
+                        image_url = img.get("src") if img else None
+
+                        merchant_input = it.find("input", {"name": "merchantId"})
+                        merchant_id = merchant_input.get("value") if merchant_input else None
+                        product_url = f"https://www.amazon.com/dp/{item_asin}?smid={merchant_id}" if merchant_id else f"https://www.amazon.com/dp/{item_asin}"
+
+                        valid_offers.append({
+                            "retailer": "Amazon",
+                            "title": title,
+                            "price": price_val,
+                            "originalPrice": None,
+                            "inStock": True,
+                            "isRefurbished": "renewed" in title.lower() or "refurbished" in title.lower(),
+                            "url": product_url,
+                            "imageUrl": image_url,
+                            "brand": analysis.brand,
+                            "source": "amazon-direct"
+                        })
+
+                    if valid_offers:
+                        valid_offers.sort(key=lambda x: x["price"])
+                        best = valid_offers[0]
+                        print(f"✅ [Amazon Hit] ${best['price']:.2f} -> {best['title'][:60]}")
+                        return best
+        except Exception as e:
+            print(f"[Amazon Direct Search Error] {e}")
+        return None
+
+
+# ─── 3. EBAY CLIENT (eBay Browse API with OAuth2) ────────────────────────────
+
+class EbayClient:
+    """Official eBay Browse API client with automatic OAuth application token caching."""
+
+    def __init__(self):
+        self._access_token: str | None = None
+        self._token_expires_at: float = 0
+
+    def _is_sandbox(self, client_id: str) -> bool:
+        return "SBX" in client_id.upper()
+
+    def _get_oauth_url(self, client_id: str) -> str:
+        return "https://api.sandbox.ebay.com/identity/v1/oauth2/token" if self._is_sandbox(client_id) else "https://api.ebay.com/identity/v1/oauth2/token"
+
+    def _get_browse_url(self, client_id: str) -> str:
+        return "https://api.sandbox.ebay.com/buy/browse/v1/item_summary/search" if self._is_sandbox(client_id) else "https://api.ebay.com/buy/browse/v1/item_summary/search"
+
+    async def get_access_token(self) -> str | None:
+        client_id = os.environ.get("EBAY_CLIENT_ID", "") or EBAY_CLIENT_ID
+        client_secret = os.environ.get("EBAY_CLIENT_SECRET", "") or EBAY_CLIENT_SECRET
+
+        if not client_id or not client_secret:
+            return None
+
+        if self._access_token and time.time() < (self._token_expires_at - 60):
+            return self._access_token
+
+        env_name = "Sandbox" if self._is_sandbox(client_id) else "Production"
+        print(f"[eBay API] Refreshing eBay OAuth application token ({env_name})...")
+        credentials = f"{client_id}:{client_secret}"
+        encoded_creds = base64.b64encode(credentials.encode()).decode()
 
         try:
             async with httpx.AsyncClient() as client:
                 res = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                    json={
-                        "model": "groq/compound-mini",
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": f"Title: {query}"}
-                        ],
-                        "response_format": {"type": "json_object"},
-                        "temperature": 0
+                    self._get_oauth_url(client_id),
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Authorization": f"Basic {encoded_creds}"
+                    },
+                    data={
+                        "grant_type": "client_credentials",
+                        "scope": "https://api.ebay.com/oauth/api_scope"
                     },
                     timeout=10.0
                 )
                 if res.status_code == 200:
-                    raw_content = res.json()["choices"][0]["message"]["content"]
-                    print(f"[DEBUG Groq Analyzer] Raw JSON response: {raw_content}")
-                    data = json.loads(raw_content)
-
-                    # Smart context fallback: if it's marked Not compatible or GENERIC_QUERY_ERROR, check if web context clarifies the exact model
-                    if (data.get('category') == 'Not compatible (N/A)' or data.get('model') == 'GENERIC_QUERY_ERROR') and self.get_tavily_key():
-                        try:
-                            print(f"[AI Analyzer] '{query}' returned {data.get('model', data.get('category'))}. Fetching web context...")
-                            tavily_res = await client.post('https://api.tavily.com/search', json={
-                                "api_key": self.get_tavily_key(),
-                                "query": f"{query} specs computer hardware",
-                                "search_depth": "basic",
-                                "max_results": 2
-                            }, timeout=4.0)
-                            if tavily_res.status_code == 200:
-                                results = tavily_res.json().get('results', [])
-                                snippet = ' '.join([r.get('title', '') + ' ' + r.get('content', '') for r in results])
-                                if snippet:
-                                    res2 = await client.post(
-                                        "https://api.groq.com/openai/v1/chat/completions",
-                                        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                                        json={
-                                            "model": "openai/gpt-oss-20b",
-                                            "messages": [
-                                                {"role": "system", "content": system_prompt + "\nUse the search context to identify the exact GPU/CPU/hardware model if the query was an abbreviated trim name (e.g. Inno3D X3 OC -> Inno3D RTX 5090 X3 OC)."},
-                                                {"role": "user", "content": f"Query: {query}\n\nSearch Context: {snippet}"}
-                                            ],
-                                            "response_format": {"type": "json_object"},
-                                            "temperature": 0
-                                        },
-                                        timeout=6.0
-                                    )
-                                    if res2.status_code == 200:
-                                        data2 = json.loads(res2.json()["choices"][0]["message"]["content"])
-                                        if data2.get('model') and data2.get('model') != 'GENERIC_QUERY_ERROR':
-                                            if hasattr(self, '_classification_cache'):
-                                                self._classification_cache[cache_key] = data2
-                                            return data2
-                        except Exception as e:
-                            print(f"[Tavily Fallback Error] {e}")
-
-                    if hasattr(self, '_classification_cache'):
-                        self._classification_cache[cache_key] = data
-                    return data
+                    data = res.json()
+                    self._access_token = data.get("access_token")
+                    expires_in = data.get("expires_in", 7200)
+                    self._token_expires_at = time.time() + expires_in
+                    print(f"✅ [eBay API] OAuth token acquired ({env_name}, valid for {expires_in}s).")
+                    return self._access_token
                 else:
-                    print(f"[Groq Analyzer] HTTP {res.status_code}: {res.text[:200]}")
+                    print(f"⚠️ [eBay Auth Error] {res.status_code}: {res.text}")
         except Exception as e:
-            print(f"[Groq Analyzer Error] {e}")
+            print(f"[eBay Auth Exception] {e}")
+        return None
 
-        cleaned = clean_hardware_query(query)
-        res = {"model": cleaned, "category": "Hardware"}
-        if hasattr(self, '_classification_cache'):
-            self._classification_cache[cache_key] = res
-        return res
+    async def search(self, analysis: ProductAnalysis) -> dict | None:
+        client_id = os.environ.get("EBAY_CLIENT_ID", "") or EBAY_CLIENT_ID
+        token = await self.get_access_token()
+        if not token:
+            print("[eBay API] ℹ️ EBAY_CLIENT_ID / EBAY_CLIENT_SECRET not configured, skipping eBay.")
+            return None
+
+        search_query = analysis.retailer_search_query
+        print(f"[eBay API] Searching for '{search_query}'...")
+        try:
+            async with httpx.AsyncClient() as client:
+                res = await client.get(
+                    self._get_browse_url(client_id),
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"
+                    },
+                    params={
+                        "q": search_query,
+                        "limit": "10",
+                        "filter": "buyingOptions:{FIXED_PRICE}"
+                    },
+                    timeout=15.0
+                )
+                if res.status_code == 200:
+                    items = res.json().get("itemSummaries", [])
+                    valid_offers = []
+                    for it in items:
+                        title = it.get("title", "")
+                        price_obj = it.get("price", {})
+                        price_str = price_obj.get("value")
+                        if not title or not price_str:
+                            continue
+
+                        condition = it.get("condition", "New")
+                        if any(w in condition.lower() for w in ["parts", "not working", "broken", "faulty", "as is"]):
+                            print(f"[eBay Filtered] Skipping '{title[:50]}...': Condition is '{condition}'")
+                            continue
+
+                        price_val = float(price_str)
+                        is_valid, reason = ProductAnalyzer.validate_offer(analysis, title, price_val)
+                        if not is_valid:
+                            print(f"[eBay Filtered] Skipping '{title[:50]}...': {reason}")
+                            continue
+
+                        is_refurb = any(w in condition.lower() for w in ["refurbished", "used", "seller refurbished"])
+                        image_url = (it.get("image") or {}).get("imageUrl")
+                        item_url = it.get("itemWebUrl") or f"https://www.ebay.com/itm/{it.get('itemId')}"
+
+                        valid_offers.append({
+                            "retailer": "eBay",
+                            "title": title,
+                            "price": price_val,
+                            "originalPrice": None,
+                            "inStock": True,
+                            "isRefurbished": is_refurb,
+                            "url": item_url,
+                            "imageUrl": image_url,
+                            "brand": analysis.brand,
+                            "source": "ebay-api"
+                        })
+
+                    if valid_offers:
+                        valid_offers.sort(key=lambda x: x["price"])
+                        best = valid_offers[0]
+                        print(f"✅ [eBay Hit] ${best['price']:.2f} -> {best['title'][:60]}")
+                        return best
+                else:
+                    print(f"⚠️ [eBay Search Error] {res.status_code}: {res.text}")
+        except Exception as e:
+            print(f"[eBay Search Exception] {e}")
+        return None
+
+
+# ─── 4. HARDWARE AGENT (Main Orchestrator) ───────────────────────────────────
+
+class HardwareAgent:
+    """Deterministic, zero-hardcoding multi-retailer PC hardware pricing engine."""
+
+    def __init__(self):
+        self.amazon = AmazonClient()
+        self.ebay = EbayClient()
 
     async def run(self, prompt: str, emit_fn=None, user_id: str = None, pending_id: str = None) -> dict:
         clean_prompt = prompt.strip()
-        is_url = clean_prompt.startswith('http://') or clean_prompt.startswith('https://')
-        
-        if not is_url:
-            print(f"[AI Analyzer] Normalizing and categorizing query: '{clean_prompt}'")
-            result = await self.analyze_query_with_groq(clean_prompt)
-            clean_prompt = result.get('model', clean_prompt)
-            category = result.get('category', 'Not compatible (N/A)')
-            print(f"[AI Analyzer] Result: '{clean_prompt}' ({category})")
-        else:
-            category = await self.detect_category(clean_prompt)
-
-        if emit_fn:
-            emit_fn('agent_start', {'query': clean_prompt, 'original_query': prompt.strip(), 'category': category, 'timestamp': datetime.now(timezone.utc).isoformat()})
-
-        state = {
-            "userQuery": clean_prompt,
-            "category": category,
-            "scrapedOffers": [],
-            "summary": ""
-        }
-
-        if clean_prompt == 'GENERIC_QUERY_ERROR':
-            print(f"[Generic Query Rejected] \"{prompt.strip()}\"")
-            state["summary"] = f"Your search '{prompt.strip()}' is too broad (e.g. a general chipset or product family). Please search for a specific model (e.g. 'ASUS ROG Strix RTX 4070' or 'Inno3D RTX 5090 X3 OC') for accurate pricing."
-            if emit_fn:
-                emit_fn('agent_error', {
-                    "query": prompt.strip(),
-                    "original_query": prompt.strip(),
-                    "error_type": "GENERIC_QUERY_ERROR",
-                    "message": state["summary"],
-                    "pending_id": pending_id,
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                })
-                emit_fn('agent_complete', {
-                    "query": prompt.strip(),
-                    "original_query": prompt.strip(),
-                    "category": category,
-                    "bestOffer": None,
-                    "allOffers": [],
-                    "is_error": True,
-                    "error_type": "GENERIC_QUERY_ERROR",
-                    "summary": state["summary"],
-                    "pending_id": pending_id,
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                })
-            return state
-
         print(f"\n======================================================")
-        print(f"[Hybrid Python Agent] Extracting price for: \"{clean_prompt}\" ({category})")
-        print(f"======================================================\n")
+        print(f"[HardwareAgent] Processing Query: \"{clean_prompt}\"")
+        print(f"======================================================")
 
-
-        if category == 'Not compatible (N/A)' and not is_url:
-            print(f"[Non-PC Part Query Rejected] \"{clean_prompt}\" is Not compatible (N/A)")
-            state["summary"] = f"Not compatible (N/A) — \"{clean_prompt}\" is not a recognized PC hardware component or peripheral."
-            if emit_fn:
-                emit_fn('agent_error', {
-                    "query": clean_prompt,
-                    "original_query": prompt.strip(),
-                    "error_type": "INCOMPATIBLE_ITEM_ERROR",
-                    "message": state["summary"],
-                    "pending_id": pending_id,
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                })
-                emit_fn('agent_complete', {
-                    "query": clean_prompt,
-                    "original_query": prompt.strip(),
-                    "category": 'Not compatible (N/A)',
-                    "bestOffer": None,
-                    "allOffers": [],
-                    "is_error": True,
-                    "error_type": "INCOMPATIBLE_ITEM_ERROR",
-                    "summary": state["summary"],
-                    "pending_id": pending_id,
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                })
-            return state
-
-        if is_url:
-            offer = await self.extract_direct_page(clean_prompt, self.detect_retailer(clean_prompt), category, model_query=model_name)
-            if not offer or offer.get('blocked') or (offer.get('price') or 0) <= 0:
-                print(f"⚠️ [Direct Page Extraction Failed] Could not extract price from {clean_prompt}")
-                state["summary"] = f"Unable to extract live pricing from \"{clean_prompt}\". The retailer page may be bot-protected or unavailable."
-                if emit_fn:
-                    emit_fn('agent_error', {
-                        "query": clean_prompt,
-                        "original_query": prompt.strip(),
-                        "error_type": "NO_OFFERS_FOUND",
-                        "message": state["summary"],
-                        "pending_id": pending_id,
-                        "timestamp": datetime.now(timezone.utc).isoformat()
-                    })
-                    emit_fn('agent_complete', {
-                        "query": clean_prompt,
-                        "original_query": prompt.strip(),
-                        "category": category,
-                        "bestOffer": None,
-                        "allOffers": [],
-                        "is_error": True,
-                        "error_type": "NO_OFFERS_FOUND",
-                        "summary": state["summary"],
-                        "pending_id": pending_id,
-                        "timestamp": datetime.now(timezone.utc).isoformat()
-                    })
-                return state
-
-            state["scrapedOffers"].append(offer)
-            # Classify the actual product title extracted from the page
-            cat_result = await self.analyze_query_with_groq(offer.get('title', ''))
-            if cat_result and cat_result.get('category') and cat_result.get('category') != 'Not compatible (N/A)':
-                category = cat_result['category']
-            else:
-                detected_cat = await self.detect_category(offer.get('title', ''))
-                if detected_cat:
-                    category = detected_cat
-            state["category"] = category
-            clean_prompt = cat_result.get('model') or offer.get('title', clean_prompt)
-            state["userQuery"] = clean_prompt
-
-            # Persist direct page offer to hardware_components & PriceHistory
-            await self.persist_hardware_offer(offer, clean_prompt, category)
-
-            if emit_fn:
-                emit_fn('retailer_found', {
-                    "query": clean_prompt,
-                    "original_query": prompt.strip(),
-                    "retailer": offer.get('retailer', 'Online Retailer'),
-                    "price": offer['price'],
-                    "title": offer['title'],
-                    "url": offer['url'],
-                    "inStock": offer.get('inStock', True),
-                    "isRefurbished": offer.get('isRefurbished', False),
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                })
-        else:
-            verified_offers = await self.scrape_all_retailers_unified(clean_prompt, category)
-            for offer in verified_offers:
-                if offer and (offer.get('price') or 0) > 0:
-                    state["scrapedOffers"].append(offer)
-                    await self.persist_hardware_offer(offer, clean_prompt, category)
-                        
-                    if emit_fn:
-                        emit_fn('retailer_found', {
-                            "query": clean_prompt,
-                            "original_query": prompt.strip(),
-                            "retailer": offer.get('retailer', 'Online Retailer'),
-                            "price": offer['price'],
-                            "title": offer['title'],
-                            "url": offer['url'],
-                            "inStock": offer.get('inStock', True),
-                            "isRefurbished": offer.get('isRefurbished', False),
-                            "timestamp": datetime.now(timezone.utc).isoformat()
-                        })
-
-        # Sort all scraped retailer offers: Available (inStock) items first, then lowest price
-        def sort_offers(offer):
-            return (0 if offer.get('inStock', True) else 1, offer.get('price') or 999999)
-
-        state["scrapedOffers"].sort(key=sort_offers)
-
-        if len(state["scrapedOffers"]) > 0:
-            state["bestOffer"] = state["scrapedOffers"][0]
-            stock_status = 'In Stock' if state["bestOffer"]['inStock'] else 'Out of Stock / Backorder'
-            state["summary"] = f"Evaluated {len(state['scrapedOffers'])} live retailer listings. Cheapest available offer: ${state['bestOffer']['price']:.2f} at {state['bestOffer']['retailer']} ({stock_status})."
-        else:
-            state["summary"] = f"No live prices found across retailers for \"{clean_prompt}\"."
-
-        # Check all users in watchlist_items tracking this component and dispatch alerts ASAP
-        if state.get("bestOffer"):
-            try:
-                best = state["bestOffer"]
-                primary_comp_id = f"comp-{re.sub(r'[^a-z0-9]+', '-', clean_prompt.lower())[:70].strip('-')}"
-                
-                # Sanitize search term without commas, periods, or special characters to prevent PostgREST parse errors
-                clean_keyword = re.sub(r'[^a-zA-Z0-9\s]', ' ', clean_prompt).strip()
-                short_keyword = re.sub(r'\s+', ' ', clean_keyword).split(' - ')[0].strip()[:30]
-
-                # Fetch matching watchlist rows across all users
-                try:
-                    all_wl_res = await asyncio.to_thread(
-                        supabase.table('watchlist_items')
-                        .select('*')
-                        .ilike('component_name', f"%{short_keyword}%")
-                        .execute
-                    )
-                except Exception as query_err:
-                    print(f"[Watchlist Query Notice]: {query_err}")
-                    all_wl_res = None
-
-                if all_wl_res and all_wl_res.data and len(all_wl_res.data) > 0:
-                    frontend_url = os.environ.get("FRONTEND_URL", "https://rigscouter.ishaankoradia.com")
-                    for row in all_wl_res.data:
-                        r_id = row['id']
-                        r_user_id = row.get('user_id')
-                        target_price = float(row.get('target_price') or 0)
-                        prior_price = row.get('previous_price_24h') or row.get('all_time_low')
-                        prior_atl = float(row.get('all_time_low') or best['price'])
-                        alerts_on = row.get('notify_on_flash_drop', True)
-
-                        # Update row's price tracking
-                        update_payload = {
-                            "all_time_low": min(prior_atl, best['price']),
-                        }
-                        if prior_price and prior_price != best['price']:
-                            update_payload["previous_price_24h"] = prior_price
-
-                        await asyncio.to_thread(
-                            supabase.table('watchlist_items').update(update_payload).eq('id', r_id).execute
-                        )
-
-                        # If new price meets target price AND alerts enabled -> send email ASAP!
-                        if target_price > 0 and best['price'] <= target_price and alerts_on:
-                            try:
-                                async with httpx.AsyncClient(timeout=4.0) as client:
-                                    await client.post(
-                                        f"{frontend_url}/api/notifications/target-met",
-                                        json={
-                                            "userId": r_user_id,
-                                            "componentName": row.get('component_name') or best.get('title') or clean_prompt,
-                                            "category": category,
-                                            "targetPrice": target_price,
-                                            "currentPrice": float(best['price']),
-                                            "retailer": best.get('retailer', 'Amazon'),
-                                            "productUrl": best.get('url', '#'),
-                                        }
-                                    )
-                                    print(f"[ASAP Alert Dispatched] Scraped price ${best['price']:.2f} <= target ${target_price:.2f} for user {r_user_id} on '{clean_prompt}'")
-                            except Exception as alert_e:
-                                print(f"[ASAP Alert Dispatch Warning]: {alert_e}")
-            except Exception as glob_wl_e:
-                print(f"[Global Watchlist Check Warning]: {glob_wl_e}")
-
-        # Single consolidated user watchlist entry for on-demand additions
-        if user_id and pending_id and state.get("bestOffer"):
-            try:
-                best = state["bestOffer"]
-                primary_comp_id = f"comp-{re.sub(r'[^a-z0-9]+', '-', clean_prompt.lower())[:70].strip('-')}"
-                
-                # Check if this user already has an entry for this clean_prompt / component_id
-                existing_check = supabase.table('watchlist_items').select('*').eq('component_id', primary_comp_id)
-                if user_id:
-                    existing_check = existing_check.eq('user_id', user_id)
-                existing_res = await asyncio.to_thread(existing_check.execute)
-
-                if existing_res.data and len(existing_res.data) > 0:
-                    existing_row = existing_res.data[0]
-                    target_id = existing_row['id']
-                    prior_price = existing_row.get('current_price') or existing_row.get('all_time_low')
-                    prior_atl = existing_row.get('all_time_low') or best['price']
-
-                    existing_target = existing_row.get('target_price')
-                    effective_target = float(existing_target) if existing_target and float(existing_target) > 0 else round(best['price'] * 0.9, 2)
-                    wl_row = {
-                        "component_name": best.get('title') or clean_prompt,
-                        "category": category,
-                        "target_price": effective_target,
-                        "previous_price_24h": prior_price if prior_price and prior_price != best['price'] else existing_row.get('previous_price_24h', best['price']),
-                        "all_time_low": min(prior_atl, best['price']),
-                    }
-                    await asyncio.to_thread(
-                        supabase.table('watchlist_items').update(wl_row).eq('id', target_id).execute
-                    )
-                    print(f"[Watchlist Persist Success] Updated single entry for '{clean_prompt}' in watchlist_items")
-                else:
-                    wl_row = {
-                        "component_id": primary_comp_id,
-                        "component_name": best.get('title') or clean_prompt,
-                        "category": category,
-                        "target_price": round(best['price'] * 0.9, 2),
-                        "previous_price_24h": best['price'],
-                        "previous_price_7d": best['price'],
-                        "previous_price_30d": best['price'],
-                        "all_time_low": best['price'],
-                    }
-                    if user_id:
-                        wl_row["user_id"] = user_id
-                    await asyncio.to_thread(
-                        supabase.table('watchlist_items').insert(wl_row).execute
-                    )
-                    print(f"[Watchlist Persist Success] Created single baseline entry for '{clean_prompt}' in watchlist_items")
-            except Exception as wl_e:
-                print(f"[Watchlist Persist Notice]: {wl_e}")
-
-        if state.get("bestOffer"):
-            try:
-                query = supabase.table('hardware_components').select('current_price').ilike('model', f"%{clean_prompt}%").order('updated_at', desc=True).limit(1)
-                res = await asyncio.to_thread(query.execute)
-                previous_price = res.data[0]['current_price'] if res.data else None
-
-                if previous_price is not None:
-                    diff = state["bestOffer"]['price'] - previous_price
-                    if diff < -0.5:
-                        state["priceChange"] = 'drop'
-                        state["previousPrice"] = previous_price
-                        if emit_fn:
-                            emit_fn('price_drop', {
-                                "query": clean_prompt,
-                                "original_query": prompt.strip(),
-                                "retailer": state["bestOffer"]['retailer'],
-                                "previousPrice": previous_price,
-                                "newPrice": state["bestOffer"]['price'],
-                                "savings": f"{abs(diff):.2f}",
-                                "url": state["bestOffer"]['url'],
-                                "title": state["bestOffer"]['title'],
-                                "category": category,
-                                "timestamp": datetime.now(timezone.utc).isoformat()
-                            })
-                    elif diff > 0.5:
-                        state["priceChange"] = 'increase'
-                        state["previousPrice"] = previous_price
-                    else:
-                        state["priceChange"] = 'unchanged'
-                else:
-                    state["priceChange"] = 'new'
-
-                component_id = f"agent-{re.sub(r'[^a-z0-9]+', '-', clean_prompt.lower())}-{re.sub(r'[^a-z0-9]+', '-', state['bestOffer']['retailer'].lower())}"
-                
-            except Exception as e:
-                print(f"[Agent Persistence Error]: {e}")
+        # 1. AI Analysis & Query Normalization
+        analysis = await ProductAnalyzer.analyze_query(clean_prompt)
+        print(f"[AI Analyzer] Brand: {analysis.brand} | Model: '{analysis.model}' | Category: {analysis.category}")
+        print(f"[AI Analyzer] Retailer Query: \"{analysis.retailer_search_query}\"")
 
         if emit_fn:
-            emit_fn('agent_complete', {
-                "query": clean_prompt,
-                "original_query": prompt.strip(),
-                "category": category,
-                "bestOffer": state.get("bestOffer"),
-                "allOffers": state.get("scrapedOffers", []),
-                "summary": state.get("summary", ""),
-                "priceChange": state.get("priceChange"),
-                "previousPrice": state.get("previousPrice"),
-                "is_error": not bool(state.get("bestOffer")),
-                "error_type": "NO_OFFERS_FOUND" if not state.get("bestOffer") else None,
-                "pending_id": pending_id,
+            emit_fn("agent_start", {
+                "query": analysis.model,
+                "original_query": clean_prompt,
+                "category": analysis.category,
                 "timestamp": datetime.now(timezone.utc).isoformat()
             })
 
-        return state
-
-    async def persist_hardware_offer(self, offer: dict, model_name: str, category: str, comp_id_override: str = None) -> dict | None:
-        """Saves or updates a retailer offer in hardware_components, recording timestamped PriceHistory."""
-        if not offer or (offer.get('price') or 0) <= 0:
-            return None
-
-        try:
-            canonical_model = model_name or "Hardware Component"
-            if offer.get('title') and model_name and not self.is_semantic_product_match(offer['title'], model_name, category):
-                canonical_model = clean_hardware_query(offer['title'], category)
-
-            clean_slug = re.sub(r'[^a-z0-9]+', '-', (canonical_model or 'hardware').lower())[:70].strip('-')
-            ret_slug = (offer.get('retailer') or 'retailer').lower().replace(' ', '-')[:20]
-            comp_id = comp_id_override if comp_id_override and str(comp_id_override).startswith('comp-') and canonical_model == model_name else f"comp-{clean_slug}-{ret_slug}"[:95]
-
-            # Preserve and append to PriceHistory
-            existing_specs = {}
-            offer_lowest_90d = float(offer['price'])
-            try:
-                exist_check = await asyncio.to_thread(supabase.table('hardware_components').select('specs, lowest_price_90d').eq('id', comp_id).execute)
-                if exist_check.data and len(exist_check.data) > 0:
-                    raw_s = exist_check.data[0].get('specs')
-                    existing_specs = json.loads(raw_s) if isinstance(raw_s, str) else (raw_s or {})
-                    if exist_check.data[0].get('lowest_price_90d'):
-                        offer_lowest_90d = min(float(exist_check.data[0]['lowest_price_90d']), float(offer['price']))
-            except Exception:
-                pass
-
-            price_history = existing_specs.get('PriceHistory', [])
-            now_iso = datetime.now(timezone.utc).isoformat()
-            price_history.append({
-                "price": float(offer['price']),
-                "timestamp": now_iso,
-                "inStock": bool(offer.get('inStock', True))
-            })
-            if len(price_history) > 180:
-                price_history = price_history[-180:]
-
-            # Calculate deal score
-            orig_p = float(offer.get('originalPrice') or offer['price'])
-            current_p = float(offer['price'])
-            if orig_p and orig_p > current_p:
-                discount_pct = (orig_p - current_p) / orig_p
-                offer_deal_score = min(99, int(60 + discount_pct * 100))
-            elif current_p <= offer_lowest_90d:
-                offer_deal_score = 90
-            else:
-                offer_deal_score = 60
-
-            hw_payload = {
-                "id": comp_id,
-                "name": (offer.get('title') or canonical_model or "Hardware Component")[:250],
-                "category": category[:50],
-                "brand": (offer.get('title', '').split()[0] if offer.get('title') else "Hardware")[:50],
-                "model": (canonical_model or "Hardware Component")[:95],
-                "specs": json.dumps({
-                    "AgentSummary": "Live Autonomous Scraping Engine",
-                    "InStock": bool(offer.get('inStock', True)),
-                    "IsRefurbished": bool(offer.get('isRefurbished', False)),
-                    "OriginalPrice": orig_p,
-                    "ScrapedAt": now_iso,
-                    "PriceHistory": price_history
-                }),
-                "msrp": orig_p,
-                "current_price": current_p,
-                "lowest_price_90d": offer_lowest_90d,
-                "retailer": (offer.get('retailer') or 'Retailer')[:50],
-                "product_url": offer.get('url') or '',
-                "image_url": offer.get('imageUrl') or "https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=600&q=80",
-                "rating": offer.get('rating') or 4.8,
-                "deal_score": offer_deal_score,
-                "updated_at": now_iso
-            }
-            await asyncio.to_thread(supabase.table('hardware_components').upsert(hw_payload).execute)
-            print(f"[DB Persist Success] Saved \"{offer.get('retailer')}\" offer: \"{offer.get('title', '')[:60]}\" (${current_p:.2f}) with PriceHistory ({len(price_history)} snapshots)")
-            return hw_payload
-        except Exception as e:
-            print(f"[Agent Incremental Persistence Error]: {e}")
-            return None
-
-    async def refresh_direct_item(self, item: dict, emit_fn=None) -> dict | None:
-        """
-        Directly refreshes a single item from its verified product_url:
-        - Extracts price and stock status via direct HTTP (fallback to Firecrawl)
-        - Upserts hardware_components with PriceHistory append
-        - Updates matching watchlist_items (current_price, all_time_low, previous_price_24h)
-        - Dispatches instant target-met email notifications if threshold reached
-        - Emits real-time SSE events
-        """
-        url = item.get('url') or item.get('product_url')
-        if not url or not (url.startswith('http://') or url.startswith('https://')):
-            return None
-
-        component_name = item.get('name') or item.get('component_name') or item.get('model') or 'Hardware Component'
-        category = item.get('category') or 'GPU'
-        retailer_name = item.get('retailer') or self.detect_retailer(url)
-
-        print(f"[Direct URL Scraper] 🎯 Fetching exact URL for: \"{component_name}\" ({retailer_name}) -> {url}")
-        
-        offer = await self.extract_direct_page(url, retailer_name, category, model_query=component_name)
-        if not offer or offer.get('blocked') or (offer.get('price') or 0) <= 0:
-            print(f"⚠️ [Direct URL Scraper Notice] Unable to extract live price from: {url}")
-            return None
-
-        clean_title = offer.get('title') or component_name
-        price = float(offer['price'])
-        in_stock = bool(offer.get('inStock', True))
-        is_refurbished = bool(offer.get('isRefurbished', False))
-        original_price = float(offer.get('originalPrice') or price)
-        now_iso = datetime.now(timezone.utc).isoformat()
-
-        # Persist to hardware_components with PriceHistory
-        await self.persist_hardware_offer(offer, component_name, category, comp_id_override=item.get('id'))
-
-        # Update watchlist_items across matching users
-        try:
-            item_db_id = item.get('id')
-            is_watchlist_item = item.get('isWatchlist') or bool(item.get('userId'))
-
-            target_rows = []
-            if is_watchlist_item and item_db_id:
-                wl_res = await asyncio.to_thread(supabase.table('watchlist_items').select('*').eq('id', item_db_id).execute)
-                target_rows = wl_res.data or []
-
-            if not target_rows:
-                clean_keyword = re.sub(r'[^a-zA-Z0-9\s]', ' ', component_name).strip()
-                short_keyword = re.sub(r'\s+', ' ', clean_keyword).split(' - ')[0].strip()[:30]
-                
-                wl_query = supabase.table('watchlist_items').select('*')
-                if item.get('userId'):
-                    wl_query = wl_query.eq('user_id', item['userId'])
-                if short_keyword:
-                    wl_query = wl_query.ilike('component_name', f"%{short_keyword}%")
-                
-                wl_res = await asyncio.to_thread(wl_query.execute)
-                target_rows = wl_res.data or []
-
-            if target_rows:
-                frontend_url = os.environ.get("FRONTEND_URL", "https://rigscouter.ishaankoradia.com")
-                for row in target_rows:
-                    r_id = row['id']
-                    r_user_id = row.get('user_id')
-                    row_name = row.get('component_name') or component_name
-
-                    # Semantic Match Guard: Ensure scraped page matches the tracked watchlist item
-                    if not self.is_semantic_product_match(clean_title, row_name, category):
-                        print(f"⚠️ [Watchlist Mismatch Safeguard] Scraped title \"{clean_title}\" does not match watchlist component \"{row_name}\" — skipping watchlist update for ID {r_id}")
-                        continue
-
-                    target_price = float(row.get('target_price') or 0)
-                    prior_price = row.get('current_price') or row.get('all_time_low')
-                    prior_atl = float(row.get('all_time_low') or price)
-                    alerts_on = row.get('notify_on_flash_drop', True)
-
-                    update_payload = {
-                        "all_time_low": min(prior_atl, price),
-                    }
-                    if prior_price and prior_price != price:
-                        update_payload["previous_price_24h"] = prior_price
-
-                    await asyncio.to_thread(supabase.table('watchlist_items').update(update_payload).eq('id', r_id).execute)
-
-                    # Trigger instant email notification ONLY if target met AND semantic product match verified AND in stock
-                    if target_price > 0 and price <= target_price and alerts_on and in_stock:
-                        try:
-                            async with httpx.AsyncClient(timeout=4.0) as client:
-                                await client.post(
-                                    f"{frontend_url}/api/notifications/target-met",
-                                    json={
-                                        "userId": r_user_id,
-                                        "componentName": row.get('component_name') or clean_title,
-                                        "category": category,
-                                        "targetPrice": target_price,
-                                        "currentPrice": price,
-                                        "retailer": retailer_name,
-                                        "productUrl": url,
-                                    }
-                                )
-                                print(f"[ASAP Alert Dispatched] Scraped price ${price:.2f} <= target ${target_price:.2f} for user {r_user_id} on '{clean_title}'")
-                        except Exception as alert_e:
-                            print(f"[ASAP Alert Dispatch Warning]: {alert_e}")
-        except Exception as wl_err:
-            print(f"[Direct URL Watchlist Update Warning]: {wl_err}")
-
-        # Emit SSE
-        if emit_fn:
-            emit_fn('retailer_found', {
-                "query": component_name,
-                "original_query": component_name,
-                "retailer": retailer_name,
-                "price": price,
-                "title": clean_title,
-                "url": url,
-                "inStock": in_stock,
-                "isRefurbished": is_refurbished,
-                "timestamp": now_iso
-            })
-            emit_fn('agent_complete', {
-                "query": component_name,
-                "original_query": component_name,
-                "category": category,
-                "bestOffer": {
-                    "retailer": retailer_name,
-                    "price": price,
-                    "title": clean_title,
-                    "url": url,
-                    "inStock": in_stock,
-                    "isRefurbished": is_refurbished,
-                    "originalPrice": original_price
-                },
-                "allOffers": [offer],
-                "is_error": False,
-                "summary": f"Direct product URL updated: ${price:.2f} at {retailer_name} ({'In Stock' if in_stock else 'Out of Stock'}).",
-                "timestamp": now_iso
-            })
-
-        return offer
-
-    async def extract_direct_page(self, url: str, retailer_name: str, category: str, model_query: str = None) -> dict:
-        offer = await self.direct_http_extract(url, retailer_name, category, model_query)
-        if not offer:
-            offer = await self.firecrawl_extract(url, retailer_name, category, model_query)
-        return offer
-
-    def is_semantic_product_match(self, title: str, query: str, category: str = None) -> bool:
-        """
-        Adaptable semantic match: verifies title matches requested product without arbitrary price bounds.
-        Enforces strict brand consistency, trim/model line consistency, chipset/model numbers,
-        and eliminates accessory/parts/prebuilt false positives.
-        """
-        if not title or not query:
-            return False
-
-        lower_t = title.lower()
-        lower_q = query.lower()
-        clean_t = re.sub(r'[^a-z0-9]', '', lower_t)
-
-        # 1. Reject junk, broken items, and parts-only listings
-        bad_keywords = [
-            'for parts', 'broken', 'box only', 'read description', 'empty box', 
-            'sticker only', 'packaging only', 'manual only', 'dummy', 'poster', 'as is', 'case badge'
-        ]
-        if any(b in lower_t and b not in lower_q for b in bad_keywords):
-            return False
-
-        # 2. Reject accessory and part replacement listings unless query explicitly requested it
-        is_query_for_accessory = any(k in lower_q for k in ['cable', 'adapter', 'bracket', 'backplate', 'block', 'shroud', 'fan', 'pad', 'shim', 'mount', 'accessory', 'stand', 'holder'])
-        if not is_query_for_accessory:
-            clean_acc_t = re.sub(r'\b(?:heatsink|cooler)\s+not\s+included\b', '', lower_t)
-            clean_acc_t = re.sub(r'\b(?:with|w/|integrated)\s+heatsink\b', '', clean_acc_t)
-            
-            accessory_indicators = [
-                r'\b(?:bracket|backplate|cable|adapter|shroud|heatsink|water\s*block|waterblock|gpu\s*fan|thermal\s*pad|copper\s*shim|holder|stand|mounting\s*kit)\s+(?:only|for\b)',
-                r'^(?:bracket|backplate|cable|adapter|shroud|heatsink|waterblock|fan|thermal\s*pad|holder|stand)\b',
-                r'\b(?:bracket|backplate|cable|adapter|shroud|heatsink|waterblock|fan|holder|stand)\s+only\b',
-                r'\b(?:riser\s*cable|extension\s*cable|12vhpwr|anti-sag|gpu\s*support|gpu\s*holder|gpu\s*stand|power\s*cable|water\s*block|waterblock|backplate)\b'
-            ]
-            is_full_component = any(w in lower_t for w in [
-                'graphics card', 'video card', 'geforce rtx', 'geforce gtx', 'radeon rx', 
-                'desktop processor', 'boxed processor', 'processor', 'motherboard', 'desktop memory', 
-                'solid state drive', 'internal ssd', 'nvme m.2', 'power supply', 'atx power supply'
-            ])
-            has_exclusive_accessory = any(w in lower_t for w in [
-                'only', 'stand for', 'bracket for', 'cable for', 'holder for', 'block for', 
-                'cooler for', 'anti-sag', 'support bracket', 'support holder'
-            ])
-            if not (is_full_component and not has_exclusive_accessory):
-                if any(re.search(pat, clean_acc_t) for pat in accessory_indicators):
-                    return False
-
-        # 3. Reject multi-model keyword stuffing spam (e.g. "RTX 5070 Ti 5080 5090" in title)
-        found_gpus = re.findall(r'\b(5090|5080|5070\s*ti|5070|5060\s*ti|5060|4090|4080|4070\s*ti|4070|4060\s*ti|4060|3090|3080|3070|3060)\b', lower_t)
-        if len(set(re.sub(r'\s+', '', g) for g in found_gpus)) > 1:
-            return False
-
-        # 4. Reject prebuilt PCs / Laptops when looking for individual components
-        if category in ['GPU', 'CPU', 'Motherboard', 'RAM', 'Storage', 'Power Supply', 'Case', 'Cooling'] or not category:
-            if not any(k in lower_q for k in ['pc', 'desktop', 'prebuilt', 'laptop', 'system', 'notebook']):
-                if any(p in lower_t for p in ['gaming laptop', 'laptop computer', 'prebuilt pc', 'complete pc', 'all-in-one desktop', 'desktop computer', 'notebook pc']):
-                    return False
-                is_component_indicator = any(w in lower_t for w in ['graphics card', 'video card', 'geforce', 'radeon', 'desktop processor', 'motherboard', 'solid state drive', 'power supply', 'internal ssd', 'gddr', 'pci express', 'pcie', 'gpu for', 'graphics cards'])
-                if not is_component_indicator and any(p in lower_t for p in ['desktop pc', 'gaming pc', 'gaming desktop', 'laptop', 'notebook']):
-                    return False
-
-        # 5. Strict Brand Consistency Check
-        PRIMARY_BRANDS = [
-            'asus', 'gigabyte', 'msi', 'zotac', 'pny', 'evga', 'sapphire', 'powercolor', 'xfx', 
-            'asrock', 'inno3d', 'gainward', 'palit', 'galax', 'kfa2', 'samsung', 'western digital', 
-            'wd', 'seagate', 'crucial', 'sk hynix', 'sabrent', 'corsair', 'g.skill', 'gskill', 
-            'kingston', 'teamgroup', 'patriot', 'adata', 'noctua', 'be quiet', 'lian li', 'nzxt', 
-            'fractal design', 'fractal', 'thermalright', 'deepcool', 'arctic', 'seasonic', 'super flower', 
-            'thermaltake', 'silverstone', 'cooler master', 'montech', 'phanteks', 'antec', 'logitech', 
-            'razer', 'steelseries', 'wooting', 'keychron', 'hyperx', 'shure', 'elgato', 'rode', 
-            'audio-technica', 'ducky', 'epomaker', 'glorious'
-        ]
-        
-        query_brands = [b for b in PRIMARY_BRANDS if re.search(r'\b' + re.escape(b) + r'\b', lower_q)]
-        if query_brands:
-            has_matching_brand = any(re.search(r'\b' + re.escape(b) + r'\b', lower_t) for b in query_brands)
-            title_conflicts = [b for b in PRIMARY_BRANDS if b not in query_brands and re.search(r'\b' + re.escape(b) + r'\b', lower_t)]
-            if not has_matching_brand and title_conflicts:
-                return False
-
-        # 6. Trim / Sub-Model Line Matching (e.g. Prime, TUF, Strix, Windforce, Gaming OC, AORUS, Suprim, Ventus)
-        TRIM_LINES = [
-            'prime', 'tuf', 'strix', 'rog', 'proart', 'dual', 'ko', 'aorus', 'windforce', 'eagle', 
-            'gaming oc', 'aero', 'master', 'xtreme', 'suprim', 'ventus', 'gaming x', 'gaming trio', 
-            'vanguard', 'trinity', 'amp extreme', 'speedster', 'merc', 'qick', 'swft', 'nitro', 
-            'pulse', 'pure', 'hellhound', 'red devil', 'fighter', 'taichi', 'phantom gaming', 
-            'steel legend', 'challenger', 'ichill', 'twin x2', 'trident z', 'ripjaws', 'flare x', 
-            'vengeance', 'dominator', 'fury beast', 'black sn850x', 'blue sn580', '990 pro', '980 pro'
-        ]
-        query_trims = [t for t in TRIM_LINES if re.search(r'\b' + re.escape(t) + r'\b', lower_q)]
-        if query_trims:
-            has_matching_trim = any(re.search(r'\b' + re.escape(t) + r'\b', lower_t) for t in query_trims)
-            title_conflicting_trims = [t for t in TRIM_LINES if t not in query_trims and re.search(r'\b' + re.escape(t) + r'\b', lower_t)]
-            if not has_matching_trim and title_conflicting_trims:
-                return False
-
-        # 7. Extract core numeric/model identifiers from query and verify presence
-        # Strip spec units, bus widths (e.g. 256-bit), interface versions (PCIe 5.0, DLSS 4.0, GDDR7), and capacities (16gb, 2tb)
-        q_clean = re.sub(r'\b(?:pcie|pci[- ]?e|pci[- ]?express|dlss|gen|bluetooth|bt|wifi|wi[- ]?fi|hdmi|dp|displayport|type[- ]?c|usb|gddr|m\.2|nvme)[- ]?\d+(?:\.\d+)?\b', '', query.lower())
-        q_clean = re.sub(r'\b\d+(?:\.\d+)?[- ]*(?:gb|tb|mb|mhz|ghz|w|mm|slot|pin|bit|fan|rpm)\b', '', q_clean)
-        q_clean = re.sub(r'\b\d+\.\d+\b', '', q_clean)
-        q_raw = re.sub(r'([a-zA-Z]{2,})(\d+)', r'\1 \2', q_clean)
-        q_raw = re.sub(r'(\d+)([a-zA-Z]{2,})', r'\1 \2', q_raw)
-        q_tokens = [w for w in re.sub(r'[^a-z0-9\s]', ' ', q_raw.lower()).split() if len(w) > 0]
-        
-        digit_tokens = [w for w in q_tokens if re.search(r'\d', w)]
-        pure_digits = [re.findall(r'\d+', w)[0] for w in digit_tokens if re.findall(r'\d+', w)]
-        if pure_digits and not all(d in clean_t for d in pure_digits):
-            return False
-
-        # 8. If query specifies critical modifiers (e.g. 'ti', 'super', 'wifi', 'white', 'ddr5', '2tb'), ensure title matches
-        CRITICAL_MODIFIERS = {'plus', 'super', 'ti', 'xt', 'xtx', 'wifi', 'white', 'liquid', 'wireless', 'ddr4', 'ddr5', '500gb', '1tb', '2tb', '4tb', '8tb', '16gb', '32gb', '64gb'}
-        q_orig_tokens = [w for w in re.sub(r'[^a-z0-9\s]', ' ', query.lower()).split() if len(w) > 0]
-        query_modifiers = [w for w in q_orig_tokens if w in CRITICAL_MODIFIERS]
-        if query_modifiers and not all(m in clean_t for m in query_modifiers):
-            return False
-
-        return True
-
-    async def filter_matching_titles(self, titles: list[str], query: str, category: str) -> list[bool]:
-        return [self.is_semantic_product_match(t, query, category) for t in titles]
-
-    def extract_json_ld(self, soup: BeautifulSoup, model_query: str = None) -> dict | None:
-        """
-        Parses Schema.org JSON-LD standard embedded on Best Buy, B&H, Newegg, Micro Center, eBay, Amazon, etc.
-        """
-        for script in soup.find_all('script', type='application/ld+json'):
-            if not script.string:
-                continue
-            try:
-                raw_data = json.loads(script.string)
-                items = []
-                if isinstance(raw_data, list):
-                    items = raw_data
-                elif isinstance(raw_data, dict):
-                    if '@graph' in raw_data and isinstance(raw_data['@graph'], list):
-                        items = raw_data['@graph']
-                    else:
-                        items = [raw_data]
-
-                for item in items:
-                    item_type = str(item.get('@type', '')).lower()
-                    if 'product' in item_type or 'itempage' in item_type or 'individualproduct' in item_type:
-                        name = item.get('name') or item.get('headline')
-                        offers = item.get('offers')
-                        if not offers:
-                            continue
-
-                        offer_list = offers if isinstance(offers, list) else [offers]
-                        for off in offer_list:
-                            if not isinstance(off, dict):
-                                continue
-                            raw_price = off.get('price') or off.get('lowPrice')
-                            if raw_price is not None:
-                                try:
-                                    price_val = float(str(raw_price).replace('$', '').replace(',', '').strip())
-                                except (ValueError, TypeError):
-                                    continue
-
-                                if price_val > 0:
-                                    avail_str = str(off.get('availability', '')).lower()
-                                    is_in_stock = True
-                                    if any(s in avail_str for s in ['outofstock', 'discontinued', 'soldout', 'backorder']):
-                                        is_in_stock = False
-
-                                    cond_str = str(off.get('itemCondition', '')).lower()
-                                    is_refurbished = any(c in cond_str for c in ['refurbished', 'used', 'damaged'])
-
-                                    image_url = item.get('image')
-                                    if isinstance(image_url, list) and image_url:
-                                        image_url = image_url[0]
-                                    elif isinstance(image_url, dict):
-                                        image_url = image_url.get('url')
-
-                                    brand = item.get('brand')
-                                    if isinstance(brand, dict):
-                                        brand = brand.get('name')
-
-                                    return {
-                                        "title": name,
-                                        "price": price_val,
-                                        "inStock": is_in_stock,
-                                        "isRefurbished": is_refurbished,
-                                        "imageUrl": image_url if isinstance(image_url, str) else None,
-                                        "brand": str(brand) if brand else None,
-                                        "source": "json-ld"
-                                    }
-            except Exception:
-                continue
-        return None
-
-    def extract_opengraph_microdata(self, soup: BeautifulSoup) -> dict | None:
-        """
-        Parses OpenGraph and Microdata meta tags.
-        """
-        price = None
-        for tag in soup.select('meta[property="og:price:amount"], meta[property="product:price:amount"], meta[itemprop="price"], meta[name="twitter:data1"]'):
-            content = tag.get('content') or tag.get('value')
-            if content:
-                m = re.search(r'([0-9,]+(?:\.[0-9]{2})?)', content)
-                if m:
-                    try:
-                        val = float(m.group(1).replace(',', ''))
-                        if val > 0:
-                            price = val
-                            break
-                    except ValueError:
-                        pass
-
-        if not price:
-            return None
-
-        title_tag = soup.select_one('meta[property="og:title"], meta[name="twitter:title"]')
-        title = title_tag.get('content').strip() if title_tag and title_tag.get('content') else None
-
-        img_tag = soup.select_one('meta[property="og:image"], meta[name="twitter:image"]')
-        image_url = img_tag.get('content').strip() if img_tag and img_tag.get('content') else None
-
-        avail_tag = soup.select_one('meta[property="og:availability"], meta[itemprop="availability"]')
-        is_in_stock = True
-        if avail_tag and avail_tag.get('content'):
-            avail_val = avail_tag['content'].lower()
-            if any(s in avail_val for s in ['outofstock', 'discontinued', 'soldout']):
-                is_in_stock = False
-
-        return {
-            "title": title,
-            "price": price,
-            "inStock": is_in_stock,
-            "isRefurbished": False,
-            "imageUrl": image_url,
-            "brand": None,
-            "source": "opengraph"
-        }
-
-    def extract_retailer_buybox_dom(self, soup: BeautifulSoup, retailer_name: str) -> dict | None:
-        """
-        Clean, targeted DOM buybox parser for each supported retailer.
-        """
-        price = None
-        title = None
-        in_stock = True
-        is_refurbished = False
-
-        if retailer_name == 'Amazon':
-            if 'robot check' in soup.text.lower() or 'enter the characters you see below' in soup.text.lower():
-                return None
-            avail = soup.select_one('#availability')
-            if avail and ('currently unavailable' in avail.text.lower() or 'out of stock' in avail.text.lower()):
-                return {"out_of_stock": True}
-
-            price_elem = soup.select_one('#corePriceDisplay_desktop_feature_div .a-price .a-offscreen, #corePrice_feature_div .a-price .a-offscreen, #corePrice_desktop .a-price .a-offscreen, #apex_desktop .a-price .a-offscreen')
-            if price_elem:
-                m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', price_elem.text)
-                if m:
-                    try: price = float(m.group(1).replace(',', ''))
-                    except ValueError: pass
-
-            t_elem = soup.select_one('#productTitle')
-            if t_elem: title = t_elem.text.strip()
-
-        elif retailer_name == 'Newegg':
-            for sp in soup.select('.product-headline, .product-sellers, [class*="sponsored"], .item-sponsored, .recommended-box, .swiper, .carousel, [class*="protection"], [class*="warranty"], #Buy_Together, #PDP_product-recommend, .item-cells-wrap, .product-similar-links, .product-similar-link, .modal-intermediary, .objCombo'):
-                sp.decompose()
-
-            buybox = soup.select_one('.product-buy-box, #ProductBuy, .product-pane, .product-main')
-            search_scope = buybox if buybox else soup
-
-            for price_elem in search_scope.select('.price-current_2026, [class*="price-current"], li.price-current, .price-current'):
-                price_strong = price_elem.select_one('strong')
-                price_sup = price_elem.select_one('sup')
-                if price_strong:
-                    price_str = price_strong.text.replace('$', '').replace(',', '').strip()
-                    frac = price_sup.text.strip() if price_sup else ".00"
-                    try:
-                        p_val = float(f"{price_str}{frac}")
-                        if p_val >= 10.0:
-                            price = p_val
-                            break
-                    except ValueError:
-                        pass
-                else:
-                    p_text = price_elem.text.replace('\xa0', ' ').strip()
-                    m = re.search(r'\$?([0-9,]+(?:\.[0-9]{2})?)', p_text)
-                    if m:
-                        try:
-                            p_val = float(m.group(1).replace(',', ''))
-                            if p_val >= 10.0:
-                                price = p_val
-                                break
-                        except ValueError:
-                            pass
-            t_elem = soup.select_one('h1.product-title, h1')
-            if t_elem: title = t_elem.text.strip()
-
-            inv = soup.select_one('.product-inventory, .product-buy-box')
-            if inv and any(s in inv.text.lower() for s in ['out of stock', 'sold out', 'discontinued', 'auto notify']):
-                return {"out_of_stock": True}
-
-        elif retailer_name == 'Best Buy':
-            price_elem = soup.select_one('.priceView-customer-price span[aria-hidden="true"], .priceView-hero-price span[aria-hidden="true"], div[data-testid="customer-price"] span[aria-hidden="true"], .pricing-price span')
-            if price_elem:
-                m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', price_elem.text)
-                if m:
-                    try: price = float(m.group(1).replace(',', ''))
-                    except ValueError: pass
-            t_elem = soup.select_one('.sku-title h1, h1[class*="product-title"], h1')
-            if t_elem: title = t_elem.text.strip()
-
-            btn = soup.select_one('.add-to-cart-button, button[data-button-state]')
-            if btn and ('sold_out' in btn.get('data-button-state', '').lower() or 'sold out' in btn.text.lower()):
-                return {"out_of_stock": True}
-
-        elif retailer_name == 'B&H':
-            price_elem = soup.select_one('[data-selenium="pricingPrice"], .price__9gLfjPSjp')
-            if price_elem:
-                m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', price_elem.text)
-                if m:
-                    try: price = float(m.group(1).replace(',', ''))
-                    except ValueError: pass
-            t_elem = soup.select_one('[data-selenium="productTitle"], h1[data-selenium="productTitle"], h1')
-            if t_elem: title = t_elem.text.strip()
-
-            avail = soup.select_one('.shippingAvail_yL7x0I4P, [data-selenium="stockStatus"], [data-selenium="availability"]')
-            avail_text = avail.text.lower() if avail else ''
-            if 'no longer available' in avail_text or 'discontinued' in avail_text:
-                return {"out_of_stock": True}
-
-        elif retailer_name == 'eBay':
-            for plan in soup.select('.x-additional-services, [data-testid*="additional-services"], [class*="protection-plan"], [class*="warranty"], [data-testid*="warranty"], .insurance-plan'):
-                plan.decompose()
-            price_elem = soup.select_one('.x-price-primary, [data-testid="x-price-primary"], .x-bin-price .x-price-primary')
-            if price_elem:
-                spans = price_elem.select('.ux-textspans')
-                valid_spans = [s for s in spans if 'strikethrough' not in ''.join(s.get('class', [])).lower()]
-                target_text = valid_spans[0].text if valid_spans else price_elem.text
-                m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', target_text)
-                if m:
-                    try: price = float(m.group(1).replace(',', ''))
-                    except ValueError: pass
-            t_elem = soup.select_one('.x-item-title__mainTitle span.ux-textspans, .x-item-title__mainTitle')
-            if t_elem: title = t_elem.text.strip()
-
-            cond_elem = soup.select_one('.x-item-condition-text')
-            if cond_elem:
-                cond_text = cond_elem.text.lower()
-                if 'used' in cond_text or 'refurbished' in cond_text:
-                    is_refurbished = True
-                if 'for parts' in cond_text or 'not working' in cond_text:
-                    return None
-
-        elif retailer_name == 'Micro Center':
-            price_elem = soup.select_one('#pricing, #pricing2')
-            if price_elem:
-                content_val = price_elem.get('content')
-                if content_val:
-                    m = re.search(r'([0-9,]+(?:\.[0-9]{2})?)', content_val)
-                    if m:
-                        try: price = float(m.group(1).replace(',', ''))
-                        except ValueError: pass
-                if not price:
-                    m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', price_elem.text)
-                    if m:
-                        try: price = float(m.group(1).replace(',', ''))
-                        except ValueError: pass
-            t_elem = soup.select_one('[data-name], .product-header h1')
-            if t_elem and t_elem.get('data-name'):
-                title = t_elem['data-name'].strip()
-            elif t_elem:
-                title = t_elem.text.strip()
-
-            inv = soup.select_one('.inventoryCnt, .out-of-stock, .unavailable')
-            if inv and ('sold out' in inv.text.lower() or 'no longer carried' in inv.text.lower()):
-                return {"out_of_stock": True}
-
-        if price and price > 0:
+        if not analysis.is_pc_part:
+            msg = f"'{clean_prompt}' does not appear to be a PC component or computer peripheral."
+            print(f"[Non-Hardware Rejected] {msg}")
+            if emit_fn:
+                emit_fn("agent_error", {
+                    "query": clean_prompt,
+                    "original_query": clean_prompt,
+                    "error_type": "NON_HARDWARE_QUERY",
+                    "message": msg,
+                    "pending_id": pending_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                })
+                emit_fn("agent_complete", {
+                    "query": clean_prompt,
+                    "original_query": clean_prompt,
+                    "category": analysis.category,
+                    "scrapedOffers": [],
+                    "summary": msg,
+                    "pending_id": pending_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                })
             return {
-                "title": title,
-                "price": price,
-                "inStock": in_stock,
-                "isRefurbished": is_refurbished,
-                "imageUrl": None,
-                "brand": None,
-                "source": "buybox-dom"
+                "query": clean_prompt,
+                "normalized_query": analysis.model,
+                "category": analysis.category,
+                "scrapedOffers": [],
+                "failed_retailers": []
             }
-        return None
 
-    def is_page_out_of_stock(self, soup: BeautifulSoup, retailer_name: str) -> bool:
-        """
-        Verifies if the page or buybox explicitly indicates out of stock / discontinued / no longer available.
-        """
-        lower_page = (soup.text or '')[:4000].lower()
+        # 2. Concurrently scrape retailers (Amazon + eBay)
+        tasks = [
+            self.amazon.search(analysis),
+            self.ebay.search(analysis),
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # 1. Retailer-specific critical indicators
-        if retailer_name == 'B&H':
-            avail = soup.select_one('[data-selenium="stockStatus"], [data-selenium="availability"], .shippingAvail_yL7x0I4P, [class*="stockStatus"], [class*="availability"]')
-            if avail:
-                text = avail.text.lower()
-                if any(s in text for s in ['no longer available', 'discontinued', 'out of stock', 'sold out', 'backorder', 'not available']):
-                    return True
-            if 'no longer available' in lower_page or 'discontinued' in lower_page:
-                return True
+        scraped_offers = []
+        for res in results:
+            if isinstance(res, dict) and res.get("price"):
+                scraped_offers.append(res)
+                if emit_fn:
+                    emit_fn("retailer_found", {"retailer": res["retailer"], "offer": res})
 
-        elif retailer_name == 'Best Buy':
-            btn = soup.select_one('.add-to-cart-button, button[data-button-state]')
-            if btn:
-                btn_state = btn.get('data-button-state', '').lower()
-                btn_text = btn.text.lower()
-                if 'sold_out' in btn_state or 'sold out' in btn_text or 'unavailable' in btn_text:
-                    return True
-            fulfillment = soup.select_one('.fulfillment-add-to-cart-button, .fulfillment-fulfillment-summary')
-            if fulfillment and ('sold out' in fulfillment.text.lower() or 'currently unavailable' in fulfillment.text.lower()):
-                return True
-            if 'sold out' in lower_page[:1500] or 'currently unavailable' in lower_page[:1500]:
-                return True
+        # 3. Sort offers by price ascending
+        scraped_offers.sort(key=lambda x: x["price"])
 
-        elif retailer_name == 'Newegg':
-            inv = soup.select_one('.product-inventory, .product-buy-box')
-            if inv and any(s in inv.text.lower() for s in ['out of stock', 'sold out', 'discontinued', 'auto notify']):
-                return True
+        # 4. Generate Summary
+        if scraped_offers:
+            best = scraped_offers[0]
+            summary = f"Best price for {analysis.model} is ${best['price']:.2f} at {best['retailer']} ({len(scraped_offers)} retailers found)."
+            print(f"\n--- FINAL MULTI-RETAILER RESULTS ---")
+            print(f"Total Offers: {len(scraped_offers)}")
+            for o in scraped_offers:
+                print(f"  • {o['retailer']}: ${o['price']:.2f} ({o['title'][:55]}...)")
+        else:
+            summary = f"No verified in-stock offers found for {analysis.model} on Amazon or eBay."
+            print(f"\n[HardwareAgent] No valid offers found across retailers.")
 
-        elif retailer_name == 'Micro Center':
-            inv = soup.select_one('.inventoryCnt, .out-of-stock, .unavailable, .availabilityTrunc')
-            if inv and any(s in inv.text.lower() for s in ['sold out', 'no longer carried', 'not available', '0 in stock', 'out of stock']):
-                return True
+        best_offer = scraped_offers[0] if scraped_offers else None
+        if emit_fn:
+            emit_fn("agent_complete", {
+                "query": analysis.model,
+                "original_query": clean_prompt,
+                "category": analysis.category,
+                "bestOffer": best_offer,
+                "allOffers": scraped_offers,
+                "scrapedOffers": scraped_offers,
+                "summary": summary,
+                "pending_id": pending_id,
+                "is_error": not bool(scraped_offers),
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            })
 
-        elif retailer_name == 'Amazon':
-            avail = soup.select_one('#availability')
-            if avail and any(s in avail.text.lower() for s in ['currently unavailable', 'out of stock', 'temporarily out of stock']):
-                return True
-
-        elif retailer_name == 'eBay':
-            ended = soup.select_one('.x-ended-item-msg, .msg-error, .ux-notice')
-            if ended and any(s in ended.text.lower() for s in ['ended', 'out of stock', 'this listing has ended', 'this listing was ended']):
-                return True
-
-        # 2. Universal stock badge search
-        raw_badges = soup.select('.stock-status, .out-of-stock, .badge-out-of-stock, [data-stock="out_of_stock"]')
-        for b in raw_badges:
-            if any(s in b.text.lower() for s in ['out of stock', 'sold out', 'no longer available', 'discontinued']):
-                return True
-
-        return False
-
-    async def parse_page_content(self, html_content: str, markdown_content: str, url: str, retailer_name: str, category: str, model_query: str = None) -> dict | None:
-        if not html_content:
-            return None
-
-        soup = BeautifulSoup(html_content, 'lxml')
-
-        # Tier 1: Schema.org JSON-LD
-        offer = self.extract_json_ld(soup, model_query)
-
-        # Tier 2: OpenGraph & Microdata
-        if not offer or (offer.get('price') or 0) == 0:
-            og_offer = self.extract_opengraph_microdata(soup)
-            if og_offer and (og_offer.get('price') or 0) > 0:
-                offer = og_offer
-
-        # Tier 3: Dedicated Retailer Buybox DOM
-        if not offer or (offer.get('price') or 0) == 0:
-            dom_offer = self.extract_retailer_buybox_dom(soup, retailer_name)
-            if dom_offer:
-                if dom_offer.get('out_of_stock'):
-                    return {"out_of_stock": True}
-                offer = dom_offer
-
-        # Tier 4: AI Extraction on clean markdown if structured data missing
-        if not offer or (offer.get('price') or 0) == 0:
-            groq_data = await self.parse_with_groq(markdown_content or html_content[:8000], model_query, retailer_name, category)
-            if groq_data and (groq_data.get('price') or 0) > 0:
-                offer = {
-                    "title": groq_data.get('title'),
-                    "price": groq_data['price'],
-                    "originalPrice": groq_data.get('originalPrice'),
-                    "inStock": groq_data.get('inStock', True),
-                    "isRefurbished": groq_data.get('isRefurbished', False),
-                    "brand": groq_data.get('brand'),
-                    "source": "groq-ai"
-                }
-
-        # Multi-layer stock validation: check if page indicates out of stock / discontinued
-        page_oos = self.is_page_out_of_stock(soup, retailer_name)
-        if page_oos:
-            if offer:
-                offer['inStock'] = False
-            else:
-                return {"out_of_stock": True}
-
-        if not offer or (offer.get('price') or 0) <= 0:
-            return {"out_of_stock": True} if page_oos else None
-
-        price_val = float(offer.get('price') or 0)
-
-        # Sanity Price Guard: Discard false positive promo/shipping/rebate micro-prices
-        MIN_CATEGORY_PRICES = {
-            'GPU': 45.00,
-            'CPU': 30.00,
-            'Motherboard': 25.00,
-            'RAM': 15.00,
-            'Storage': 15.00,
-            'Power Supply': 20.00,
-            'Case': 20.00,
-            'Cooling': 8.00,
-        }
-        min_allowed = MIN_CATEGORY_PRICES.get(category, 5.00)
-        if price_val < min_allowed:
-            print(f"⚠️ [Sanity Price Guard] Price ${price_val:.2f} is suspiciously low for {category} (min ${min_allowed:.2f}) — ignoring false positive")
-            return None
-
-        title = offer.get('title') or model_query or ''
-        full_title_for_check = f"{title} {url}"
-
-        # Semantic Match Check
-        if model_query:
-            if not self.is_semantic_product_match(full_title_for_check, model_query, category):
-                print(f"⚠️ [Semantic Mismatch] {retailer_name}: '{title}' does not match query '{model_query}'")
-                return None
-
-        is_stock_final = offer.get('inStock', True) and not page_oos
-        print(f"✅ [{offer.get('source', 'scraped').upper()} HIT] {retailer_name}: Found price ${offer['price']:.2f} (InStock: {is_stock_final}) -> {title[:60]}")
         return {
-            "retailer": retailer_name,
-            "title": title,
-            "price": offer['price'],
-            "originalPrice": offer.get('originalPrice'),
-            "inStock": is_stock_final,
-            "isRefurbished": offer.get('isRefurbished', False),
-            "url": url,
-            "imageUrl": offer.get('imageUrl'),
-            "brand": offer.get('brand'),
-            "source": offer.get('source')
+            "query": clean_prompt,
+            "normalized_query": analysis.model,
+            "category": analysis.category,
+            "brand": analysis.brand,
+            "bestOffer": best_offer,
+            "allOffers": scraped_offers,
+            "scrapedOffers": scraped_offers,
+            "summary": summary,
+            "failed_retailers": []
         }
-
-    async def scrape_all_retailers_unified(self, model_query: str, category: str) -> list[dict]:
-        """
-        Executes a single, unified Tavily search across all top hardware retailers (Amazon, Newegg, 
-        Micro Center, Best Buy, B&H, eBay) using 'basic' search depth (1 credit total vs 12).
-        Clusters and parses candidate URLs per retailer using direct HTTP first (0 credits),
-        with fallback to snippet/Firecrawl only when necessary.
-        """
-        RETAILERS_MAP = {
-            'amazon.com': 'Amazon',
-            'microcenter.com': 'Micro Center',
-            'newegg.com': 'Newegg',
-            'bestbuy.com': 'Best Buy',
-            'bhphotovideo.com': 'B&H',
-            'ebay.com': 'eBay'
-        }
-        all_domains = list(RETAILERS_MAP.keys())
-        search_query = f"buy {model_query} lowest price in stock"
-        print(f"[Unified Tavily Search] 🔍 Querying all 6 retailers for \"{model_query}\" ({category}) in 1 single basic search (1 credit)...")
-
-        results = []
-        for attempt in range(len(TAVILY_API_KEYS)):
-            try:
-                async with httpx.AsyncClient() as client:
-                    res = await client.post('https://api.tavily.com/search', json={
-                        "api_key": self.get_tavily_key(),
-                        "query": search_query,
-                        "search_depth": "basic",
-                        "include_domains": all_domains,
-                        "include_raw_content": False,
-                        "max_results": 15
-                    }, timeout=15.0)
-                
-                if res.status_code != 200:
-                    raise Exception(f"Tavily search HTTP {res.status_code}: {res.text[:200]}")
-                
-                data = res.json()
-                results = data.get('results', [])
-                break
-            except Exception as e:
-                print(f"[Tavily Unified Search Error]: {e}")
-                self.rotate_tavily_key()
-
-        if not results:
-            print(f"[Unified Tavily Search] No raw search results returned for \"{model_query}\"")
-            return []
-
-        # Batch filter candidate titles with semantic matching
-        titles_to_check = [r.get('title', '') for r in results]
-        match_results = await self.filter_matching_titles(titles_to_check, model_query, category)
-
-        # Cluster candidate URLs by retailer
-        retailer_candidates: dict[str, list[dict]] = {}
-        for i, hit in enumerate(results):
-            if i < len(match_results) and not match_results[i]:
-                print(f"⚠️ [Tavily Title Mismatch] Skipping: {hit.get('title')}")
-                continue
-
-            full_url = hit.get('url', '')
-            matched_domain = None
-            for d in all_domains:
-                if d in full_url.lower():
-                    matched_domain = d
-                    break
-            
-            if not matched_domain:
-                continue
-
-            ret_name = RETAILERS_MAP[matched_domain]
-            if not self.is_valid_direct_product_url(full_url, matched_domain):
-                continue
-
-            clean_url = full_url.replace('/reviews/', '').split('?')[0]
-            
-            # Extract price hint from search snippet
-            price_hint = 999999.0
-            combined_text = (hit.get('content', '') or '') + ' ' + (hit.get('title', '') or '')
-            pm = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', combined_text)
-            if pm:
-                try:
-                    val = float(pm.group(1).replace(',', ''))
-                    if val > 5.0:
-                        price_hint = val
-                except ValueError:
-                    pass
-
-            item_candidate = {
-                'url': clean_url,
-                'title': hit.get('title', ''),
-                'content': hit.get('content', ''),
-                'price_hint': price_hint,
-                'retailer': ret_name,
-                'domain': matched_domain
-            }
-            retailer_candidates.setdefault(ret_name, []).append(item_candidate)
-
-        # Process each retailer's candidates
-        verified_offers = []
-        for ret_name, candidates in retailer_candidates.items():
-            candidates.sort(key=lambda x: x.get('price_hint', 999999.0))
-            # Evaluate top 2 candidates per retailer
-            for cand in candidates[:2]:
-                # 1. Try Direct HTTP first (0 API cost)
-                offer = await self.direct_http_extract(cand['url'], ret_name, category, model_query)
-                
-                # 2. Try Firecrawl to render exact live DOM if HTTP was blocked/unavailable
-                if not offer or ((offer.get('price') or 0) == 0 and not offer.get('out_of_stock')):
-                    if not getattr(self, '_disable_firecrawl_in_batch', False):
-                        offer = await self.firecrawl_extract(cand['url'], ret_name, category, model_query)
-
-                # 3. Last-resort fallback: Snippet extraction only if both direct HTTP and Firecrawl failed
-                if not offer or ((offer.get('price') or 0) == 0 and not offer.get('out_of_stock')):
-                    offer = await self.extract_snippet_offer(cand, ret_name, category, model_query)
-
-                if offer and (offer.get('price') or 0) > 0 and not offer.get('out_of_stock') and offer.get('inStock', True):
-                    verified_offers.append(offer)
-                    print(f"✅ [{ret_name.upper()} OFFER EXTRACTED] ${offer['price']:.2f} -> {offer['title'][:60]}")
-                    break
-
-        return verified_offers
-
-    async def scrape_retailer_accurate_offer(self, model_query: str, retailer_name: str, domain_pattern: str, category: str) -> dict:
-        print(f"[Tavily Search] Querying {retailer_name} for \"{model_query}\" ({category})...")
-        
-        for attempt in range(len(TAVILY_API_KEYS)):
-            try:
-                # 1. Search with Tavily to get candidate URLs using basic depth (1 credit)
-                search_query = f"buy {model_query} lowest price in stock"
-                async with httpx.AsyncClient() as client:
-                    res = await client.post('https://api.tavily.com/search', json={
-                        "api_key": self.get_tavily_key(),
-                        "query": search_query,
-                        "search_depth": "basic",
-                        "include_domains": [domain_pattern],
-                        "include_raw_content": False,
-                        "max_results": 10
-                    }, timeout=15.0)
-                
-                if res.status_code != 200:
-                    raise Exception(f"Tavily search failed: {res.text}")
-                    
-                data = res.json()
-                results = data.get('results', [])
-                
-                # Batch filter candidate titles
-                titles_to_check = [r.get('title', '') for r in results]
-                match_results = await self.filter_matching_titles(titles_to_check, model_query, category)
-
-                valid_hits = []
-                for i, hit in enumerate(results):
-                    if i < len(match_results) and not match_results[i]:
-                        print(f"⚠️ [Tavily Title Mismatch] Skipping: {hit.get('title')}")
-                        continue
-
-                    full_url = hit.get('url', '')
-                    if not self.is_valid_direct_product_url(full_url, domain_pattern):
-                        continue
-                        
-                    clean_url = full_url.replace('/reviews/', '').split('?')[0]
-                    
-                    # Extract price hint from search blurb to prioritize evaluating lowest priced listings first
-                    price_hint = 999999.0
-                    combined_text = (hit.get('content', '') or '') + ' ' + (hit.get('title', '') or '')
-                    pm = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', combined_text)
-                    if pm:
-                        try:
-                            val = float(pm.group(1).replace(',', ''))
-                            if val > 5.0: # filter out $0 or $1 coupon text
-                                price_hint = val
-                        except ValueError:
-                            pass
-
-                    valid_hits.append({
-                        'url': clean_url,
-                        'title': hit.get('title', ''),
-                        'content': hit.get('content', ''),
-                        'price_hint': price_hint
-                    })
-
-                if not valid_hits:
-                    return None
-                    
-                # Sort candidate product URLs by lowest price hint first
-                valid_hits.sort(key=lambda x: x.get('price_hint', 999999.0))
-
-                # Evaluate top 3 candidate URLs
-                valid_offers = []
-                for candidate in valid_hits[:3]:
-                    # 1. Try Direct HTTP fetch first (fast, browser headers, 0 credit cost)
-                    offer = await self.direct_http_extract(candidate['url'], retailer_name, category, model_query)
-                    
-                    # 2. If Direct HTTP failed or was blocked, try Firecrawl proxy (unless disabled in batch)
-                    if not offer or ((offer.get('price') or 0) == 0 and not offer.get('out_of_stock')):
-                        if not getattr(self, '_disable_firecrawl_in_batch', False):
-                            offer = await self.firecrawl_extract(candidate['url'], retailer_name, category, model_query)
-
-                    # 3. If Direct HTTP & Firecrawl both failed or were blocked by WAF (e.g. Best Buy on Render), use AI snippet extraction
-                    if not offer or ((offer.get('price') or 0) == 0 and not offer.get('out_of_stock')):
-                        offer = await self.extract_snippet_offer(candidate, retailer_name, category, model_query)
-
-                    if offer:
-                        if offer.get('out_of_stock') or not offer.get('inStock', True):
-                            print(f"⚠️ [Confirmed Out of Stock] {retailer_name}: '{offer.get('title', candidate['title'])}' is out of stock / discontinued. Skipping to next candidate...")
-                            continue
-                        if (offer.get('price') or 0) > 0:
-                            valid_offers.append(offer)
-
-                if valid_offers:
-                    # Select the lowest priced verified in-stock offer for this retailer
-                    valid_offers.sort(key=lambda x: x['price'])
-                    lowest_offer = valid_offers[0]
-                    print(f"✅ [LOWEST CONFIRMED {retailer_name.upper()} OFFER] \"${lowest_offer['price']:.2f}\" (from {len(valid_offers)} option(s)) -> {lowest_offer['title'][:60]}")
-                    return lowest_offer
-
-                return None
-            except Exception as e:
-                print(f"[Tavily Search Error] {retailer_name}: {e}")
-                self.rotate_tavily_key()
-        return None
-
-    async def direct_http_extract(self, url: str, retailer_name: str, category: str, model_query: str = None) -> dict:
-        """Direct HTTP scraper with realistic browser headers when Firecrawl is blocked/unavailable."""
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.google.com/",
-            "Sec-Ch-Ua": '"Google Chrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Platform": '"macOS"',
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "cross-site",
-            "Sec-Fetch-User": "?1",
-            "Upgrade-Insecure-Requests": "1"
-        }
-        http_timeout = 2.5 if "bestbuy.com" in url.lower() else 12.0
-        try:
-            async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=http_timeout) as client:
-                res = await client.get(url)
-                if res.status_code == 200:
-                    return await self.parse_page_content(res.text, "", url, retailer_name, category, model_query)
-        except Exception:
-            pass
-        return None
-
-    async def firecrawl_extract(self, url: str, retailer_name: str, category: str, model_query: str = None) -> dict:
-        if time.time() < getattr(self, '_firecrawl_disabled_until', 0):
-            return None
-
-        app = self.get_firecrawl_app()
-        if not app:
-            return None
-            
-        print(f"[Firecrawl] Extracting {url} ...")
-        scrape_timeout = 15.0
-        try:
-            try:
-                res = await asyncio.wait_for(
-                    asyncio.to_thread(lambda: app.scrape_url(url, formats=['html'])),
-                    timeout=scrape_timeout
-                )
-            except asyncio.TimeoutError:
-                print(f"⚠️ [Firecrawl Timeout] {retailer_name} took >{scrape_timeout}s on {url} — skipping this URL")
-                return None
-            except Exception as e:
-                error_str = str(e).lower()
-                if "err_http2_protocol_error" in error_str or "protocol_error" in error_str or "waf" in error_str:
-                    print(f"⚠️ [Bot WAF Block] {retailer_name} rejected scraper connection — skipping domain")
-                    return {"blocked": True}
-                if "payment" in error_str or "credits" in error_str or "401" in error_str or "402" in error_str or "rate limit" in error_str or "429" in error_str:
-                    print(f"[Firecrawl] Rate/credit limit — disabling Firecrawl for session")
-                    self._firecrawl_disabled_until = time.time() + 300
-                    return None
-                elif "dns resolution failed" in error_str or "dns" in error_str:
-                    print(f"⚠️ [Firecrawl Cloud DNS Warning] {retailer_name}: Firecrawl cloud proxy DNS could not resolve domain — skipping Firecrawl for this URL")
-                    return None
-                else:
-                    print(f"[Firecrawl Error] {retailer_name}: {e}")
-                    return None
-            
-            if not res:
-                return None
-                
-            html_content = ""
-            markdown_content = ""
-            
-            if hasattr(res, 'get'):
-                html_content = res.get('html', '')
-                markdown_content = res.get('markdown', '')
-            else:
-                markdown_content = getattr(res, 'markdown', '') or getattr(res, 'page_content', '') or getattr(res, 'text', '')
-                html_content = getattr(res, 'html', '')
-                if not html_content and hasattr(res, 'metadata') and isinstance(res.metadata, dict):
-                    html_content = res.metadata.get('html', '')
-                    if not markdown_content:
-                        markdown_content = res.metadata.get('markdown', '')
-
-            if not html_content:
-                html_content = markdown_content
-                
-            return await self.parse_page_content(html_content, markdown_content, url, retailer_name, category, model_query)
-        except Exception as e:
-            print(f"⚠️ [Firecrawl Extraction Error] {url}: {e}")
-            return None
-
-    async def extract_snippet_offer(self, candidate: dict, retailer_name: str, category: str, model_query: str = None) -> dict | None:
-        """
-        AI & Regex fallback parser when direct HTTP & Firecrawl are blocked by retailer WAF (e.g. Best Buy on Render).
-        Extracts verified pricing and in-stock status from the search engine result snippet.
-        """
-        url = candidate.get('url', '')
-        raw_title = candidate.get('title', '')
-        content = candidate.get('content', '') or ''
-        combined_text = f"{raw_title} {content}"
-
-        if not content and not raw_title:
-            return None
-
-        # Clean monthly financing e.g. "$94.45/mo"
-        no_monthly = re.sub(r'\$\d+(?:\.\d+)?\s*/\s*(?:mo|month|yr)\b', '', combined_text, flags=re.I)
-        
-        # Look for explicit out of stock indicators in snippet
-        is_oos = any(s in combined_text.lower() for s in ['out of stock', 'sold out', 'currently unavailable', 'no longer available', 'discontinued'])
-
-        price = None
-        # Try Groq AI extraction first if available
-        if GROQ_API_KEY:
-            try:
-                system_prompt = (
-                    f"You are an expert product data extraction agent parsing a {retailer_name} search result. "
-                    f"Target item: '{model_query or raw_title}' ({category}). "
-                    "CRITICAL RULES:\n"
-                    "1. Extract the current active selling price for the MAIN product from the snippet.\n"
-                    "2. NEVER extract protection plans, monthly financing (e.g. '$55/mo'), or shipping fees.\n"
-                    "3. Return ONLY valid JSON: {\"price\": float, \"inStock\": bool, \"title\": str}"
-                )
-                models_to_try = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b", "groq/compound"]
-                for model_name in models_to_try:
-                    try:
-                        async with httpx.AsyncClient() as client:
-                            res = await client.post(
-                                "https://api.groq.com/openai/v1/chat/completions",
-                                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                                json={
-                                    "model": model_name,
-                                    "messages": [
-                                        {"role": "system", "content": system_prompt},
-                                        {"role": "user", "content": f"URL: {url}\nTitle: {raw_title}\nSnippet: {content}"}
-                                    ],
-                                    "response_format": {"type": "json_object"},
-                                    "temperature": 0
-                                },
-                                timeout=4.0
-                            )
-                            if res.status_code == 200:
-                                parsed = json.loads(res.json()["choices"][0]["message"]["content"])
-                                if parsed.get('price') and float(parsed['price']) > 5.0:
-                                    price = float(parsed['price'])
-                                    if 'inStock' in parsed:
-                                        is_oos = not bool(parsed.get('inStock', True))
-                                    if parsed.get('title'):
-                                        raw_title = parsed['title']
-                                    break
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-
-        # Regex fallback if AI didn't return a price
-        if not price:
-            m = re.search(r'\$([0-9,]+(?:\.[0-9]{2})?)', no_monthly)
-            if m:
-                try:
-                    p_val = float(m.group(1).replace(',', ''))
-                    if p_val > 5.0:
-                        price = p_val
-                except ValueError:
-                    pass
-
-        if not price or price <= 0:
-            return None
-
-        # Sanity floor check
-        MIN_CATEGORY_PRICES = {
-            'GPU': 45.00, 'CPU': 30.00, 'Motherboard': 25.00, 'RAM': 15.00,
-            'Storage': 15.00, 'Power Supply': 20.00, 'Case': 20.00, 'Cooling': 8.00,
-        }
-        min_allowed = MIN_CATEGORY_PRICES.get(category, 5.00)
-        if price < min_allowed:
-            return None
-
-        clean_title = raw_title.replace(' - Best Buy', '').replace(' | Best Buy', '').strip()
-        
-        # Semantic check
-        if model_query and not self.is_semantic_product_match(f"{clean_title} {url}", model_query, category):
-            return None
-
-        if is_oos:
-            return {"out_of_stock": True, "title": clean_title}
-
-        is_refurb = retailer_name == 'eBay' or any(w in combined_text.lower() for w in ['refurbished', 'used', 'pre-owned', 'renewed'])
-        print(f"✅ [SNIPPET-AI HIT] {retailer_name}: Found price ${price:.2f} (InStock: True, Refurb: {is_refurb}) -> {clean_title[:60]}")
-        return {
-            "retailer": retailer_name,
-            "title": clean_title,
-            "price": price,
-            "originalPrice": None,
-            "inStock": True,
-            "isRefurbished": is_refurb,
-            "url": url,
-            "imageUrl": None,
-            "brand": None,
-            "source": "snippet-ai"
-        }
-
-    async def parse_with_groq(self, markdown_content: str, query: str, retailer: str, category: str) -> dict:
-        if not GROQ_API_KEY:
-            return {}
-
-        clean_markdown = re.sub(r'##\s*People who viewed this item also viewed[\s\S]*?(?=##|\Z)', '', markdown_content, flags=re.I)
-        clean_markdown = re.sub(r'##\s*Similar items[\s\S]*?(?=##|\Z)', '', clean_markdown, flags=re.I)
-        clean_markdown = re.sub(r'##\s*Sponsored items[\s\S]*?(?=##|\Z)', '', clean_markdown, flags=re.I)
-        clean_markdown = re.sub(r'##\s*Compare with similar items[\s\S]*?(?=##|\Z)', '', clean_markdown, flags=re.I)
-        clean_markdown = re.sub(r'(?:additional service available|protection plan|allstate|squaretrade|asurion|applecare|extended warranty)[\s\S]*?(?=\n\n|\Z)', '', clean_markdown, flags=re.I)
-
-        system_prompt = (
-            f"You are an expert product data extraction agent parsing a {retailer} product page. "
-            f"Extract product details for the target item: '{query}' ({category}). "
-            "CRITICAL RULES:\n"
-            "1. Extract the current active BUYBOX selling price for the MAIN product.\n"
-            "2. NEVER extract protection plans (e.g. '$28.00'), warranties, financing (e.g. '$55/mo'), or shipping fees.\n"
-            "3. NEVER extract prices of related or recommended items from carousels.\n"
-            "4. Return ONLY valid JSON with keys: price (float), originalPrice (float or null), title (str), brand (str or null), inStock (bool)."
-        )
-
-        models_to_try = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b", "groq/compound"]
-        for model_name in models_to_try:
-            try:
-                async with httpx.AsyncClient() as client:
-                    res = await client.post(
-                        "https://api.groq.com/openai/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                        json={
-                            "model": model_name,
-                            "messages": [
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": f"Extract info from this markdown:\n\n{clean_markdown[:7000]}"}
-                            ],
-                            "response_format": {"type": "json_object"},
-                            "temperature": 0
-                        },
-                        timeout=10.0
-                    )
-                    if res.status_code == 200:
-                        return json.loads(res.json()["choices"][0]["message"]["content"])
-                    elif res.status_code == 429:
-                        print(f"[Groq 429] Rate limit on {model_name} — trying next model fallback...")
-                        continue
-            except Exception as e:
-                print(f"[Groq Price Parse Error with {model_name}] {e}")
-
-        return {}
-
-    def is_valid_direct_product_url(self, url: str, domain_pattern: str) -> bool:
-        lower = url.lower()
-        if any(x in lower for x in ['/reviews/', '/questions/', '/forum/', '/blog/', 'searchpage.jsp', '/s?k=', '/p/pl', '/openbox']):
-            return False
-            
-        if 'microcenter.com' in domain_pattern: return '/product/' in lower
-        if 'amazon.com' in domain_pattern: return '/dp/' in lower or '/gp/product/' in lower
-        if 'newegg.com' in domain_pattern: return '/p/' in lower and not '/p/pl' in lower
-        if 'bestbuy.com' in domain_pattern: return ('/site/' in lower and '.p' in lower) or '/product/' in lower or ('/click/' in lower and '/pdp' in lower)
-        if 'bhphotovideo.com' in domain_pattern: return '/c/product/' in lower and not '/accessories' in lower
-        if 'ebay.com' in domain_pattern: return '/itm/' in lower
-        return True
-
-    def detect_retailer(self, text: str) -> str:
-        lower = text.lower()
-        if 'microcenter' in lower: return 'Micro Center'
-        if 'newegg' in lower: return 'Newegg'
-        if 'bestbuy' in lower: return 'Best Buy'
-        if 'bhphotovideo' in lower: return 'B&H'
-        if 'ebay' in lower: return 'eBay'
-        return 'Amazon'
-
-    async def detect_category(self, text: str) -> str:
-        if not GROQ_API_KEY:
-            return 'Not compatible (N/A)'
-            
-        system_prompt = (
-            "Classify the following query or URL into ONE of these strict categories: "
-            "GPU, CPU, RAM, Motherboard, Storage, Power Supply, Case, Cooling, Monitor, Peripherals, Networking. "
-            "If it is NOT a computer component or peripheral, return EXACTLY: Not compatible (N/A). "
-            "Return ONLY the category name. Do not include any other text."
-        )
-        models_to_try = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b", "groq/compound"]
-        for model_name in models_to_try:
-            try:
-                async with httpx.AsyncClient() as client:
-                    res = await client.post(
-                        "https://api.groq.com/openai/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                        json={
-                            "model": model_name,
-                            "messages": [
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": f"Query: {text}"}
-                            ],
-                            "temperature": 0
-                        },
-                        timeout=5.0
-                    )
-                if res.status_code == 200:
-                    category = res.json()["choices"][0]["message"]["content"].strip()
-                    valid_categories = ['GPU', 'CPU', 'RAM', 'Motherboard', 'Storage', 'Power Supply', 'Case', 'Cooling', 'Monitor', 'Peripherals', 'Networking']
-                    if category in valid_categories:
-                        return category
-                    for vc in valid_categories:
-                        if vc.lower() in category.lower():
-                            return vc
-            except Exception as e:
-                print(f"[Groq Category Detect Error with {model_name}] {e}")
-                
-        return 'Not compatible (N/A)'
-
-    def normalize_model(self, text: str, fallback: str) -> str:
-        if fallback and len(fallback.strip()) > 2:
-            return fallback.strip()
-        clean = re.sub(r'^(asus|msi|gigabyte|zotac|evga|sapphire|xfx|pny|powercolor|asrock|intel|amd|nvidia|corsair|g\.skill|samsung|crucial|western digital|wd)\s+', '', text, flags=re.I)
-        clean = re.sub(r'\s+(graphics card|video card|processor|desktop processor|cpu|gpu|ddr4|ddr5|ram|nvme|ssd|motherboard|power supply|edition|oc|gaming).*$', '', clean, flags=re.I).strip()
-        return clean or text
