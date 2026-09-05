@@ -377,6 +377,7 @@ class AmazonClient:
                         # Semantic validation
                         is_valid, reason = ProductAnalyzer.validate_offer(analysis, title, price_val)
                         if not is_valid:
+                            print(f"[Amazon Filtered] Skipping '{title[:50]}...': {reason}")
                             continue
 
                         img = it.find("img", class_="s-image")
@@ -404,6 +405,8 @@ class AmazonClient:
                         best = valid_offers[0]
                         print(f"✅ [Amazon Hit] ${best['price']:.2f} -> {best['title'][:60]}")
                         return best
+                    else:
+                        print(f"[Amazon Direct] 0 valid standalone offers found for '{search_term}'")
         except Exception as e:
             print(f"[Amazon Direct Search Error] {e}")
         return None
@@ -612,7 +615,19 @@ class HardwareAgent:
             if isinstance(res, dict) and res.get("price"):
                 scraped_offers.append(res)
                 if emit_fn:
-                    emit_fn("retailer_found", {"retailer": res["retailer"], "offer": res})
+                    emit_fn("retailer_found", {
+                        "query": analysis.model,
+                        "original_query": clean_prompt,
+                        "retailer": res["retailer"],
+                        "title": res["title"],
+                        "price": res["price"],
+                        "originalPrice": res.get("originalPrice"),
+                        "url": res["url"],
+                        "imageUrl": res.get("imageUrl"),
+                        "inStock": res.get("inStock", True),
+                        "pending_id": pending_id,
+                        "offer": res
+                    })
 
         # 3. Sort offers by price ascending
         scraped_offers.sort(key=lambda x: x["price"])

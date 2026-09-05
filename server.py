@@ -187,6 +187,79 @@ async def handle_scrape_request(target_query: str, user_id: str = None, pending_
 
             if is_fresh and match.get("current_price"):
                 print(f"[DB Hit] Cache match: \"{match['name'][:50]}\" (${match['current_price']})")
+                
+                offers = []
+                try:
+                    specs_data = json.loads(match.get("specs") or "{}") if isinstance(match.get("specs"), str) else (match.get("specs") or {})
+                    offers = specs_data.get("RetailerOffers") or []
+                except Exception:
+                    offers = []
+
+                if not offers:
+                    offers = [{
+                        "retailer": match.get("retailer") or "Amazon",
+                        "title": match.get("name"),
+                        "price": match.get("current_price"),
+                        "originalPrice": match.get("msrp"),
+                        "url": match.get("product_url"),
+                        "imageUrl": match.get("image_url"),
+                        "inStock": True
+                    }]
+
+                # Broadcast cached offers over SSE so pending UI listeners immediately update
+                for off in offers:
+                    broadcast_sse("retailer_found", {
+                        "query": match.get("model") or clean,
+                        "original_query": clean,
+                        "retailer": off.get("retailer"),
+                        "title": off.get("title"),
+                        "price": off.get("price"),
+                        "originalPrice": off.get("originalPrice"),
+                        "url": off.get("url"),
+                        "imageUrl": off.get("imageUrl") or match.get("image_url"),
+                        "inStock": off.get("inStock", True),
+                        "pending_id": pending_id,
+                        "offer": off
+                    })
+
+                broadcast_sse("agent_complete", {
+                    "query": match.get("model") or clean,
+                    "original_query": clean,
+                    "category": match.get("category", "GPU"),
+                    "bestOffer": {
+                        "title": match.get("name"),
+                        "price": match.get("current_price"),
+                        "retailer": match.get("retailer"),
+                        "url": match.get("product_url"),
+                        "imageUrl": match.get("image_url"),
+                        "inStock": True
+                    },
+                    "allOffers": offers,
+                    "scrapedOffers": offers,
+                    "summary": f"Best price for {match.get('model') or clean} is ${match.get('current_price')} at {match.get('retailer')}.",
+                    "pending_id": pending_id,
+                    "is_error": False,
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                })
+
+                if user_id:
+                    try:
+                        wl_payload = {
+                            "user_id": user_id,
+                            "component_id": match.get("id"),
+                            "component_name": match.get("name"),
+                            "category": match.get("category", "Hardware"),
+                            "target_price": round(float(match.get("current_price") or 0) * 0.9, 2),
+                            "all_time_low": match.get("lowest_price_90d") or match.get("current_price"),
+                            "added_at": datetime.now(timezone.utc).isoformat()
+                        }
+                        await asyncio.to_thread(
+                            supabase.table("watchlist_items").upsert(wl_payload).execute
+                        )
+                        print(f"💾 [DB Watchlist Cache Synced] User {user_id} tracking {match.get('id')}")
+                    except Exception as wl_err:
+                        print(f"⚠️ [DB Watchlist Cache Notice]: {wl_err}")
+
                 return {
                     "source": "supabase_database_cache",
                     "query": clean,
@@ -195,8 +268,11 @@ async def handle_scrape_request(target_query: str, user_id: str = None, pending_
                         "price": match.get("current_price"),
                         "retailer": match.get("retailer"),
                         "url": match.get("product_url"),
+                        "imageUrl": match.get("image_url"),
                         "inStock": True
                     },
+                    "allOffers": offers,
+                    "scrapedOffers": offers,
                     "component": match
                 }
     except Exception as e:
