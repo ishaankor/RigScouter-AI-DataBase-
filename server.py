@@ -290,11 +290,211 @@ async def handle_scrape_request(target_query: str, user_id: str = None, pending_
     }
 
 
+# ─── Daily Price Refresh Engine ───────────────────────────────────────────────
+
+async def execute_daily_price_refresh():
+    """
+    Automated daily refresh job:
+    Iterates through all tracked hardware items across watchlist_items and hardware_components.
+    Scrapes live prices, computes 24h price drops, updates lowest_price_90d and deal scores,
+    and updates both tables in Supabase.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    print(f"\n======================================================")
+    print(f"⏰ [Daily Price Refresh] Starting automated cycle at {now_iso}")
+    print(f"======================================================")
+
+    items_to_refresh = set()
+
+    # 1. Collect user-watched items
+    try:
+        wl_res = await asyncio.to_thread(
+            supabase.table("watchlist_items").select("component_name, component_id").execute
+        )
+        for w in (wl_res.data or []):
+            name = w.get("component_name") or w.get("component_id")
+            if name and len(name) > 2:
+                items_to_refresh.add(name.strip())
+    except Exception as e:
+        print(f"[Daily Refresh Notice] Fetching watchlist_items: {e}")
+
+    # 2. Collect catalog items (top 50)
+    try:
+        hw_res = await asyncio.to_thread(
+            supabase.table("hardware_components").select("model, name").order("updated_at", desc=True).limit(50).execute
+        )
+        for h in (hw_res.data or []):
+            model = h.get("model") or h.get("name")
+            if model and len(model) > 2:
+                items_to_refresh.add(model.strip())
+    except Exception as e:
+        print(f"[Daily Refresh Notice] Fetching hardware_components: {e}")
+
+    if not items_to_refresh:
+        items_to_refresh = {"RTX 4070 Super", "Ryzen 7 7800X3D", "Samsung 990 Pro 2TB"}
+
+    print(f"[Daily Refresh] Identified {len(items_to_refresh)} distinct hardware item(s) to scrape.")
+
+    agent_runner = HardwareAgent()
+    updated_records = []
+
+    for query in items_to_refresh:
+        try:
+            print(f"\n[Daily Refresh] Scraping updated pricing for: \"{query}\"...")
+            res = await agent_runner.run(query)
+            offers = res.get("scrapedOffers") or []
+            if not offers:
+                print(f"[Daily Refresh] No offers found for \"{query}\", skipping.")
+                continue
+
+            best = res.get("bestOffer") or offers[0]
+            new_price = float(best.get("price") or 0.0)
+            if new_price <= 0:
+                continue
+
+            msrp = float(best.get("originalPrice") or new_price)
+            comp_id = re.sub(r'[^a-zA-Z0-9]+', '-', res.get("normalized_query", query).lower()).strip('-')
+
+            # Fetch previous price to record historical 24h drop
+            old_price = None
+            old_atl = new_price
+            try:
+                prev_row = await asyncio.to_thread(
+                    supabase.table("hardware_components").select("current_price, lowest_price_90d").eq("id", comp_id).limit(1).execute
+                )
+                if prev_row.data and len(prev_row.data) > 0:
+                    old_price = prev_row.data[0].get("current_price")
+                    old_atl = prev_row.data[0].get("lowest_price_90d") or new_price
+            except Exception:
+                pass
+
+            new_atl = min(float(old_atl or new_price), new_price)
+            deal_score = 50
+            if msrp > new_price and msrp > 0:
+                deal_score = round(min(99, max(50, ((msrp - new_price) / msrp) * 100 + 70)))
+            elif new_price <= new_atl:
+                deal_score = 80
+
+            specs_json = json.dumps({"RetailerOffers": offers})
+            image_url = best.get("imageUrl") or "https://images.unsplash.com/photo-1587202372775-e229f172b9d7?auto=format&fit=crop&w=600&q=80"
+
+            # A. Update base hardware_components row
+            hw_payload = {
+                "id": comp_id,
+                "name": best.get("title") or res.get("normalized_query", query),
+                "model": res.get("normalized_query", query),
+                "category": res.get("category", "Hardware"),
+                "brand": res.get("brand"),
+                "current_price": new_price,
+                "msrp": msrp,
+                "lowest_price_90d": new_atl,
+                "deal_score": deal_score,
+                "retailer": best.get("retailer", "Amazon"),
+                "product_url": best.get("url"),
+                "image_url": image_url,
+                "specs": specs_json,
+                "updated_at": now_iso
+            }
+            await asyncio.to_thread(supabase.table("hardware_components").upsert(hw_payload).execute)
+
+            # B. Update individual retailer rows in hardware_components
+            for off in offers:
+                ret_name = off.get("retailer", "Unknown")
+                ret_slug = re.sub(r'[^a-zA-Z0-9]+', '-', ret_name.lower()).strip('-')
+                row_id = f"{comp_id}-{ret_slug}"
+                off_price = float(off.get("price") or 0.0)
+                off_msrp = float(off.get("originalPrice") or off_price)
+                off_img = off.get("imageUrl") or image_url
+                off_payload = {
+                    "id": row_id,
+                    "name": off.get("title") or res.get("normalized_query", query),
+                    "model": res.get("normalized_query", query),
+                    "category": res.get("category", "Hardware"),
+                    "brand": res.get("brand"),
+                    "current_price": off_price,
+                    "msrp": off_msrp,
+                    "lowest_price_90d": min(new_atl, off_price),
+                    "retailer": ret_name,
+                    "product_url": off.get("url"),
+                    "image_url": off_img,
+                    "specs": specs_json,
+                    "updated_at": now_iso
+                }
+                await asyncio.to_thread(supabase.table("hardware_components").upsert(off_payload).execute)
+
+            # C. Update watchlist_items: record previous_price_24h and new ATL
+            wl_updates = {
+                "all_time_low": new_atl,
+            }
+            if old_price and float(old_price) > 0 and float(old_price) != new_price:
+                wl_updates["previous_price_24h"] = float(old_price)
+
+            try:
+                norm_q = res.get("normalized_query", query)
+                await asyncio.to_thread(
+                    supabase.table("watchlist_items")
+                    .update(wl_updates)
+                    .or_(f"component_id.eq.{comp_id},component_name.ilike.%{norm_q}%")
+                    .execute
+                )
+            except Exception as wl_u_err:
+                print(f"[Daily Refresh Watchlist Notice] {wl_u_err}")
+
+            updated_records.append({
+                "item": query,
+                "price": new_price,
+                "previous_price_24h": old_price,
+                "retailer": best.get("retailer"),
+                "offers_count": len(offers)
+            })
+
+            # Polite rate-limiting between retailer requests
+            await asyncio.sleep(1.5)
+
+        except Exception as item_err:
+            print(f"[Daily Refresh Item Exception] {query}: {item_err}")
+
+    print(f"\n✅ [Daily Price Refresh Complete] Updated {len(updated_records)} items at {datetime.now(timezone.utc).isoformat()}")
+    return {
+        "status": "success",
+        "timestamp": now_iso,
+        "refreshed_count": len(updated_records),
+        "records": updated_records
+    }
+
+
+async def daily_refresh_background_daemon():
+    """Continuous 24-hour cycle loop that runs as long as the server is alive."""
+    while True:
+        # Sleep for 24 hours (86,400 seconds)
+        await asyncio.sleep(86400)
+        try:
+            await execute_daily_price_refresh()
+        except Exception as e:
+            print(f"[Daily Refresh Daemon Exception] {e}")
+
+
 # ─── API Endpoints ────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(sse_publisher())
+    asyncio.create_task(daily_refresh_background_daemon())
+
+
+@app.post("/api/cron/trigger-daily-update")
+@app.get("/api/cron/trigger-daily-update")
+async def api_trigger_daily_update():
+    """
+    Triggered daily by GitHub Actions (daily-price-refresh.yml) or external cron services.
+    Kicks off execute_daily_price_refresh in the background and returns an immediate 200 OK.
+    """
+    asyncio.create_task(execute_daily_price_refresh())
+    return {
+        "status": "queued",
+        "message": "Daily multi-retailer hardware price refresh initiated in background.",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
 
 @app.get("/")
 async def root():

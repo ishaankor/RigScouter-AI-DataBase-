@@ -1,0 +1,31 @@
+name: "Daily Hardware Price Refresh (12:00 AM UTC)"
+
+on:
+  schedule:
+    # Runs every day at 00:00 UTC (12:00 AM UTC)
+    - cron: "0 0 * * *"
+  workflow_dispatch: # Allows manual trigger from GitHub UI anytime
+
+jobs:
+  refresh-prices:
+    name: "Refresh All Catalog Hardware Prices"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Ping Backend 12 AM UTC Refresh Endpoint"
+        env:
+          BACKEND_URL: ${{ secrets.BACKEND_URL || 'https://rigscouter-ai-database.onrender.com' }}
+        run: |
+          echo "======================================================="
+          echo "🌟 Triggering RigScouter Daily Price Refresh (12:00 AM UTC)"
+          echo "Timestamp: $(date -u)"
+          echo "Target: $BACKEND_URL/api/cron/trigger-daily-update"
+          echo "======================================================="
+
+          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}\nTIME_TOTAL:%{time_total}s" \
+            -X POST "$BACKEND_URL/api/cron/trigger-daily-update")
+
+          echo "$RESPONSE"
+
+          echo "======================================================="
+          echo "✅ 12:00 AM UTC Daily price refresh job dispatched."
+          echo "======================================================="
