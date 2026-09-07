@@ -13,7 +13,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-CANOPY_API_KEY = os.environ.get("CANOPY_API_KEY", "")
 EBAY_CLIENT_ID = os.environ.get("EBAY_CLIENT_ID", "")
 EBAY_CLIENT_SECRET = os.environ.get("EBAY_CLIENT_SECRET", "")
 
@@ -281,53 +280,6 @@ class AmazonClient:
         m = re.search(r'(?:/dp/|/gp/product/|^)([A-Z0-9]{10})(?:[/?&]|$)', text.strip())
         return m.group(1) if m else None
 
-    async def lookup_canopy(self, asin: str) -> dict | None:
-        canopy_key = os.environ.get("CANOPY_API_KEY", "") or CANOPY_API_KEY
-        if not canopy_key:
-            return None
-        try:
-            query = """
-            query amazonProduct($asin: String!) {
-              amazonProduct(input: {asin: $asin}) {
-                title
-                price {
-                  value
-                }
-                isInStock
-                mainImageUrl
-              }
-            }
-            """
-            async with httpx.AsyncClient(timeout=12.0) as client:
-                res = await client.post(
-                    "https://graphql.canopyapi.co/",
-                    headers={"API-KEY": canopy_key},
-                    json={"query": query, "variables": {"asin": asin}}
-                )
-                if res.status_code == 200:
-                    data = (res.json().get("data") or {}).get("amazonProduct")
-                    if data:
-                        price_val = (data.get("price") or {}).get("value")
-                        if price_val is not None and float(price_val) > 0:
-                            title = data.get("title") or f"Amazon Product {asin}"
-                            offer = {
-                                "retailer": "Amazon",
-                                "title": title,
-                                "price": float(price_val),
-                                "originalPrice": None,
-                                "inStock": data.get("isInStock", True),
-                                "isRefurbished": "renewed" in title.lower() or "refurbished" in title.lower(),
-                                "url": f"https://www.amazon.com/dp/{asin}",
-                                "imageUrl": data.get("mainImageUrl"),
-                                "brand": None,
-                                "source": "canopy-api"
-                            }
-                            print(f"✅ [Canopy Hit] ${offer['price']:.2f} -> {offer['title'][:60]}")
-                            return offer
-        except Exception as e:
-            print(f"[Canopy Lookup Error] {e}")
-        return None
-
     async def lookup_asin(self, asin: str) -> dict | None:
         url = f"https://www.amazon.com/dp/{asin}"
         print(f"[Amazon Direct] Fetching product page: {url}...")
@@ -403,11 +355,6 @@ class AmazonClient:
                         return offer
         except Exception as e:
             print(f"[Amazon Direct DP Error] {e}")
-
-        # Fallback to Canopy API
-        canopy_offer = await self.lookup_canopy(asin)
-        if canopy_offer:
-            return canopy_offer
 
         return None
 

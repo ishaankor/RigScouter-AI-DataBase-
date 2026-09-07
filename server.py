@@ -572,7 +572,7 @@ async def root():
     return {
         "status": "ok",
         "service": "RigScouter-AI Multi-Retailer Pricing Engine",
-        "retailers": ["Amazon (Canopy API)", "eBay (Browse API)"],
+        "retailers": ["Amazon (Direct HTTP/2)", "eBay (Browse API)"],
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
