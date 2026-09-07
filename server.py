@@ -295,170 +295,241 @@ async def handle_scrape_request(target_query: str, user_id: str = None, pending_
 async def execute_daily_price_refresh():
     """
     Automated daily refresh job:
-    Iterates through all tracked hardware items across watchlist_items and hardware_components.
-    Scrapes live prices, computes 24h price drops, updates lowest_price_90d and deal scores,
-    and updates both tables in Supabase.
+    Iterates through all tracked hardware items in hardware_components and watchlist_items.
+    For each item with a product_url, scrapes the EXACT SAME product URL directly (via Amazon/eBay/direct),
+    detects price changes, updates previous_price_24h, all_time_low/lowest_price_90d, and deal scores,
+    and updates both tables in Supabase without running broad keyword searches.
     """
     now_iso = datetime.now(timezone.utc).isoformat()
     print(f"\n======================================================")
     print(f"⏰ [Daily Price Refresh] Starting automated cycle at {now_iso}")
     print(f"======================================================")
 
-    items_to_refresh = set()
+    agent_runner = HardwareAgent()
 
-    # 1. Collect user-watched items
-    try:
-        wl_res = await asyncio.to_thread(
-            supabase.table("watchlist_items").select("component_name, component_id").execute
-        )
-        for w in (wl_res.data or []):
-            name = w.get("component_name") or w.get("component_id")
-            if name and len(name) > 2:
-                items_to_refresh.add(name.strip())
-    except Exception as e:
-        print(f"[Daily Refresh Notice] Fetching watchlist_items: {e}")
-
-    # 2. Collect catalog items (top 50)
+    # 1. Fetch all tracked components from hardware_components
+    hw_components = []
     try:
         hw_res = await asyncio.to_thread(
-            supabase.table("hardware_components").select("model, name").order("updated_at", desc=True).limit(50).execute
+            supabase.table("hardware_components").select("*").order("updated_at", desc=True).limit(100).execute
         )
-        for h in (hw_res.data or []):
-            model = h.get("model") or h.get("name")
-            if model and len(model) > 2:
-                items_to_refresh.add(model.strip())
+        hw_components = hw_res.data or []
     except Exception as e:
         print(f"[Daily Refresh Notice] Fetching hardware_components: {e}")
 
-    if not items_to_refresh:
-        items_to_refresh = {"RTX 4070 Super", "Ryzen 7 7800X3D", "Samsung 990 Pro 2TB"}
+    # 2. Fetch all user watchlist items
+    watchlist_items = []
+    try:
+        wl_res = await asyncio.to_thread(
+            supabase.table("watchlist_items").select("*").execute
+        )
+        watchlist_items = wl_res.data or []
+    except Exception as e:
+        print(f"[Daily Refresh Notice] Fetching watchlist_items: {e}")
 
-    print(f"[Daily Refresh] Identified {len(items_to_refresh)} distinct hardware item(s) to scrape.")
+    print(f"[Daily Refresh] Found {len(hw_components)} hardware component(s) and {len(watchlist_items)} watchlist item(s).")
 
-    agent_runner = HardwareAgent()
+    # In-memory URL cache for this cycle so identical URLs are never fetched twice
+    url_cache = {}
+
+    async def get_url_offer(url: str) -> dict | None:
+        if not url or not url.startswith("http"):
+            return None
+        clean_url = url.strip()
+        if clean_url in url_cache:
+            return url_cache[clean_url]
+        res = await agent_runner.scrape_product_url(clean_url)
+        if res:
+            url_cache[clean_url] = res
+        return res
+
     updated_records = []
 
-    for query in items_to_refresh:
+    # 3. Process each hardware component by looking at its SAME product_url
+    for comp in hw_components:
+        comp_id = comp.get("id")
+        comp_name = comp.get("name") or comp.get("model") or comp_id
+        product_url = comp.get("product_url")
+        old_price = float(comp.get("current_price") or 0.0)
+        old_atl = float(comp.get("lowest_price_90d") or old_price)
+        msrp = float(comp.get("msrp") or old_price)
+        current_retailer = comp.get("retailer") or "Amazon"
+
         try:
-            print(f"\n[Daily Refresh] Scraping updated pricing for: \"{query}\"...")
-            res = await agent_runner.run(query)
-            offers = res.get("scrapedOffers") or []
-            if not offers:
-                print(f"[Daily Refresh] No offers found for \"{query}\", skipping.")
-                continue
-
-            best = res.get("bestOffer") or offers[0]
-            new_price = float(best.get("price") or 0.0)
-            if new_price <= 0:
-                continue
-
-            msrp = float(best.get("originalPrice") or new_price)
-            comp_id = re.sub(r'[^a-zA-Z0-9]+', '-', res.get("normalized_query", query).lower()).strip('-')
-
-            # Fetch previous price to record historical 24h drop
-            old_price = None
-            old_atl = new_price
+            # Parse specs for multi-retailer offers
+            specs_data = {}
             try:
-                prev_row = await asyncio.to_thread(
-                    supabase.table("hardware_components").select("current_price, lowest_price_90d").eq("id", comp_id).limit(1).execute
-                )
-                if prev_row.data and len(prev_row.data) > 0:
-                    old_price = prev_row.data[0].get("current_price")
-                    old_atl = prev_row.data[0].get("lowest_price_90d") or new_price
+                if isinstance(comp.get("specs"), str):
+                    specs_data = json.loads(comp.get("specs") or "{}")
+                elif isinstance(comp.get("specs"), dict):
+                    specs_data = comp.get("specs")
             except Exception:
-                pass
+                specs_data = {}
 
-            new_atl = min(float(old_atl or new_price), new_price)
-            deal_score = 50
-            if msrp > new_price and msrp > 0:
-                deal_score = round(min(99, max(50, ((msrp - new_price) / msrp) * 100 + 70)))
-            elif new_price <= new_atl:
-                deal_score = 80
+            retailer_offers = specs_data.get("RetailerOffers") or []
 
-            specs_json = json.dumps({"RetailerOffers": offers})
-            image_url = best.get("imageUrl") or "https://images.unsplash.com/photo-1587202372775-e229f172b9d7?auto=format&fit=crop&w=600&q=80"
+            # ── Scenario A: Component has a product_url -> Scrape SAME URL ──
+            if product_url:
+                print(f"\n[Daily Refresh] Checking URL for: \"{comp_name[:50]}\"")
+                print(f"  🔗 URL: {product_url[:80]}...")
 
-            # A. Update base hardware_components row
-            hw_payload = {
-                "id": comp_id,
-                "name": best.get("title") or res.get("normalized_query", query),
-                "model": res.get("normalized_query", query),
-                "category": res.get("category", "Hardware"),
-                "brand": res.get("brand"),
-                "current_price": new_price,
-                "msrp": msrp,
-                "lowest_price_90d": new_atl,
-                "deal_score": deal_score,
-                "retailer": best.get("retailer", "Amazon"),
-                "product_url": best.get("url"),
-                "image_url": image_url,
-                "specs": specs_json,
-                "updated_at": now_iso
-            }
-            await asyncio.to_thread(supabase.table("hardware_components").upsert(hw_payload).execute)
+                primary_offer = await get_url_offer(product_url)
+                new_price = float(primary_offer.get("price") or 0.0) if primary_offer else 0.0
 
-            # B. Update individual retailer rows in hardware_components
-            for off in offers:
-                ret_name = off.get("retailer", "Unknown")
-                ret_slug = re.sub(r'[^a-zA-Z0-9]+', '-', ret_name.lower()).strip('-')
-                row_id = f"{comp_id}-{ret_slug}"
-                off_price = float(off.get("price") or 0.0)
-                off_msrp = float(off.get("originalPrice") or off_price)
-                off_img = off.get("imageUrl") or image_url
-                off_payload = {
-                    "id": row_id,
-                    "name": off.get("title") or res.get("normalized_query", query),
-                    "model": res.get("normalized_query", query),
-                    "category": res.get("category", "Hardware"),
-                    "brand": res.get("brand"),
-                    "current_price": off_price,
-                    "msrp": off_msrp,
-                    "lowest_price_90d": min(new_atl, off_price),
-                    "retailer": ret_name,
-                    "product_url": off.get("url"),
-                    "image_url": off_img,
+                # Also update other retailer offers for this component if present
+                if retailer_offers:
+                    for off in retailer_offers:
+                        off_url = off.get("url")
+                        if off_url and off_url != product_url:
+                            sub_offer = await get_url_offer(off_url)
+                            if sub_offer and sub_offer.get("price") and float(sub_offer["price"]) > 0:
+                                off["price"] = float(sub_offer["price"])
+                                off["inStock"] = sub_offer.get("inStock", True)
+
+                    # For base components, determine best in-stock price among all retailer offers
+                    valid_offers = [o for o in retailer_offers if float(o.get("price") or 0) > 0 and o.get("inStock", True)]
+                    if valid_offers:
+                        valid_offers.sort(key=lambda x: float(x["price"]))
+                        best_off = valid_offers[0]
+                        new_price = float(best_off["price"])
+                        current_retailer = best_off.get("retailer", current_retailer)
+
+                if new_price <= 0:
+                    print(f"⚠️ [Daily Refresh Notice] No price extracted from {product_url}, retaining ${old_price:.2f}")
+                    continue
+
+                price_changed = abs(new_price - old_price) >= 0.01
+                new_atl = min(old_atl if old_atl > 0 else new_price, new_price)
+
+                deal_score = comp.get("deal_score", 50)
+                if msrp > new_price and msrp > 0:
+                    deal_score = round(min(99, max(50, ((msrp - new_price) / msrp) * 100 + 70)))
+                elif new_price <= new_atl:
+                    deal_score = 80
+
+                if price_changed:
+                    diff = new_price - old_price
+                    if diff < 0:
+                        print(f"🔥 [Daily Refresh Drop] \"{comp_name[:40]}\": ${old_price:.2f} -> ${new_price:.2f} (DROP: ${abs(diff):.2f})")
+                    else:
+                        print(f"📈 [Daily Refresh Increase] \"{comp_name[:40]}\": ${old_price:.2f} -> ${new_price:.2f} (+${diff:.2f})")
+                else:
+                    print(f"ℹ️ [Daily Refresh Unchanged] \"{comp_name[:40]}\": ${new_price:.2f} (Verified)")
+
+                # Update hardware_components row
+                hw_update = {
+                    "current_price": new_price,
+                    "lowest_price_90d": new_atl,
+                    "deal_score": deal_score,
+                    "retailer": current_retailer,
+                    "updated_at": now_iso
+                }
+                if retailer_offers:
+                    specs_data["RetailerOffers"] = retailer_offers
+                    hw_update["specs"] = json.dumps(specs_data)
+                if primary_offer and primary_offer.get("imageUrl"):
+                    hw_update["image_url"] = primary_offer["imageUrl"]
+
+                await asyncio.to_thread(
+                    supabase.table("hardware_components").update(hw_update).eq("id", comp_id).execute
+                )
+
+                # Update matching watchlist_items
+                wl_updates = {
+                    "all_time_low": new_atl,
+                }
+                if price_changed and old_price > 0:
+                    wl_updates["previous_price_24h"] = old_price
+
+                try:
+                    model_clean = comp.get("model") or comp_name
+                    await asyncio.to_thread(
+                        supabase.table("watchlist_items")
+                        .update(wl_updates)
+                        .or_(f"component_id.eq.{comp_id},component_name.ilike.%{model_clean}%")
+                        .execute
+                    )
+                except Exception as wl_err:
+                    print(f"[Daily Refresh Watchlist Update Notice] {wl_err}")
+
+                updated_records.append({
+                    "item": comp_name,
+                    "id": comp_id,
+                    "url": product_url,
+                    "old_price": old_price,
+                    "new_price": new_price,
+                    "price_changed": price_changed,
+                    "retailer": current_retailer
+                })
+
+            # ── Scenario B: Missing product_url (Fallback only) ──
+            else:
+                search_query = comp.get("model") or comp_name
+                print(f"\n[Daily Refresh Fallback] No product_url for \"{comp_name}\", searching via agent...")
+                res = await agent_runner.run(search_query)
+                offers = res.get("scrapedOffers") or []
+                if not offers:
+                    continue
+                best = res.get("bestOffer") or offers[0]
+                new_price = float(best.get("price") or 0.0)
+                if new_price <= 0:
+                    continue
+
+                new_atl = min(old_atl if old_atl > 0 else new_price, new_price)
+                specs_json = json.dumps({"RetailerOffers": offers})
+                hw_payload = {
+                    "current_price": new_price,
+                    "lowest_price_90d": new_atl,
+                    "retailer": best.get("retailer", "Amazon"),
+                    "product_url": best.get("url"),
+                    "image_url": best.get("imageUrl") or comp.get("image_url"),
                     "specs": specs_json,
                     "updated_at": now_iso
                 }
-                await asyncio.to_thread(supabase.table("hardware_components").upsert(off_payload).execute)
+                await asyncio.to_thread(supabase.table("hardware_components").update(hw_payload).eq("id", comp_id).execute)
 
-            # C. Update watchlist_items: record previous_price_24h and new ATL
-            wl_updates = {
-                "all_time_low": new_atl,
-            }
-            if old_price and float(old_price) > 0 and float(old_price) != new_price:
-                wl_updates["previous_price_24h"] = float(old_price)
+                wl_updates = {"all_time_low": new_atl}
+                if old_price > 0 and abs(new_price - old_price) >= 0.01:
+                    wl_updates["previous_price_24h"] = old_price
+                try:
+                    await asyncio.to_thread(
+                        supabase.table("watchlist_items")
+                        .update(wl_updates)
+                        .or_(f"component_id.eq.{comp_id},component_name.ilike.%{search_query}%")
+                        .execute
+                    )
+                except Exception:
+                    pass
 
-            try:
-                norm_q = res.get("normalized_query", query)
-                await asyncio.to_thread(
-                    supabase.table("watchlist_items")
-                    .update(wl_updates)
-                    .or_(f"component_id.eq.{comp_id},component_name.ilike.%{norm_q}%")
-                    .execute
-                )
-            except Exception as wl_u_err:
-                print(f"[Daily Refresh Watchlist Notice] {wl_u_err}")
+                updated_records.append({
+                    "item": comp_name,
+                    "id": comp_id,
+                    "url": best.get("url"),
+                    "old_price": old_price,
+                    "new_price": new_price,
+                    "price_changed": abs(new_price - old_price) >= 0.01,
+                    "retailer": best.get("retailer")
+                })
 
-            updated_records.append({
-                "item": query,
-                "price": new_price,
-                "previous_price_24h": old_price,
-                "retailer": best.get("retailer"),
-                "offers_count": len(offers)
-            })
-
-            # Polite rate-limiting between retailer requests
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(0.3)
 
         except Exception as item_err:
-            print(f"[Daily Refresh Item Exception] {query}: {item_err}")
+            print(f"[Daily Refresh Item Exception] {comp_name}: {item_err}")
 
-    print(f"\n✅ [Daily Price Refresh Complete] Updated {len(updated_records)} items at {datetime.now(timezone.utc).isoformat()}")
+    changed_count = sum(1 for r in updated_records if r.get("price_changed"))
+    drops_count = sum(1 for r in updated_records if r.get("old_price", 0) > r.get("new_price", 0))
+
+    print(f"\n======================================================")
+    print(f"✅ [Daily Price Refresh Complete] Checked {len(updated_records)} items at {datetime.now(timezone.utc).isoformat()}")
+    print(f"📊 Results: {changed_count} price change(s) ({drops_count} price drop(s)), {len(updated_records) - changed_count} unchanged.")
+    print(f"======================================================\n")
+
     return {
         "status": "success",
         "timestamp": now_iso,
         "refreshed_count": len(updated_records),
+        "changed_count": changed_count,
+        "drops_count": drops_count,
         "records": updated_records
     }
 

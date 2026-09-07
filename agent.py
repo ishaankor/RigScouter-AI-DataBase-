@@ -281,6 +281,53 @@ class AmazonClient:
         m = re.search(r'(?:/dp/|/gp/product/|^)([A-Z0-9]{10})(?:[/?&]|$)', text.strip())
         return m.group(1) if m else None
 
+    async def lookup_canopy(self, asin: str) -> dict | None:
+        canopy_key = os.environ.get("CANOPY_API_KEY", "") or CANOPY_API_KEY
+        if not canopy_key:
+            return None
+        try:
+            query = """
+            query amazonProduct($asin: String!) {
+              amazonProduct(input: {asin: $asin}) {
+                title
+                price {
+                  value
+                }
+                isInStock
+                mainImageUrl
+              }
+            }
+            """
+            async with httpx.AsyncClient(timeout=12.0) as client:
+                res = await client.post(
+                    "https://graphql.canopyapi.co/",
+                    headers={"API-KEY": canopy_key},
+                    json={"query": query, "variables": {"asin": asin}}
+                )
+                if res.status_code == 200:
+                    data = (res.json().get("data") or {}).get("amazonProduct")
+                    if data:
+                        price_val = (data.get("price") or {}).get("value")
+                        if price_val is not None and float(price_val) > 0:
+                            title = data.get("title") or f"Amazon Product {asin}"
+                            offer = {
+                                "retailer": "Amazon",
+                                "title": title,
+                                "price": float(price_val),
+                                "originalPrice": None,
+                                "inStock": data.get("isInStock", True),
+                                "isRefurbished": "renewed" in title.lower() or "refurbished" in title.lower(),
+                                "url": f"https://www.amazon.com/dp/{asin}",
+                                "imageUrl": data.get("mainImageUrl"),
+                                "brand": None,
+                                "source": "canopy-api"
+                            }
+                            print(f"✅ [Canopy Hit] ${offer['price']:.2f} -> {offer['title'][:60]}")
+                            return offer
+        except Exception as e:
+            print(f"[Canopy Lookup Error] {e}")
+        return None
+
     async def lookup_asin(self, asin: str) -> dict | None:
         url = f"https://www.amazon.com/dp/{asin}"
         print(f"[Amazon Direct] Fetching product page: {url}...")
@@ -294,15 +341,43 @@ class AmazonClient:
                     if not title and soup.title:
                         title = soup.title.string.replace("Amazon.com:", "").strip()
 
+                    # Check in-stock availability
+                    avail_el = soup.find("div", id="availability")
+                    in_stock = True
+                    if avail_el:
+                        avail_text = avail_el.text.strip().lower()
+                        if any(w in avail_text for w in ["currently unavailable", "out of stock", "temporarily out of stock"]):
+                            in_stock = False
+
                     # Extract price from buybox
                     price_val = None
-                    for span in soup.find_all("span", class_="a-price"):
+                    # First check corePriceDisplay or corePrice feature div
+                    core_price_div = soup.find("div", id="corePriceDisplay_desktop_feature_div") or soup.find("div", id="corePrice_feature_div") or soup.find("div", id="apex_desktop")
+                    search_scope = core_price_div if core_price_div else soup
+
+                    for span in search_scope.find_all("span", class_="a-price"):
+                        # Avoid strikethrough list price
+                        classes = span.get("class", [])
+                        if "a-text-price" in classes:
+                            continue
                         off = span.find("span", class_="a-offscreen")
                         if off and off.text:
                             m = re.search(r'[\$]?([0-9,]+\.[0-9]{2})', off.text)
                             if m:
                                 price_val = float(m.group(1).replace(",", ""))
                                 break
+
+                    # Fallback to general price spans if needed
+                    if not price_val:
+                        for span in soup.find_all("span", class_="a-price"):
+                            if "a-text-price" in span.get("class", []):
+                                continue
+                            off = span.find("span", class_="a-offscreen")
+                            if off and off.text:
+                                m = re.search(r'[\$]?([0-9,]+\.[0-9]{2})', off.text)
+                                if m:
+                                    price_val = float(m.group(1).replace(",", ""))
+                                    break
 
                     img = soup.find("img", id="landingImage") or soup.find("img", class_="s-image")
                     image_url = img.get("src") if img else None
@@ -317,7 +392,7 @@ class AmazonClient:
                             "title": title,
                             "price": price_val,
                             "originalPrice": None,
-                            "inStock": True,
+                            "inStock": in_stock,
                             "isRefurbished": "renewed" in title.lower() or "refurbished" in title.lower(),
                             "url": product_url,
                             "imageUrl": image_url,
@@ -328,6 +403,22 @@ class AmazonClient:
                         return offer
         except Exception as e:
             print(f"[Amazon Direct DP Error] {e}")
+
+        # Fallback to Canopy API
+        canopy_offer = await self.lookup_canopy(asin)
+        if canopy_offer:
+            return canopy_offer
+
+        return None
+
+    async def lookup_url(self, url: str) -> dict | None:
+        asin = self.extract_asin(url)
+        if asin:
+            res = await self.lookup_asin(asin)
+            if res:
+                if url.startswith("http"):
+                    res["url"] = url
+                return res
         return None
 
     async def search(self, analysis: ProductAnalysis) -> dict | None:
@@ -545,8 +636,166 @@ class EbayClient:
             print(f"[eBay Search Exception] {e}")
         return None
 
+    @staticmethod
+    def extract_item_id(text: str) -> str | None:
+        if not text:
+            return None
+        # Support /itm/123456789012, /itm/slug/123456789012, ?item=123456789012, ?itemId=123456789012, or raw numeric ID
+        m = re.search(r'/itm/(?:[^/?#]+/)?(\d{9,15})', text)
+        if m:
+            return m.group(1)
+        m = re.search(r'[?&](?:item|itemId|id)=(\d{9,15})', text, re.IGNORECASE)
+        if m:
+            return m.group(1)
+        clean = text.strip()
+        if clean.isdigit() and len(clean) in range(9, 16):
+            return clean
+        return None
 
-# ─── 4. HARDWARE AGENT (Main Orchestrator) ───────────────────────────────────
+    def _get_item_url(self, client_id: str, legacy_id: str) -> str:
+        base = "https://api.sandbox.ebay.com/buy/browse/v1/item" if self._is_sandbox(client_id) else "https://api.ebay.com/buy/browse/v1/item"
+        return f"{base}/get_item_by_legacy_id?legacy_item_id={legacy_id}"
+
+    async def lookup_item_id(self, item_id: str) -> dict | None:
+        client_id = os.environ.get("EBAY_CLIENT_ID", "") or EBAY_CLIENT_ID
+        token = await self.get_access_token()
+        if not token:
+            print("[eBay API] ℹ️ EBAY_CLIENT_ID / EBAY_CLIENT_SECRET not configured.")
+            return None
+
+        url = self._get_item_url(client_id, item_id)
+        try:
+            async with httpx.AsyncClient(timeout=12.0) as client:
+                res = await client.get(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"
+                    }
+                )
+                if res.status_code == 200:
+                    data = res.json()
+                    price_obj = data.get("price", {})
+                    price_str = price_obj.get("value")
+                    if price_str:
+                        price_val = float(price_str)
+                        title = data.get("title", "")
+                        condition = data.get("condition", "New")
+                        is_refurb = any(w in condition.lower() for w in ["refurbished", "used", "seller refurbished"])
+                        image_url = (data.get("image") or {}).get("imageUrl")
+                        item_url = data.get("itemWebUrl") or f"https://www.ebay.com/itm/{item_id}"
+
+                        avail = data.get("estimatedAvailabilities", [])
+                        in_stock = True
+                        if avail and avail[0].get("estimatedAvailabilityStatus") == "OUT_OF_STOCK":
+                            in_stock = False
+
+                        offer = {
+                            "retailer": "eBay",
+                            "title": title,
+                            "price": price_val,
+                            "originalPrice": None,
+                            "inStock": in_stock,
+                            "isRefurbished": is_refurb,
+                            "url": item_url,
+                            "imageUrl": image_url,
+                            "brand": None,
+                            "source": "ebay-api"
+                        }
+                        print(f"✅ [eBay Hit] ${offer['price']:.2f} -> {offer['title'][:60]}")
+                        return offer
+                else:
+                    print(f"⚠️ [eBay Lookup Status] {res.status_code} for item {item_id}")
+        except Exception as e:
+            print(f"[eBay Lookup Exception] {e}")
+        return None
+
+    async def lookup_url(self, url: str) -> dict | None:
+        item_id = self.extract_item_id(url)
+        if item_id:
+            res = await self.lookup_item_id(item_id)
+            if res:
+                if url.startswith("http"):
+                    res["url"] = url
+                return res
+        return None
+
+
+# ─── 4. GENERIC RETAILER CLIENT (Direct URL Parser) ───────────────────────────
+
+class GenericRetailerClient:
+    """Direct URL price parser for other retailers (Newegg, Best Buy, B&H, Micro Center, etc.)."""
+
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    async def lookup_url(self, url: str) -> dict | None:
+        try:
+            async with httpx.AsyncClient(headers=self.HEADERS, follow_redirects=True, timeout=12.0) as client:
+                res = await client.get(url)
+                if res.status_code == 200:
+                    soup = BeautifulSoup(res.text, "html.parser")
+                    title = soup.title.string.strip() if soup.title else "Online Retailer Product"
+
+                    # 1. Try JSON-LD schema.org/Product
+                    for script in soup.find_all("script", type="application/ld+json"):
+                        try:
+                            ld_data = json.loads(script.string or "{}")
+                            if isinstance(ld_data, list):
+                                ld_data = ld_data[0]
+                            if isinstance(ld_data, dict):
+                                offers = ld_data.get("offers")
+                                if isinstance(offers, list):
+                                    offers = offers[0]
+                                if isinstance(offers, dict) and offers.get("price"):
+                                    p = float(offers["price"])
+                                    if p > 0:
+                                        t = ld_data.get("name") or title
+                                        img = ld_data.get("image")
+                                        if isinstance(img, list) and img:
+                                            img = img[0]
+                                        return {
+                                            "retailer": "Online Retailer",
+                                            "title": t,
+                                            "price": p,
+                                            "originalPrice": None,
+                                            "inStock": "InStock" in str(offers.get("availability", "")),
+                                            "url": url,
+                                            "imageUrl": img,
+                                            "source": "generic-jsonld"
+                                        }
+                        except Exception:
+                            continue
+
+                    # 2. Try OpenGraph meta tags
+                    og_price = soup.find("meta", property="og:price:amount") or soup.find("meta", property="product:price:amount")
+                    og_title = soup.find("meta", property="og:title")
+                    og_img = soup.find("meta", property="og:image")
+                    if og_price and og_price.get("content"):
+                        try:
+                            p = float(og_price["content"].replace("$", "").replace(",", "").strip())
+                            if p > 0:
+                                return {
+                                    "retailer": "Online Retailer",
+                                    "title": og_title.get("content") if og_title else title,
+                                    "price": p,
+                                    "originalPrice": None,
+                                    "inStock": True,
+                                    "url": url,
+                                    "imageUrl": og_img.get("content") if og_img else None,
+                                    "source": "generic-og"
+                                }
+                        except ValueError:
+                            pass
+        except Exception as e:
+            print(f"[Generic URL Lookup Error] {url}: {e}")
+        return None
+
+
+# ─── 5. HARDWARE AGENT (Main Orchestrator) ───────────────────────────────────
 
 class HardwareAgent:
     """Deterministic, zero-hardcoding multi-retailer PC hardware pricing engine."""
@@ -554,6 +803,22 @@ class HardwareAgent:
     def __init__(self):
         self.amazon = AmazonClient()
         self.ebay = EbayClient()
+        self.generic = GenericRetailerClient()
+
+    async def scrape_product_url(self, url: str) -> dict | None:
+        """Directly scrapes the SAME product URL to get latest price without search query hallucinations."""
+        if not url or not url.startswith("http"):
+            return None
+
+        clean_url = url.strip()
+        domain = urllib.parse.urlparse(clean_url).netloc.lower()
+
+        if "amazon." in domain or "amzn.to" in domain:
+            return await self.amazon.lookup_url(clean_url)
+        elif "ebay." in domain:
+            return await self.ebay.lookup_url(clean_url)
+        else:
+            return await self.generic.lookup_url(clean_url)
 
     async def run(self, prompt: str, emit_fn=None, user_id: str = None, pending_id: str = None) -> dict:
         clean_prompt = prompt.strip()
