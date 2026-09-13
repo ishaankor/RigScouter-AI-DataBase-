@@ -21,6 +21,7 @@ load_dotenv()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 EBAY_CLIENT_ID = os.environ.get("EBAY_CLIENT_ID", "")
 EBAY_CLIENT_SECRET = os.environ.get("EBAY_CLIENT_SECRET", "")
+ZENROWS_API_KEY = os.environ.get("ZENROWS_API_KEY", "91418034a0339b39d3cfab8f77d001a8006896a7")
 
 # ─── 1. AI PRODUCT ANALYZER (No hardcoded brands or regexes) ──────────────────
 
@@ -292,18 +293,70 @@ class AmazonClient:
         m = re.search(r'(?:/dp/|/gp/product/|^)([A-Z0-9]{10})(?:[/?&]|$)', text.strip())
         return m.group(1) if m else None
 
+    async def _fetch_with_zenrows(self, url: str) -> tuple[int, str]:
+        zenrows_key = os.environ.get("ZENROWS_API_KEY", "") or ZENROWS_API_KEY
+        if not zenrows_key:
+            return 0, ""
+        try:
+            print(f"[ZenRows Proxy] Routing request via ZenRows (5-credit JS render mode)...")
+            async with httpx.AsyncClient(timeout=35.0) as client:
+                res = await client.get(
+                    "https://api.zenrows.com/v1/",
+                    params={
+                        "apikey": zenrows_key,
+                        "url": url,
+                        "js_render": "true",
+                    }
+                )
+                if res.status_code == 200:
+                    return 200, res.text
+                return res.status_code, res.text
+        except Exception as e:
+            print(f"[ZenRows Error] {e}")
+            return 0, ""
+
     async def _fetch_html(self, url: str) -> tuple[int, str]:
+        status_code = 0
+        text = ""
+
+        # 1. Try fast direct fetch with curl_cffi
         if HAS_CURL_CFFI:
             try:
                 async with CurlAsyncSession(impersonate="chrome124") as session:
                     res = await session.get(url, headers=self.HEADERS, timeout=12)
-                    return res.status_code, res.text
+                    status_code, text = res.status_code, res.text
             except Exception as e:
-                print(f"[Amazon Direct curl_cffi Notice] {e}, falling back to httpx...")
+                print(f"[Amazon Direct curl_cffi Notice] {e}")
 
-        async with httpx.AsyncClient(headers=self.HEADERS, follow_redirects=True, timeout=12.0) as client:
-            res = await client.get(url)
-            return res.status_code, res.text
+        # Fallback to httpx if curl_cffi was unavailable or threw exception
+        if not text:
+            try:
+                async with httpx.AsyncClient(headers=self.HEADERS, follow_redirects=True, timeout=12.0) as client:
+                    res = await client.get(url)
+                    status_code, text = res.status_code, res.text
+            except Exception as e:
+                print(f"[Amazon Direct httpx Notice] {e}")
+
+        # Check if Amazon blocked or issued an anti-bot challenge
+        is_blocked = (
+            status_code != 200
+            or not text
+            or "bm-verify" in text
+            or "Robot Check" in text
+            or "validateCaptcha" in text
+            or "automated access" in text.lower()
+        )
+
+        # 2. If blocked, seamlessly fall back to ZenRows anti-bot bypass
+        if is_blocked:
+            zenrows_key = os.environ.get("ZENROWS_API_KEY", "") or ZENROWS_API_KEY
+            if zenrows_key:
+                print(f"🛡️ [Amazon Direct] Direct request blocked ({status_code}); routing via ZenRows...")
+                zr_status, zr_text = await self._fetch_with_zenrows(url)
+                if zr_status == 200 and "bm-verify" not in zr_text:
+                    return zr_status, zr_text
+
+        return status_code, text
 
     async def lookup_asin(self, asin: str) -> dict | None:
         url = f"https://www.amazon.com/dp/{asin}"
