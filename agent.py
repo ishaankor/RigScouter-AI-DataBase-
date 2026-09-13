@@ -10,6 +10,12 @@ import httpx
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
+try:
+    from curl_cffi.requests import AsyncSession as CurlAsyncSession
+    HAS_CURL_CFFI = True
+except ImportError:
+    HAS_CURL_CFFI = False
+
 load_dotenv()
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
@@ -267,12 +273,18 @@ class AmazonClient:
     """High-speed direct Amazon client with zero API rate-limits/credit costs."""
 
     HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         "Accept-Language": "en-US,en;q=0.9",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1"
+        "Sec-Ch-Ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"macOS"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "Referer": "https://www.amazon.com/",
     }
 
     @staticmethod
@@ -280,37 +292,65 @@ class AmazonClient:
         m = re.search(r'(?:/dp/|/gp/product/|^)([A-Z0-9]{10})(?:[/?&]|$)', text.strip())
         return m.group(1) if m else None
 
+    async def _fetch_html(self, url: str) -> tuple[int, str]:
+        if HAS_CURL_CFFI:
+            try:
+                async with CurlAsyncSession(impersonate="chrome124") as session:
+                    res = await session.get(url, headers=self.HEADERS, timeout=12)
+                    return res.status_code, res.text
+            except Exception as e:
+                print(f"[Amazon Direct curl_cffi Notice] {e}, falling back to httpx...")
+
+        async with httpx.AsyncClient(headers=self.HEADERS, follow_redirects=True, timeout=12.0) as client:
+            res = await client.get(url)
+            return res.status_code, res.text
+
     async def lookup_asin(self, asin: str) -> dict | None:
         url = f"https://www.amazon.com/dp/{asin}"
         print(f"[Amazon Direct] Fetching product page: {url}...")
         try:
-            async with httpx.AsyncClient(headers=self.HEADERS, http2=True, follow_redirects=True, timeout=12.0) as client:
-                res = await client.get(url)
-                if res.status_code == 200:
-                    soup = BeautifulSoup(res.text, "html.parser")
-                    title_el = soup.find("span", id="productTitle")
-                    title = title_el.text.strip() if title_el else None
-                    if not title and soup.title:
-                        title = soup.title.string.replace("Amazon.com:", "").strip()
+            status_code, text = await self._fetch_html(url)
+            if status_code == 200:
+                if "bm-verify" in text or "Robot Check" in text or "validateCaptcha" in text:
+                    print(f"⚠️ [Amazon Direct] Anti-bot verification challenge triggered for ASIN {asin}.")
+                    return None
 
-                    # Check in-stock availability
-                    avail_el = soup.find("div", id="availability")
-                    in_stock = True
-                    if avail_el:
-                        avail_text = avail_el.text.strip().lower()
-                        if any(w in avail_text for w in ["currently unavailable", "out of stock", "temporarily out of stock"]):
-                            in_stock = False
+                soup = BeautifulSoup(text, "html.parser")
+                title_el = soup.find("span", id="productTitle")
+                title = title_el.text.strip() if title_el else None
+                if not title and soup.title:
+                    title = soup.title.string.replace("Amazon.com:", "").strip()
 
-                    # Extract price from buybox
-                    price_val = None
-                    # First check corePriceDisplay or corePrice feature div
-                    core_price_div = soup.find("div", id="corePriceDisplay_desktop_feature_div") or soup.find("div", id="corePrice_feature_div") or soup.find("div", id="apex_desktop")
-                    search_scope = core_price_div if core_price_div else soup
+                # Check in-stock availability
+                avail_el = soup.find("div", id="availability")
+                in_stock = True
+                if avail_el:
+                    avail_text = avail_el.text.strip().lower()
+                    if any(w in avail_text for w in ["currently unavailable", "out of stock", "temporarily out of stock"]):
+                        in_stock = False
 
-                    for span in search_scope.find_all("span", class_="a-price"):
-                        # Avoid strikethrough list price
-                        classes = span.get("class", [])
-                        if "a-text-price" in classes:
+                # Extract price from buybox
+                price_val = None
+                # First check corePriceDisplay or corePrice feature div
+                core_price_div = soup.find("div", id="corePriceDisplay_desktop_feature_div") or soup.find("div", id="corePrice_feature_div") or soup.find("div", id="apex_desktop")
+                search_scope = core_price_div if core_price_div else soup
+
+                for span in search_scope.find_all("span", class_="a-price"):
+                    # Avoid strikethrough list price
+                    classes = span.get("class", [])
+                    if "a-text-price" in classes:
+                        continue
+                    off = span.find("span", class_="a-offscreen")
+                    if off and off.text:
+                        m = re.search(r'[\$]?([0-9,]+\.[0-9]{2})', off.text)
+                        if m:
+                            price_val = float(m.group(1).replace(",", ""))
+                            break
+
+                # Fallback to general price spans if needed
+                if not price_val:
+                    for span in soup.find_all("span", class_="a-price"):
+                        if "a-text-price" in span.get("class", []):
                             continue
                         off = span.find("span", class_="a-offscreen")
                         if off and off.text:
@@ -319,40 +359,30 @@ class AmazonClient:
                                 price_val = float(m.group(1).replace(",", ""))
                                 break
 
-                    # Fallback to general price spans if needed
-                    if not price_val:
-                        for span in soup.find_all("span", class_="a-price"):
-                            if "a-text-price" in span.get("class", []):
-                                continue
-                            off = span.find("span", class_="a-offscreen")
-                            if off and off.text:
-                                m = re.search(r'[\$]?([0-9,]+\.[0-9]{2})', off.text)
-                                if m:
-                                    price_val = float(m.group(1).replace(",", ""))
-                                    break
+                img = soup.find("img", id="landingImage") or soup.find("img", class_="s-image")
+                image_url = img.get("src") if img else None
 
-                    img = soup.find("img", id="landingImage") or soup.find("img", class_="s-image")
-                    image_url = img.get("src") if img else None
+                merchant_input = soup.find("input", id="merchantID") or soup.find("input", {"name": "merchantID"}) or soup.find("input", {"name": "merchantId"})
+                merchant_id = merchant_input.get("value") if merchant_input else None
+                product_url = f"https://www.amazon.com/dp/{asin}?smid={merchant_id}" if merchant_id else url
 
-                    merchant_input = soup.find("input", id="merchantID") or soup.find("input", {"name": "merchantID"}) or soup.find("input", {"name": "merchantId"})
-                    merchant_id = merchant_input.get("value") if merchant_input else None
-                    product_url = f"https://www.amazon.com/dp/{asin}?smid={merchant_id}" if merchant_id else url
-
-                    if title and price_val:
-                        offer = {
-                            "retailer": "Amazon",
-                            "title": title,
-                            "price": price_val,
-                            "originalPrice": None,
-                            "inStock": in_stock,
-                            "isRefurbished": "renewed" in title.lower() or "refurbished" in title.lower(),
-                            "url": product_url,
-                            "imageUrl": image_url,
-                            "brand": None,
-                            "source": "amazon-direct"
-                        }
-                        print(f"✅ [Amazon Hit] ${offer['price']:.2f} -> {offer['title'][:60]}")
-                        return offer
+                if title and price_val:
+                    offer = {
+                        "retailer": "Amazon",
+                        "title": title,
+                        "price": price_val,
+                        "originalPrice": None,
+                        "inStock": in_stock,
+                        "isRefurbished": "renewed" in title.lower() or "refurbished" in title.lower(),
+                        "url": product_url,
+                        "imageUrl": image_url,
+                        "brand": None,
+                        "source": "amazon-direct"
+                    }
+                    print(f"✅ [Amazon Hit] ${offer['price']:.2f} -> {offer['title'][:60]}")
+                    return offer
+            else:
+                print(f"⚠️ [Amazon Direct] HTTP {status_code} received when fetching ASIN {asin}")
         except Exception as e:
             print(f"[Amazon Direct DP Error] {e}")
 
@@ -379,72 +409,77 @@ class AmazonClient:
         url = f"https://www.amazon.com/s?k={encoded}"
 
         try:
-            async with httpx.AsyncClient(headers=self.HEADERS, http2=True, follow_redirects=True, timeout=12.0) as client:
-                res = await client.get(url)
-                if res.status_code == 200:
-                    soup = BeautifulSoup(res.text, "html.parser")
-                    items = soup.find_all("div", {"data-component-type": "s-search-result"})
-                    valid_offers = []
-                    for it in items:
-                        item_asin = it.get("data-asin")
-                        if not item_asin:
-                            continue
+            status_code, text = await self._fetch_html(url)
+            if status_code == 200:
+                if "bm-verify" in text or "Robot Check" in text or "validateCaptcha" in text:
+                    print(f"⚠️ [Amazon Direct] Anti-bot challenge (Akamai/Captcha) triggered for '{search_term}'")
+                    return None
 
-                        # Extract title
-                        title = None
-                        for a in it.find_all("a", class_="a-link-normal"):
-                            txt = a.text.strip()
-                            if len(txt) > 20 and not txt.startswith("("):
-                                title = txt
-                                break
-                        if not title:
-                            img = it.find("img", class_="s-image")
-                            if img and img.get("alt"):
-                                title = img.get("alt")
+                soup = BeautifulSoup(text, "html.parser")
+                items = soup.find_all("div", {"data-component-type": "s-search-result"})
+                valid_offers = []
+                for it in items:
+                    item_asin = it.get("data-asin")
+                    if not item_asin:
+                        continue
 
-                        # Extract price
-                        price_el = it.find("span", class_="a-price")
-                        price_offscreen = price_el.find("span", class_="a-offscreen") if price_el else None
-                        if not price_offscreen or not title:
-                            continue
-                        m = re.search(r'[\$]?([0-9,]+\.[0-9]{2})', price_offscreen.text)
-                        if not m:
-                            continue
-                        price_val = float(m.group(1).replace(",", ""))
-
-                        # Semantic validation
-                        is_valid, reason = ProductAnalyzer.validate_offer(analysis, title, price_val)
-                        if not is_valid:
-                            print(f"[Amazon Filtered] Skipping '{title[:50]}...': {reason}")
-                            continue
-
+                    # Extract title
+                    title = None
+                    for a in it.find_all("a", class_="a-link-normal"):
+                        txt = a.text.strip()
+                        if len(txt) > 20 and not txt.startswith("("):
+                            title = txt
+                            break
+                    if not title:
                         img = it.find("img", class_="s-image")
-                        image_url = img.get("src") if img else None
+                        if img and img.get("alt"):
+                            title = img.get("alt")
 
-                        merchant_input = it.find("input", {"name": "merchantId"})
-                        merchant_id = merchant_input.get("value") if merchant_input else None
-                        product_url = f"https://www.amazon.com/dp/{item_asin}?smid={merchant_id}" if merchant_id else f"https://www.amazon.com/dp/{item_asin}"
+                    # Extract price
+                    price_el = it.find("span", class_="a-price")
+                    price_offscreen = price_el.find("span", class_="a-offscreen") if price_el else None
+                    if not price_offscreen or not title:
+                        continue
+                    m = re.search(r'[\$]?([0-9,]+\.[0-9]{2})', price_offscreen.text)
+                    if not m:
+                        continue
+                    price_val = float(m.group(1).replace(",", ""))
 
-                        valid_offers.append({
-                            "retailer": "Amazon",
-                            "title": title,
-                            "price": price_val,
-                            "originalPrice": None,
-                            "inStock": True,
-                            "isRefurbished": "renewed" in title.lower() or "refurbished" in title.lower(),
-                            "url": product_url,
-                            "imageUrl": image_url,
-                            "brand": analysis.brand,
-                            "source": "amazon-direct"
-                        })
+                    # Semantic validation
+                    is_valid, reason = ProductAnalyzer.validate_offer(analysis, title, price_val)
+                    if not is_valid:
+                        print(f"[Amazon Filtered] Skipping '{title[:50]}...': {reason}")
+                        continue
 
-                    if valid_offers:
-                        valid_offers.sort(key=lambda x: x["price"])
-                        best = valid_offers[0]
-                        print(f"✅ [Amazon Hit] ${best['price']:.2f} -> {best['title'][:60]}")
-                        return best
-                    else:
-                        print(f"[Amazon Direct] 0 valid standalone offers found for '{search_term}'")
+                    img = it.find("img", class_="s-image")
+                    image_url = img.get("src") if img else None
+
+                    merchant_input = it.find("input", {"name": "merchantId"})
+                    merchant_id = merchant_input.get("value") if merchant_input else None
+                    product_url = f"https://www.amazon.com/dp/{item_asin}?smid={merchant_id}" if merchant_id else f"https://www.amazon.com/dp/{item_asin}"
+
+                    valid_offers.append({
+                        "retailer": "Amazon",
+                        "title": title,
+                        "price": price_val,
+                        "originalPrice": None,
+                        "inStock": True,
+                        "isRefurbished": "renewed" in title.lower() or "refurbished" in title.lower(),
+                        "url": product_url,
+                        "imageUrl": image_url,
+                        "brand": analysis.brand,
+                        "source": "amazon-direct"
+                    })
+
+                if valid_offers:
+                    valid_offers.sort(key=lambda x: x["price"])
+                    best = valid_offers[0]
+                    print(f"✅ [Amazon Hit] ${best['price']:.2f} -> {best['title'][:60]}")
+                    return best
+                else:
+                    print(f"[Amazon Direct] 0 valid standalone offers found for '{search_term}'")
+            else:
+                print(f"⚠️ [Amazon Direct] HTTP {status_code} received for '{search_term}'")
         except Exception as e:
             print(f"[Amazon Direct Search Error] {e}")
         return None
