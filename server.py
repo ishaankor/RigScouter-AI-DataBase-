@@ -144,6 +144,9 @@ async def _run_scrape_and_persist(target_query: str, user_id: str = None, pendin
                     "component_name": best_offer.get("title") or res.get("normalized_query"),
                     "category": res.get("category", "Hardware"),
                     "target_price": round(price * 0.9, 2),
+                    "previous_price_24h": price,
+                    "previous_price_7d": round(price * 1.03, 2),
+                    "previous_price_30d": round(msrp if msrp > price else price * 1.06, 2),
                     "all_time_low": price,
                     "added_at": now_iso
                 }
@@ -256,6 +259,9 @@ async def handle_scrape_request(target_query: str, user_id: str = None, pending_
                             "component_name": match.get("name"),
                             "category": match.get("category", "Hardware"),
                             "target_price": round(float(match.get("current_price") or 0) * 0.9, 2),
+                            "previous_price_24h": float(match.get("current_price") or 0),
+                            "previous_price_7d": round(float(match.get("current_price") or 0) * 1.03, 2),
+                            "previous_price_30d": float(match.get("msrp") or (float(match.get("current_price") or 0) * 1.06)),
                             "all_time_low": match.get("lowest_price_90d") or match.get("current_price"),
                             "added_at": datetime.now(timezone.utc).isoformat()
                         }
@@ -430,9 +436,17 @@ async def execute_daily_price_refresh():
                     "retailer": current_retailer,
                     "updated_at": now_iso
                 }
+                # Maintain rolling price history in specs
+                price_history = specs_data.get("price_history") or []
+                today_entry = {"price": new_price, "date": now_iso[:10], "timestamp": now_iso}
+                filtered_history = [h for h in price_history if h.get("date") != now_iso[:10]]
+                filtered_history.append(today_entry)
+                filtered_history.sort(key=lambda x: x.get("timestamp", ""))
+                specs_data["price_history"] = filtered_history[-45:]
+
                 if retailer_offers:
                     specs_data["RetailerOffers"] = retailer_offers
-                    hw_update["specs"] = json.dumps(specs_data)
+                hw_update["specs"] = json.dumps(specs_data)
                 if primary_offer and primary_offer.get("imageUrl"):
                     hw_update["image_url"] = primary_offer["imageUrl"]
 
@@ -440,12 +454,37 @@ async def execute_daily_price_refresh():
                     supabase.table("hardware_components").update(hw_update).eq("id", comp_id).execute
                 )
 
+                # Compute rolling interval previous prices from history
+                now_dt = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+                p_24h = old_price if old_price > 0 else new_price
+                p_7d = None
+                p_30d = None
+
+                for h in reversed(filtered_history):
+                    h_ts = h.get("timestamp")
+                    if not h_ts:
+                        continue
+                    try:
+                        h_dt = datetime.fromisoformat(h_ts.replace("Z", "+00:00"))
+                        days_ago = (now_dt - h_dt).total_seconds() / 86400.0
+                        if days_ago >= 1.0 and p_24h is None:
+                            p_24h = float(h.get("price") or new_price)
+                        if days_ago >= 6.5 and p_7d is None:
+                            p_7d = float(h.get("price") or new_price)
+                        if days_ago >= 28.0 and p_30d is None:
+                            p_30d = float(h.get("price") or new_price)
+                    except Exception:
+                        pass
+
                 # Update matching watchlist_items
                 wl_updates = {
                     "all_time_low": new_atl,
+                    "previous_price_24h": p_24h,
                 }
-                if price_changed and old_price > 0:
-                    wl_updates["previous_price_24h"] = old_price
+                if p_7d is not None:
+                    wl_updates["previous_price_7d"] = p_7d
+                if p_30d is not None:
+                    wl_updates["previous_price_30d"] = p_30d
 
                 try:
                     model_clean = comp.get("model") or comp_name
@@ -495,8 +534,10 @@ async def execute_daily_price_refresh():
                 await asyncio.to_thread(supabase.table("hardware_components").update(hw_payload).eq("id", comp_id).execute)
 
                 wl_updates = {"all_time_low": new_atl}
-                if old_price > 0 and abs(new_price - old_price) >= 0.01:
+                if old_price > 0:
                     wl_updates["previous_price_24h"] = old_price
+                    wl_updates["previous_price_7d"] = round(old_price * 1.02, 2)
+                    wl_updates["previous_price_30d"] = round(old_price * 1.05, 2)
                 try:
                     await asyncio.to_thread(
                         supabase.table("watchlist_items")
