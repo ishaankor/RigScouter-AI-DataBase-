@@ -1,4 +1,5 @@
 import os
+import sys
 import re
 import json
 import base64
@@ -9,6 +10,11 @@ from datetime import datetime, timezone
 import httpx
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 try:
     from curl_cffi.requests import AsyncSession as CurlAsyncSession
@@ -298,14 +304,16 @@ class AmazonClient:
         if not zenrows_key:
             return 0, ""
         try:
-            print(f"[ZenRows Proxy] Routing request via ZenRows (5-credit JS render mode)...")
-            async with httpx.AsyncClient(timeout=35.0) as client:
+            print(f"[ZenRows Proxy] Routing request via ZenRows (residential stealth mode)...")
+            async with httpx.AsyncClient(timeout=40.0) as client:
                 res = await client.get(
                     "https://api.zenrows.com/v1/",
                     params={
                         "apikey": zenrows_key,
                         "url": url,
                         "js_render": "true",
+                        "premium_proxy": "true",
+                        "proxy_country": "us",
                     }
                 )
                 if res.status_code == 200:

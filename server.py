@@ -1,4 +1,5 @@
 import os
+import sys
 import re
 import json
 import asyncio
@@ -7,6 +8,11 @@ from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 from dotenv import load_dotenv
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 load_dotenv()
 
