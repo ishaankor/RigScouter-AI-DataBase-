@@ -78,7 +78,11 @@ async def _run_scrape_and_persist(target_query: str, user_id: str = None, pendin
         msrp = float(best_offer.get("originalPrice") or price)
         image_url = best_offer.get("imageUrl") or "https://images.unsplash.com/photo-1587202372775-e229f172b9d7?auto=format&fit=crop&w=600&q=80"
 
-        specs_json = json.dumps({"RetailerOffers": offers})
+        specs_dict = {
+            "RetailerOffers": offers,
+            "price_history": [{"price": price, "timestamp": now_iso}]
+        }
+        specs_json = json.dumps(specs_dict)
 
         # 1. Upsert all individual retailer offers so every retailer row exists in catalog
         for off in offers:
@@ -138,6 +142,7 @@ async def _run_scrape_and_persist(target_query: str, user_id: str = None, pendin
         # 2. Sync to watchlist if this was user-requested
         if user_id:
             try:
+                # Newly queried entry: initial baseline is the real scraped price (0% delta until history accumulates)
                 wl_payload = {
                     "user_id": user_id,
                     "component_id": comp_id,
@@ -145,8 +150,8 @@ async def _run_scrape_and_persist(target_query: str, user_id: str = None, pendin
                     "category": res.get("category", "Hardware"),
                     "target_price": round(price * 0.9, 2),
                     "previous_price_24h": price,
-                    "previous_price_7d": round(price * 1.03, 2),
-                    "previous_price_30d": round(msrp if msrp > price else price * 1.06, 2),
+                    "previous_price_7d": price,
+                    "previous_price_30d": round(msrp, 2) if msrp > price else price,
                     "all_time_low": price,
                     "added_at": now_iso
                 }
@@ -260,8 +265,8 @@ async def handle_scrape_request(target_query: str, user_id: str = None, pending_
                             "category": match.get("category", "Hardware"),
                             "target_price": round(float(match.get("current_price") or 0) * 0.9, 2),
                             "previous_price_24h": float(match.get("current_price") or 0),
-                            "previous_price_7d": round(float(match.get("current_price") or 0) * 1.03, 2),
-                            "previous_price_30d": float(match.get("msrp") or (float(match.get("current_price") or 0) * 1.06)),
+                            "previous_price_7d": float(match.get("current_price") or 0),
+                            "previous_price_30d": float(match.get("msrp") or match.get("current_price") or 0),
                             "all_time_low": match.get("lowest_price_90d") or match.get("current_price"),
                             "added_at": datetime.now(timezone.utc).isoformat()
                         }
