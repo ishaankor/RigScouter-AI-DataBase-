@@ -764,10 +764,10 @@ class EbayClient:
         return None
 
 
-# ─── 4. BEST BUY CLIENT (Direct curl_cffi with Zero ZenRows Credits) ───────────
+# ─── 4. BEST BUY CLIENT (Direct curl_cffi with Seamless ZenRows Backup) ─────────
 
 class BestBuyClient:
-    """Best Buy search & product parser using direct curl_cffi (0 ZenRows credits used)."""
+    """Best Buy search & product parser: direct curl_cffi (0 credits) with ZenRows residential fallback."""
 
     HEADERS = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -775,170 +775,223 @@ class BestBuyClient:
         "Referer": "https://www.bestbuy.com/",
     }
 
+    async def _fetch_with_zenrows(self, url: str) -> tuple[int, str]:
+        zenrows_key = os.environ.get("ZENROWS_API_KEY", "") or ZENROWS_API_KEY
+        if not zenrows_key:
+            return 0, ""
+        try:
+            print(f"[ZenRows Proxy] Routing Best Buy request via ZenRows (residential stealth mode)...")
+            async with httpx.AsyncClient(timeout=40.0) as client:
+                res = await client.get(
+                    "https://api.zenrows.com/v1/",
+                    params={
+                        "apikey": zenrows_key,
+                        "url": url,
+                        "js_render": "true",
+                        "premium_proxy": "true",
+                        "proxy_country": "us",
+                    }
+                )
+                return res.status_code, res.text
+        except Exception as e:
+            print(f"[Best Buy ZenRows Fallback Error] {e}")
+            return 0, ""
+
+    async def _fetch_html(self, url: str) -> tuple[int, str]:
+        status_code = 0
+        text = ""
+
+        # 1. Primary: Direct curl_cffi Chrome impersonation (0 ZenRows credits used)
+        if HAS_CURL_CFFI:
+            try:
+                async with CurlAsyncSession(impersonate="chrome124") as session:
+                    res = await session.get(url, headers=self.HEADERS, timeout=12)
+                    status_code, text = res.status_code, res.text
+            except Exception as e:
+                print(f"[Best Buy curl_cffi Notice] {e}")
+
+        # Fallback to httpx if curl_cffi unavailable
+        if not text:
+            try:
+                async with httpx.AsyncClient(headers=self.HEADERS, follow_redirects=True, timeout=12.0) as client:
+                    res = await client.get(url)
+                    status_code, text = res.status_code, res.text
+            except Exception as e:
+                print(f"[Best Buy httpx Notice] {e}")
+
+        # Check if Best Buy blocked or challenged the request
+        is_blocked = (
+            status_code != 200
+            or not text
+            or "access denied" in text.lower()
+            or "automated access" in text.lower()
+            or status_code in [403, 429, 503]
+        )
+
+        # 2. Secondary: Seamless ZenRows residential proxy fallback
+        if is_blocked:
+            zenrows_key = os.environ.get("ZENROWS_API_KEY", "") or ZENROWS_API_KEY
+            if zenrows_key:
+                print(f"🛡️ [Best Buy Direct] Direct request blocked ({status_code}); routing via ZenRows residential proxy...")
+                zr_status, zr_text = await self._fetch_with_zenrows(url)
+                if zr_status == 200 and zr_text and "access denied" not in zr_text.lower():
+                    return zr_status, zr_text
+
+        return status_code, text
+
     async def search(self, analysis: ProductAnalysis) -> dict | None:
         search_term = analysis.retailer_search_query
         print(f"[Best Buy Direct] Searching for '{search_term}'...")
         encoded = urllib.parse.quote_plus(search_term)
         url = f"https://www.bestbuy.com/site/searchpage.jsp?st={encoded}&intl=nosplash"
 
-        if not HAS_CURL_CFFI:
-            print("[Best Buy Direct] curl_cffi not installed, skipping Best Buy.")
-            return None
-
         try:
-            async with CurlAsyncSession(impersonate="chrome124") as session:
-                res = await session.get(url, headers=self.HEADERS, timeout=12)
-                if res.status_code != 200:
-                    print(f"⚠️ [Best Buy Direct] HTTP {res.status_code} received for '{search_term}' (0 proxy credits used)")
-                    return None
+            status_code, text = await self._fetch_html(url)
+            if status_code != 200 or not text:
+                print(f"⚠️ [Best Buy Direct] Failed to fetch search results for '{search_term}' (HTTP {status_code})")
+                return None
 
-                text = res.text
+            # 1. Map skuId -> price from embedded pricing objects
+            sku_prices = {}
+            for m in re.finditer(r"\"customerPrice\":\s*([0-9.]+)[^}]*?\"skuId\":\s*\"(\d+)\"", text):
+                price, sku = float(m.group(1)), m.group(2)
+                if sku not in sku_prices or price < sku_prices[sku]:
+                    sku_prices[sku] = price
 
-                # 1. Map skuId -> price from embedded pricing objects
-                sku_prices = {}
-                for m in re.finditer(r"\"customerPrice\":\s*([0-9.]+)[^}]*?\"skuId\":\s*\"(\d+)\"", text):
-                    price, sku = float(m.group(1)), m.group(2)
-                    if sku not in sku_prices or price < sku_prices[sku]:
-                        sku_prices[sku] = price
+            for m in re.finditer(r"\"skuId\":\s*\"(\d+)\"[^}]*?\"customerPrice\":\s*([0-9.]+)", text):
+                sku, price = m.group(1), float(m.group(2))
+                if sku not in sku_prices or price < sku_prices[sku]:
+                    sku_prices[sku] = price
 
-                for m in re.finditer(r"\"skuId\":\s*\"(\d+)\"[^}]*?\"customerPrice\":\s*([0-9.]+)", text):
-                    sku, price = m.group(1), float(m.group(2))
-                    if sku not in sku_prices or price < sku_prices[sku]:
-                        sku_prices[sku] = price
+            # 2. Extract products from Apollo SSR chunks
+            valid_offers = []
+            for m in re.finditer(r"\"__typename\":\"Product\",\"skuId\":\"(\d+)\"(.*?)(?=\"__typename\":\"Product\"|$)", text):
+                sku = m.group(1)
+                chunk = m.group(2)
 
-                # 2. Extract products from Apollo SSR chunks
-                valid_offers = []
-                for m in re.finditer(r"\"__typename\":\"Product\",\"skuId\":\"(\d+)\"(.*?)(?=\"__typename\":\"Product\"|$)", text):
-                    sku = m.group(1)
-                    chunk = m.group(2)
+                title_m = re.search(r"\"name\":\{[^}]*\"short\":\"([^\"]+)\"", chunk) or re.search(r"\"title\":\"([^\"]+)\"", chunk)
+                if not title_m:
+                    continue
+                title = title_m.group(1).encode("utf-8").decode("unicode_escape", errors="ignore")
 
-                    title_m = re.search(r"\"name\":\{[^}]*\"short\":\"([^\"]+)\"", chunk) or re.search(r"\"title\":\"([^\"]+)\"", chunk)
-                    if not title_m:
+                url_m = re.search(r"\"skuSpecificUrl\":\"([^\"]+)\"", chunk) or re.search(r"\"pdp\":\"([^\"]+)\"", chunk)
+                pdp_url = url_m.group(1) if url_m else f"https://www.bestbuy.com/site/searchpage.jsp?st={sku}"
+
+                img_m = re.search(r"\"(?:piscesHref|href)\":\"([^\"]+)\"", chunk)
+                img_url = img_m.group(1) if img_m else None
+
+                price = sku_prices.get(sku)
+                if not price:
+                    pm = re.search(r"\"customerPrice\":\s*([0-9.]+)", chunk)
+                    if pm:
+                        price = float(pm.group(1))
+
+                if not price or price <= 0:
+                    continue
+
+                # Semantic validation
+                is_valid, reason = ProductAnalyzer.validate_offer(analysis, title, price)
+                if not is_valid:
+                    print(f"[Best Buy Filtered] Skipping '{title[:50]}...': {reason}")
+                    continue
+
+                valid_offers.append({
+                    "retailer": "Best Buy",
+                    "title": title,
+                    "price": price,
+                    "originalPrice": None,
+                    "inStock": True,
+                    "isRefurbished": any(w in title.lower() for w in ["refurbished", "open-box", "open box"]),
+                    "url": pdp_url,
+                    "imageUrl": img_url,
+                    "brand": analysis.brand,
+                    "source": "bestbuy-direct"
+                })
+
+            # Fallback to DOM info-section if SSR chunk regex found no valid offers
+            if not valid_offers:
+                soup = BeautifulSoup(text, "html.parser")
+                for info in soup.find_all("div", class_="info-section"):
+                    t_el = info.find(class_=re.compile(r"product-title"))
+                    t = t_el.get_text(strip=True) if t_el else None
+                    if not t:
                         continue
-                    title = title_m.group(1).encode("utf-8").decode("unicode_escape", errors="ignore")
-
-                    url_m = re.search(r"\"skuSpecificUrl\":\"([^\"]+)\"", chunk) or re.search(r"\"pdp\":\"([^\"]+)\"", chunk)
-                    pdp_url = url_m.group(1) if url_m else f"https://www.bestbuy.com/site/searchpage.jsp?st={sku}"
-
-                    img_m = re.search(r"\"(?:piscesHref|href)\":\"([^\"]+)\"", chunk)
-                    img_url = img_m.group(1) if img_m else None
-
-                    price = sku_prices.get(sku)
-                    if not price:
-                        pm = re.search(r"\"customerPrice\":\s*([0-9.]+)", chunk)
-                        if pm:
-                            price = float(pm.group(1))
-
-                    if not price or price <= 0:
+                    pm = re.search(r"\$([0-9,]+\.[0-9]{2})", info.get_text())
+                    if not pm:
                         continue
-
-                    # Semantic validation
-                    is_valid, reason = ProductAnalyzer.validate_offer(analysis, title, price)
+                    p_val = float(pm.group(1).replace(",", ""))
+                    is_valid, reason = ProductAnalyzer.validate_offer(analysis, t, p_val)
                     if not is_valid:
-                        print(f"[Best Buy Filtered] Skipping '{title[:50]}...': {reason}")
                         continue
+                    link_el = info.find("a", href=re.compile(r"/product/")) or (info.parent.find("a", href=re.compile(r"/product/")) if info.parent else None)
+                    p_link = ("https://www.bestbuy.com" + link_el["href"]) if link_el and link_el.get("href", "").startswith("/") else (link_el.get("href") if link_el else url)
+                    sku_b = info.find_parent("div", class_="sku-block") or info.parent
+                    img_el = sku_b.find("img") if sku_b else None
+                    p_img = img_el.get("src") if img_el else None
 
                     valid_offers.append({
                         "retailer": "Best Buy",
-                        "title": title,
-                        "price": price,
+                        "title": t,
+                        "price": p_val,
                         "originalPrice": None,
                         "inStock": True,
-                        "isRefurbished": any(w in title.lower() for w in ["refurbished", "open-box", "open box"]),
-                        "url": pdp_url,
-                        "imageUrl": img_url,
+                        "isRefurbished": any(w in t.lower() for w in ["refurbished", "open-box", "open box"]),
+                        "url": p_link,
+                        "imageUrl": p_img,
                         "brand": analysis.brand,
                         "source": "bestbuy-direct"
                     })
 
-                # Fallback to DOM info-section if SSR chunk regex found no valid offers
-                if not valid_offers:
-                    soup = BeautifulSoup(text, "html.parser")
-                    for info in soup.find_all("div", class_="info-section"):
-                        t_el = info.find(class_=re.compile(r"product-title"))
-                        t = t_el.get_text(strip=True) if t_el else None
-                        if not t:
-                            continue
-                        pm = re.search(r"\$([0-9,]+\.[0-9]{2})", info.get_text())
-                        if not pm:
-                            continue
-                        p_val = float(pm.group(1).replace(",", ""))
-                        is_valid, reason = ProductAnalyzer.validate_offer(analysis, t, p_val)
-                        if not is_valid:
-                            continue
-                        link_el = info.find("a", href=re.compile(r"/product/")) or (info.parent.find("a", href=re.compile(r"/product/")) if info.parent else None)
-                        p_link = ("https://www.bestbuy.com" + link_el["href"]) if link_el and link_el.get("href", "").startswith("/") else (link_el.get("href") if link_el else url)
-                        sku_b = info.find_parent("div", class_="sku-block") or info.parent
-                        img_el = sku_b.find("img") if sku_b else None
-                        p_img = img_el.get("src") if img_el else None
-
-                        valid_offers.append({
-                            "retailer": "Best Buy",
-                            "title": t,
-                            "price": p_val,
-                            "originalPrice": None,
-                            "inStock": True,
-                            "isRefurbished": any(w in t.lower() for w in ["refurbished", "open-box", "open box"]),
-                            "url": p_link,
-                            "imageUrl": p_img,
-                            "brand": analysis.brand,
-                            "source": "bestbuy-direct"
-                        })
-
-                if valid_offers:
-                    valid_offers.sort(key=lambda x: x["price"])
-                    best = valid_offers[0]
-                    print(f"✅ [Best Buy Hit] ${best['price']:.2f} -> {best['title'][:60]}")
-                    return best
-                else:
-                    print(f"[Best Buy Direct] 0 valid standalone offers found for '{search_term}'")
+            if valid_offers:
+                valid_offers.sort(key=lambda x: x["price"])
+                best = valid_offers[0]
+                print(f"✅ [Best Buy Hit] ${best['price']:.2f} -> {best['title'][:60]}")
+                return best
+            else:
+                print(f"[Best Buy Direct] 0 valid standalone offers found for '{search_term}'")
         except Exception as e:
             print(f"[Best Buy Direct Search Error] {e}")
 
         return None
 
     async def lookup_url(self, url: str) -> dict | None:
-        if not HAS_CURL_CFFI:
-            return None
         target_url = url + ("&intl=nosplash" if "?" in url else "?intl=nosplash") if "nosplash" not in url else url
         try:
-            async with CurlAsyncSession(impersonate="chrome124") as session:
-                res = await session.get(target_url, headers=self.HEADERS, timeout=12)
-                if res.status_code == 200:
-                    text = res.text
-                    title = None
-                    price = None
-                    img = None
+            status_code, text = await self._fetch_html(target_url)
+            if status_code == 200 and text:
+                title = None
+                price = None
+                img = None
 
-                    title_m = re.search(r"\"name\":\{[^}]*\"short\":\"([^\"]+)\"", text) or re.search(r"<title>(.*?)(?:\s*-\s*Best\s*Buy|</title>)", text, re.I)
-                    if title_m:
-                        title = title_m.group(1).strip()
+                title_m = re.search(r"\"name\":\{[^}]*\"short\":\"([^\"]+)\"", text) or re.search(r"<title>(.*?)(?:\s*-\s*Best\s*Buy|</title>)", text, re.I)
+                if title_m:
+                    title = title_m.group(1).strip()
 
-                    price_m = re.search(r"\"customerPrice\":\s*([0-9.]+)", text)
-                    if price_m:
-                        price = float(price_m.group(1))
-                    else:
-                        pm = re.search(r"\$([0-9,]+\.[0-9]{2})", text)
-                        if pm:
-                            price = float(pm.group(1).replace(",", ""))
+                price_m = re.search(r"\"customerPrice\":\s*([0-9.]+)", text)
+                if price_m:
+                    price = float(price_m.group(1))
+                else:
+                    pm = re.search(r"\$([0-9,]+\.[0-9]{2})", text)
+                    if pm:
+                        price = float(pm.group(1).replace(",", ""))
 
-                    img_m = re.search(r"\"(?:piscesHref|href)\":\"(https://pisces\.bbystatic\.com/[^\"]+)\"", text)
-                    if img_m:
-                        img = img_m.group(1)
+                img_m = re.search(r"\"(?:piscesHref|href)\":\"(https://pisces\.bbystatic\.com/[^\"]+)\"", text)
+                if img_m:
+                    img = img_m.group(1)
 
-                    if title and price:
-                        return {
-                            "retailer": "Best Buy",
-                            "title": title,
-                            "price": price,
-                            "originalPrice": None,
-                            "inStock": True,
-                            "isRefurbished": any(w in title.lower() for w in ["refurbished", "open-box", "open box"]),
-                            "url": url,
-                            "imageUrl": img,
-                            "brand": None,
-                            "source": "bestbuy-direct"
-                        }
+                if title and price:
+                    return {
+                        "retailer": "Best Buy",
+                        "title": title,
+                        "price": price,
+                        "originalPrice": None,
+                        "inStock": True,
+                        "isRefurbished": any(w in title.lower() for w in ["refurbished", "open-box", "open box"]),
+                        "url": url,
+                        "imageUrl": img,
+                        "brand": None,
+                        "source": "bestbuy-direct"
+                    }
         except Exception as e:
             print(f"[Best Buy URL Lookup Error] {e}")
         return None
