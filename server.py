@@ -222,6 +222,12 @@ async def handle_scrape_request(target_query: str, user_id: str = None, pending_
 
                 # Broadcast cached offers over SSE so pending UI listeners immediately update
                 for off in offers:
+                    o_price = float(off.get("price") or 0)
+                    o_orig = float(off.get("originalPrice") or o_price)
+                    off["previousPrice"] = off.get("previousPrice") or off.get("previousPrice24h") or o_price
+                    off["previousPrice24h"] = off.get("previousPrice24h") or o_price
+                    off["previousPrice7d"] = off.get("previousPrice7d") or (o_orig if o_orig > o_price else o_price)
+                    off["previousPrice30d"] = off.get("previousPrice30d") or (o_orig if o_orig > o_price else o_price)
                     broadcast_sse("retailer_found", {
                         "query": match.get("model") or clean,
                         "original_query": clean,
@@ -229,6 +235,10 @@ async def handle_scrape_request(target_query: str, user_id: str = None, pending_
                         "title": off.get("title"),
                         "price": off.get("price"),
                         "originalPrice": off.get("originalPrice"),
+                        "previousPrice": off["previousPrice"],
+                        "previousPrice24h": off["previousPrice24h"],
+                        "previousPrice7d": off["previousPrice7d"],
+                        "previousPrice30d": off["previousPrice30d"],
                         "url": off.get("url"),
                         "imageUrl": off.get("imageUrl") or match.get("image_url"),
                         "inStock": off.get("inStock", True),

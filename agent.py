@@ -1158,6 +1158,12 @@ class HardwareAgent:
         scraped_offers = []
         for res in results:
             if isinstance(res, dict) and res.get("price"):
+                p_val = float(res["price"])
+                orig_val = float(res["originalPrice"]) if res.get("originalPrice") else p_val
+                res["previousPrice"] = res.get("previousPrice") or p_val
+                res["previousPrice24h"] = res.get("previousPrice24h") or p_val
+                res["previousPrice7d"] = res.get("previousPrice7d") or (orig_val if orig_val > p_val else p_val)
+                res["previousPrice30d"] = res.get("previousPrice30d") or (orig_val if orig_val > p_val else p_val)
                 scraped_offers.append(res)
                 if emit_fn:
                     emit_fn("retailer_found", {
@@ -1167,6 +1173,10 @@ class HardwareAgent:
                         "title": res["title"],
                         "price": res["price"],
                         "originalPrice": res.get("originalPrice"),
+                        "previousPrice": res["previousPrice"],
+                        "previousPrice24h": res["previousPrice24h"],
+                        "previousPrice7d": res["previousPrice7d"],
+                        "previousPrice30d": res["previousPrice30d"],
                         "url": res["url"],
                         "imageUrl": res.get("imageUrl"),
                         "inStock": res.get("inStock", True),
