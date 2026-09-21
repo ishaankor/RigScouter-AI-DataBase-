@@ -169,6 +169,21 @@ class ProductAnalyzer:
         elif analysis.category == "CPU":
             if any(w in title_lower for w in ["cooler only", "mounting bracket", "delid tool", "contact frame", "thermal paste"]):
                 return False, "Accessory / cooler detected instead of CPU"
+
+            # CPU tier mismatch check (e.g. Ryzen 7 query vs Ryzen 5 listing, or Core i7 vs Core i5)
+            def extract_cpu_tier(text: str) -> str | None:
+                m_r = re.search(r'\b(ryzen\s*[3579]|r[3579])\b', text, re.I)
+                if m_r: return re.sub(r'\s+', '', m_r.group(0).lower()).replace('r', 'ryzen')
+                m_i = re.search(r'\b(core\s*i[3579]|i[3579]-?\d{4,5})\b', text, re.I)
+                if m_i: return re.sub(r'[- ]', '', m_i.group(1).lower())
+                m_u = re.search(r'\bultra\s*[579]\b', text, re.I)
+                if m_u: return re.sub(r'\s+', '', m_u.group(0).lower())
+                return None
+
+            q_tier = extract_cpu_tier(analysis.model) or extract_cpu_tier(analysis.raw_query)
+            t_tier = extract_cpu_tier(title)
+            if q_tier and t_tier and q_tier != t_tier:
+                return False, f"CPU tier mismatch: Query requires '{q_tier.upper()}' but title is '{t_tier.upper()}'"
         elif analysis.category == "GPU":
             gpu_accessories = [
                 "bracket", "gpu sag", "backplate", "fan replacement", "cooler only",

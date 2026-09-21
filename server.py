@@ -59,6 +59,85 @@ def agent_sse_emitter(event_name: str, data: dict):
     broadcast_sse(event_name, data)
 
 
+# ─── Price Snapshot Recording Engine ─────────────────────────────────────────
+
+async def record_price_snapshot(
+    retailer_product_id: str,
+    price: float,
+    component_id: str = None,
+    retailer: str = "Unknown",
+    title: str = None,
+    product_url: str = None,
+    image_url: str = None,
+    in_stock: bool = True,
+    condition: str = "new",
+    shipping: float = 0.0,
+    category: str = None,
+    brand: str = None,
+    model: str = None
+):
+    """
+    Saves a snapshot to components, retailer_products, and price_snapshots tables in Supabase.
+    Gracefully logs any notices if RLS or database constraints need adjustment.
+    """
+    if not retailer_product_id or price <= 0:
+        return
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    clean_comp_id = component_id or retailer_product_id.split("-")[0]
+
+    # 0. Ensure components record exists (satisfies foreign key constraint if enabled)
+    try:
+        canonical = title or f"{brand or 'Hardware'} {model or clean_comp_id}"
+        comp_payload = {
+            "id": clean_comp_id,
+            "category": category or "Other",
+            "brand": brand or "Hardware",
+            "model": model or clean_comp_id,
+            "canonical_name": canonical[:255]
+        }
+        await asyncio.to_thread(
+            supabase.table("components").upsert(comp_payload).execute
+        )
+    except Exception as comp_err:
+        pass
+
+    # 1. Ensure retailer_products record exists
+    try:
+        rp_payload = {
+            "id": retailer_product_id,
+            "component_id": clean_comp_id,
+            "retailer": retailer,
+            "title": (title or retailer_product_id)[:255],
+            "product_url": product_url or "#",
+            "image_url": image_url
+        }
+        await asyncio.to_thread(
+            supabase.table("retailer_products").upsert(rp_payload).execute
+        )
+    except Exception as rp_err:
+        pass
+
+    # 2. Insert into price_snapshots
+    try:
+        snap_payload = {
+            "retailer_product_id": retailer_product_id,
+            "price": round(float(price), 2),
+            "shipping": round(float(shipping or 0.0), 2),
+            "total_price": round(float(price) + float(shipping or 0.0), 2),
+            "currency": "USD",
+            "availability": "in_stock" if in_stock else "out_of_stock",
+            "condition": condition or "new",
+            "scraped_at": now_iso
+        }
+        await asyncio.to_thread(
+            supabase.table("price_snapshots").insert(snap_payload).execute
+        )
+        print(f"📸 [Snapshot Recorded] {retailer_product_id}: ${price:.2f} ({retailer})")
+    except Exception as snap_err:
+        print(f"⚠️ [Snapshot Notice] {retailer_product_id}: {snap_err}")
+
+
 # ─── Background Scrape & Database Sync ────────────────────────────────────────
 
 async def _run_scrape_and_persist(target_query: str, user_id: str = None, pending_id: str = None):
@@ -113,6 +192,19 @@ async def _run_scrape_and_persist(target_query: str, user_id: str = None, pendin
                 )
             except Exception as off_err:
                 print(f"⚠️ [DB Save Notice] hardware_components ({row_id}): {off_err}")
+
+            # Record snapshot into price_snapshots
+            await record_price_snapshot(
+                retailer_product_id=row_id,
+                price=off_price,
+                component_id=comp_id,
+                retailer=ret_name,
+                title=off.get("title"),
+                product_url=off.get("url"),
+                image_url=off_img,
+                in_stock=off.get("inStock", True),
+                condition="used" if off.get("isRefurbished") else "new"
+            )
 
         # 2. Also ensure base comp_id row exists with best offer and full RetailerOffers in specs
         hw_payload = {
@@ -469,6 +561,38 @@ async def execute_daily_price_refresh():
                     supabase.table("hardware_components").update(hw_update).eq("id", comp_id).execute
                 )
 
+                # Record snapshots to retailer_products and price_snapshots tables
+                if retailer_offers:
+                    for off in retailer_offers:
+                        ret_name = off.get("retailer", "Unknown")
+                        ret_slug = re.sub(r'[^a-zA-Z0-9]+', '-', ret_name.lower()).strip('-')
+                        row_id = f"{comp_id}-{ret_slug}"
+                        await record_price_snapshot(
+                            retailer_product_id=row_id,
+                            price=float(off.get("price") or 0.0),
+                            component_id=comp_id,
+                            retailer=ret_name,
+                            title=off.get("title") or comp_name,
+                            product_url=off.get("url") or product_url,
+                            image_url=off.get("imageUrl") or comp.get("image_url"),
+                            in_stock=off.get("inStock", True),
+                            condition="used" if off.get("isRefurbished") else "new"
+                        )
+                else:
+                    ret_slug = re.sub(r'[^a-zA-Z0-9]+', '-', current_retailer.lower()).strip('-')
+                    row_id = f"{comp_id}-{ret_slug}"
+                    await record_price_snapshot(
+                        retailer_product_id=row_id,
+                        price=new_price,
+                        component_id=comp_id,
+                        retailer=current_retailer,
+                        title=comp_name,
+                        product_url=product_url,
+                        image_url=primary_offer.get("imageUrl") if primary_offer else comp.get("image_url"),
+                        in_stock=True,
+                        condition="used" if "used" in comp_name.lower() or "tested" in comp_name.lower() else "new"
+                    )
+
                 # Compute rolling interval previous prices from history
                 now_dt = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
                 p_24h = old_price if old_price > 0 else new_price
@@ -502,11 +626,18 @@ async def execute_daily_price_refresh():
                     wl_updates["previous_price_30d"] = p_30d
 
                 try:
+                    base_comp_id = re.sub(r'-(amazon|ebay|micro-center|microcenter|newegg|best-buy|bestbuy|bh|b-h)$', '', comp_id.lower())
                     model_clean = comp.get("model") or comp_name
+                    is_generic_family = any(model_clean.strip().lower() == fam for fam in ["ryzen 3", "ryzen 5", "ryzen 7", "ryzen 9", "core i3", "core i5", "core i7", "core i9", "rtx", "geforce", "radeon"])
+                    if not is_generic_family and len(model_clean.strip()) >= 5 and any(c.isdigit() for c in model_clean):
+                        filter_clause = f"component_id.eq.{comp_id},component_id.eq.{base_comp_id},component_name.ilike.%{model_clean}%"
+                    else:
+                        filter_clause = f"component_id.eq.{comp_id},component_id.eq.{base_comp_id}"
+
                     await asyncio.to_thread(
                         supabase.table("watchlist_items")
                         .update(wl_updates)
-                        .or_(f"component_id.eq.{comp_id},component_name.ilike.%{model_clean}%")
+                        .or_(filter_clause)
                         .execute
                     )
                 except Exception as wl_err:
@@ -548,16 +679,40 @@ async def execute_daily_price_refresh():
                 }
                 await asyncio.to_thread(supabase.table("hardware_components").update(hw_payload).eq("id", comp_id).execute)
 
+                # Record snapshots to retailer_products and price_snapshots tables
+                for off in offers:
+                    ret_name = off.get("retailer", "Unknown")
+                    ret_slug = re.sub(r'[^a-zA-Z0-9]+', '-', ret_name.lower()).strip('-')
+                    row_id = f"{comp_id}-{ret_slug}"
+                    await record_price_snapshot(
+                        retailer_product_id=row_id,
+                        price=float(off.get("price") or 0.0),
+                        component_id=comp_id,
+                        retailer=ret_name,
+                        title=off.get("title") or comp_name,
+                        product_url=off.get("url"),
+                        image_url=off.get("imageUrl"),
+                        in_stock=off.get("inStock", True),
+                        condition="used" if off.get("isRefurbished") else "new"
+                    )
+
                 wl_updates = {"all_time_low": new_atl}
                 if old_price > 0:
                     wl_updates["previous_price_24h"] = old_price
                     wl_updates["previous_price_7d"] = round(old_price * 1.02, 2)
                     wl_updates["previous_price_30d"] = round(old_price * 1.05, 2)
                 try:
+                    base_comp_id = re.sub(r'-(amazon|ebay|micro-center|microcenter|newegg|best-buy|bestbuy|bh|b-h)$', '', comp_id.lower())
+                    is_generic_family = any(search_query.strip().lower() == fam for fam in ["ryzen 3", "ryzen 5", "ryzen 7", "ryzen 9", "core i3", "core i5", "core i7", "core i9", "rtx", "geforce", "radeon"])
+                    if not is_generic_family and len(search_query.strip()) >= 5 and any(c.isdigit() for c in search_query):
+                        filter_clause = f"component_id.eq.{comp_id},component_id.eq.{base_comp_id},component_name.ilike.%{search_query}%"
+                    else:
+                        filter_clause = f"component_id.eq.{comp_id},component_id.eq.{base_comp_id}"
+
                     await asyncio.to_thread(
                         supabase.table("watchlist_items")
                         .update(wl_updates)
-                        .or_(f"component_id.eq.{comp_id},component_name.ilike.%{search_query}%")
+                        .or_(filter_clause)
                         .execute
                     )
                 except Exception:
