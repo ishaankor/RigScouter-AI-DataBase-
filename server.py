@@ -505,13 +505,25 @@ async def execute_daily_price_refresh():
                                 off["price"] = float(sub_offer["price"])
                                 off["inStock"] = sub_offer.get("inStock", True)
 
-                    # For base components, determine best in-stock price among all retailer offers
+                    # For retailer-specific rows (ending with retailer slug), preserve that retailer
+                    is_retailer_specific = any(comp_id.endswith(f"-{r}") for r in ["amazon", "ebay", "best-buy", "micro-center", "newegg", "bh"])
                     valid_offers = [o for o in retailer_offers if float(o.get("price") or 0) > 0 and o.get("inStock", True)]
-                    if valid_offers:
+                    
+                    if is_retailer_specific:
+                        # Find the offer matching this specific retailer
+                        matched_ret_offer = next((o for o in valid_offers if o.get("retailer", "").lower() == current_retailer.lower()), None)
+                        if matched_ret_offer and float(matched_ret_offer.get("price") or 0) > 0:
+                            new_price = float(matched_ret_offer["price"])
+                            if matched_ret_offer.get("url"):
+                                product_url = matched_ret_offer["url"]
+                    elif valid_offers:
+                        # For base components, determine best in-stock price among all retailer offers and sync both retailer AND url
                         valid_offers.sort(key=lambda x: float(x["price"]))
                         best_off = valid_offers[0]
                         new_price = float(best_off["price"])
                         current_retailer = best_off.get("retailer", current_retailer)
+                        if best_off.get("url"):
+                            product_url = best_off["url"]
 
                 if new_price <= 0:
                     print(f"⚠️ [Daily Refresh Notice] No price extracted from {product_url}, retaining ${old_price:.2f}")
@@ -541,6 +553,7 @@ async def execute_daily_price_refresh():
                     "lowest_price_90d": new_atl,
                     "deal_score": deal_score,
                     "retailer": current_retailer,
+                    "product_url": product_url,
                     "updated_at": now_iso
                 }
                 # Maintain rolling price history in specs
