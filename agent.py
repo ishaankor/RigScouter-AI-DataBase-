@@ -333,6 +333,8 @@ class AmazonClient:
                 )
                 if res.status_code == 200:
                     return 200, res.text
+                if res.status_code == 402:
+                    print(f"⚠️ [ZenRows Notice] ZenRows monthly quota exceeded (AUTH004).")
                 return res.status_code, res.text
         except Exception as e:
             print(f"[ZenRows Error] {e}")
@@ -342,17 +344,27 @@ class AmazonClient:
         status_code = 0
         text = ""
 
-        # 1. Try fast direct fetch with curl_cffi
+        # 1. Try fast direct fetch with curl_cffi using Safari TLS profiles (bypasses Amazon Akamai 503 block)
         if HAS_CURL_CFFI:
-            try:
-                async with CurlAsyncSession(impersonate="chrome124") as session:
-                    res = await session.get(url, headers=self.HEADERS, timeout=12)
-                    status_code, text = res.status_code, res.text
-            except Exception as e:
-                print(f"[Amazon Direct curl_cffi Notice] {e}")
+            for profile in ["safari18_0", "safari17_0"]:
+                try:
+                    async with CurlAsyncSession(impersonate=profile) as session:
+                        res = await session.get(url, timeout=12)
+                        status_code, text = res.status_code, res.text
+                        if (
+                            status_code == 200
+                            and text
+                            and "bm-verify" not in text
+                            and "Robot Check" not in text
+                            and "validateCaptcha" not in text
+                            and "automated access" not in text.lower()
+                        ):
+                            return status_code, text
+                except Exception as e:
+                    print(f"[Amazon Direct curl_cffi Notice] {e}")
 
-        # Fallback to httpx if curl_cffi was unavailable or threw exception
-        if not text:
+        # Fallback to httpx if curl_cffi was unavailable or blocked
+        if not text or status_code != 200:
             try:
                 async with httpx.AsyncClient(headers=self.HEADERS, follow_redirects=True, timeout=12.0) as client:
                     res = await client.get(url)
