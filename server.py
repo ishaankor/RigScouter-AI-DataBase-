@@ -206,30 +206,7 @@ async def _run_scrape_and_persist(target_query: str, user_id: str = None, pendin
                 condition="used" if off.get("isRefurbished") else "new"
             )
 
-        # 2. Also ensure base comp_id row exists with best offer and full RetailerOffers in specs
-        hw_payload = {
-            "id": comp_id,
-            "name": best_offer.get("title") or res.get("normalized_query", target_query),
-            "model": res.get("normalized_query", target_query),
-            "category": res.get("category", "Hardware"),
-            "brand": res.get("brand"),
-            "current_price": price,
-            "msrp": msrp,
-            "lowest_price_90d": price,
-            "retailer": best_offer.get("retailer", "Amazon"),
-            "product_url": best_offer.get("url"),
-            "image_url": image_url,
-            "specs": specs_json,
-            "updated_at": now_iso
-        }
-
-        try:
-            await asyncio.to_thread(
-                supabase.table("hardware_components").upsert(hw_payload).execute
-            )
-            print(f"💾 [DB Persisted] Saved component '{hw_payload['name'][:40]}' with {len(offers)} retailer offer(s)")
-        except Exception as db_err:
-            print(f"⚠️ [DB Save Notice] hardware_components: {db_err}")
+        print(f"💾 [DB Persisted] Saved {len(offers)} retailer offer(s) for '{target_query}'")
 
         # 2. Sync to watchlist if this was user-requested
         if user_id:
@@ -690,7 +667,11 @@ async def execute_daily_price_refresh():
                     "specs": specs_json,
                     "updated_at": now_iso
                 }
-                await asyncio.to_thread(supabase.table("hardware_components").update(hw_payload).eq("id", comp_id).execute)
+                best_ret_slug = re.sub(r'[^a-zA-Z0-9]+', '-', best.get("retailer", "Amazon").lower()).strip('-')
+                best_row_id = f"{comp_id}-{best_ret_slug}"
+                await asyncio.to_thread(
+                    supabase.table("hardware_components").update(hw_payload).or_(f"id.eq.{comp_id},id.eq.{best_row_id}").execute
+                )
 
                 # Record snapshots to retailer_products and price_snapshots tables
                 for off in offers:
