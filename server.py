@@ -163,14 +163,35 @@ async def _run_scrape_and_persist(target_query: str, user_id: str = None, pendin
         }
         specs_json = json.dumps(specs_dict)
 
+        valid_prices = [float(o.get("price") or 0.0) for o in offers if float(o.get("price") or 0.0) > 0]
+        max_market_price = max(valid_prices) if valid_prices else price
+        min_market_price = min(valid_prices) if valid_prices else price
+        msrp_candidates = [float(o.get("originalPrice") or 0.0) for o in offers if float(o.get("originalPrice") or 0.0) > max_market_price]
+        global_msrp = max(msrp_candidates) if msrp_candidates else max_market_price
+
         # 1. Upsert all individual retailer offers so every retailer row exists in catalog
         for off in offers:
             ret_name = off.get("retailer", "Unknown")
             ret_slug = re.sub(r'[^a-zA-Z0-9]+', '-', ret_name.lower()).strip('-')
             row_id = f"{comp_id}-{ret_slug}"
             off_price = float(off.get("price") or 0.0)
-            off_msrp = float(off.get("originalPrice") or off_price)
+            off_msrp = float(off.get("originalPrice") or global_msrp)
+            if off_msrp < off_price:
+                off_msrp = global_msrp
             off_img = off.get("imageUrl") or image_url
+
+            # Dynamic Deal Score (50 - 99) based on market arbitrage, MSRP discount, and lowest in group
+            deal_score = 50.0
+            if max_market_price > off_price and max_market_price > 0:
+                spread_pct = ((max_market_price - off_price) / max_market_price) * 100
+                deal_score += min(35.0, spread_pct * 1.15)
+            if off_msrp > off_price and off_msrp > max_market_price:
+                msrp_pct = ((off_msrp - off_price) / off_msrp) * 100
+                deal_score += min(15.0, msrp_pct * 0.5)
+            if len(valid_prices) >= 2 and off_price <= min_market_price + 0.01:
+                deal_score += 10.0
+            final_deal_score = int(round(min(99, max(50, deal_score))))
+
             off_payload = {
                 "id": row_id,
                 "name": off.get("title") or res.get("normalized_query", target_query),
@@ -180,6 +201,7 @@ async def _run_scrape_and_persist(target_query: str, user_id: str = None, pendin
                 "current_price": off_price,
                 "msrp": off_msrp,
                 "lowest_price_90d": off_price,
+                "deal_score": final_deal_score,
                 "retailer": ret_name,
                 "product_url": off.get("url"),
                 "image_url": off_img,
