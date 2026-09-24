@@ -241,8 +241,8 @@ async def _run_scrape_and_persist(target_query: str, user_id: str = None, pendin
                     "category": res.get("category", "Hardware"),
                     "target_price": round(price * 0.95, 2),
                     "previous_price_24h": price,
-                    "previous_price_7d": price,
-                    "previous_price_30d": round(msrp, 2) if msrp > price else price,
+                    "previous_price_7d": None,
+                    "previous_price_30d": None,
                     "all_time_low": price,
                     "added_at": now_iso
                 }
@@ -366,8 +366,8 @@ async def handle_scrape_request(target_query: str, user_id: str = None, pending_
                             "category": match.get("category", "Hardware"),
                             "target_price": round(float(match.get("current_price") or 0) * 0.95, 2),
                             "previous_price_24h": float(match.get("current_price") or 0),
-                            "previous_price_7d": float(match.get("current_price") or 0),
-                            "previous_price_30d": float(match.get("msrp") or match.get("current_price") or 0),
+                            "previous_price_7d": None,
+                            "previous_price_30d": None,
                             "all_time_low": match.get("lowest_price_90d") or match.get("current_price"),
                             "added_at": datetime.now(timezone.utc).isoformat()
                         }
@@ -715,8 +715,6 @@ async def execute_daily_price_refresh():
                 wl_updates = {"all_time_low": new_atl}
                 if old_price > 0:
                     wl_updates["previous_price_24h"] = old_price
-                    wl_updates["previous_price_7d"] = round(old_price * 1.02, 2)
-                    wl_updates["previous_price_30d"] = round(old_price * 1.05, 2)
                 try:
                     base_comp_id = re.sub(r'-(amazon|ebay|micro-center|microcenter|newegg|best-buy|bestbuy|bh|b-h)$', '', comp_id.lower())
                     is_generic_family = any(search_query.strip().lower() == fam for fam in ["ryzen 3", "ryzen 5", "ryzen 7", "ryzen 9", "core i3", "core i5", "core i7", "core i9", "rtx", "geforce", "radeon"])
