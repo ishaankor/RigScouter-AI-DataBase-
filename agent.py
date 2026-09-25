@@ -18,9 +18,11 @@ except Exception:
 
 try:
     from curl_cffi.requests import AsyncSession as CurlAsyncSession
+    from curl_cffi import CurlHttpVersion
     HAS_CURL_CFFI = True
 except ImportError:
     HAS_CURL_CFFI = False
+    CurlHttpVersion = None
 
 load_dotenv()
 
@@ -28,6 +30,30 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 EBAY_CLIENT_ID = os.environ.get("EBAY_CLIENT_ID", "")
 EBAY_CLIENT_SECRET = os.environ.get("EBAY_CLIENT_SECRET", "")
 ZENROWS_API_KEY = os.environ.get("ZENROWS_API_KEY", "91418034a0339b39d3cfab8f77d001a8006896a7")
+ZENROWS_QUOTA_EXHAUSTED = False
+
+TAVILY_API_KEYS = [
+    os.environ.get("TAVILY_API_KEY", ""),
+    "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",
+    "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",
+    "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",
+    "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"
+]
+
+async def query_tavily_search(query: str, max_results: int = 3) -> list[dict]:
+    active_keys = [k for k in TAVILY_API_KEYS if k]
+    for key in active_keys:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                res = await client.post(
+                    "https://api.tavily.com/search",
+                    json={"api_key": key, "query": query, "max_results": max_results}
+                )
+                if res.status_code == 200:
+                    return res.json().get("results", [])
+        except Exception:
+            continue
+    return []
 
 # ─── 1. AI PRODUCT ANALYZER (No hardcoded brands or regexes) ──────────────────
 
@@ -295,17 +321,24 @@ class AmazonClient:
     """High-speed direct Amazon client with zero API rate-limits/credit costs."""
 
     HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         "Accept-Language": "en-US,en;q=0.9",
-        "Sec-Ch-Ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124"',
         "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"macOS"',
+        "Sec-Ch-Ua-Platform": '"Windows"',
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "same-origin",
         "Sec-Fetch-User": "?1",
         "Upgrade-Insecure-Requests": "1",
+        "Referer": "https://www.amazon.com/",
+    }
+
+    SAFARI_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://www.amazon.com/",
     }
 
@@ -315,12 +348,15 @@ class AmazonClient:
         return m.group(1) if m else None
 
     async def _fetch_with_zenrows(self, url: str) -> tuple[int, str]:
+        global ZENROWS_QUOTA_EXHAUSTED
+        if ZENROWS_QUOTA_EXHAUSTED:
+            return 0, ""
         zenrows_key = os.environ.get("ZENROWS_API_KEY", "") or ZENROWS_API_KEY
         if not zenrows_key:
             return 0, ""
         try:
             print(f"[ZenRows Proxy] Routing request via ZenRows (residential stealth mode)...")
-            async with httpx.AsyncClient(timeout=40.0) as client:
+            async with httpx.AsyncClient(timeout=25.0) as client:
                 res = await client.get(
                     "https://api.zenrows.com/v1/",
                     params={
@@ -333,8 +369,9 @@ class AmazonClient:
                 )
                 if res.status_code == 200:
                     return 200, res.text
-                if res.status_code == 402:
-                    print(f"⚠️ [ZenRows Notice] ZenRows monthly quota exceeded (AUTH004).")
+                if res.status_code in [401, 402]:
+                    ZENROWS_QUOTA_EXHAUSTED = True
+                    print(f"⚠️ [ZenRows Notice] ZenRows monthly quota exceeded (AUTH004). Skipping ZenRows for subsequent calls.")
                 return res.status_code, res.text
         except Exception as e:
             print(f"[ZenRows Error] {e}")
@@ -344,12 +381,13 @@ class AmazonClient:
         status_code = 0
         text = ""
 
-        # 1. Try fast direct fetch with curl_cffi using Safari TLS profiles (bypasses Amazon Akamai 503 block)
+        # 1. Try fast direct fetch with curl_cffi using Safari and Chrome TLS profiles
         if HAS_CURL_CFFI:
+            # First try Safari TLS with matching Safari headers
             for profile in ["safari18_0", "safari17_0"]:
                 try:
                     async with CurlAsyncSession(impersonate=profile) as session:
-                        res = await session.get(url, timeout=12)
+                        res = await session.get(url, headers=self.SAFARI_HEADERS, timeout=12)
                         status_code, text = res.status_code, res.text
                         if (
                             status_code == 200
@@ -361,7 +399,25 @@ class AmazonClient:
                         ):
                             return status_code, text
                 except Exception as e:
-                    print(f"[Amazon Direct curl_cffi Notice] {e}")
+                    pass
+
+            # Second try Chrome TLS with Chrome headers
+            for profile in ["chrome124", "chrome120"]:
+                try:
+                    async with CurlAsyncSession(impersonate=profile) as session:
+                        res = await session.get(url, headers=self.HEADERS, timeout=12)
+                        status_code, text = res.status_code, res.text
+                        if (
+                            status_code == 200
+                            and text
+                            and "bm-verify" not in text
+                            and "Robot Check" not in text
+                            and "validateCaptcha" not in text
+                            and "automated access" not in text.lower()
+                        ):
+                            return status_code, text
+                except Exception as e:
+                    pass
 
         # Fallback to httpx if curl_cffi was unavailable or blocked
         if not text or status_code != 200:
@@ -382,8 +438,8 @@ class AmazonClient:
             or "automated access" in text.lower()
         )
 
-        # 2. If blocked, seamlessly fall back to ZenRows anti-bot bypass
-        if is_blocked:
+        # 2. If blocked, fall back to ZenRows residential proxy (if credits remain)
+        if is_blocked and not ZENROWS_QUOTA_EXHAUSTED:
             zenrows_key = os.environ.get("ZENROWS_API_KEY", "") or ZENROWS_API_KEY
             if zenrows_key:
                 print(f"🛡️ [Amazon Direct] Direct request blocked ({status_code}); routing via ZenRows...")
@@ -473,6 +529,33 @@ class AmazonClient:
                 print(f"⚠️ [Amazon Direct] HTTP {status_code} received when fetching ASIN {asin}")
         except Exception as e:
             print(f"[Amazon Direct DP Error] {e}")
+
+        # 3. Intelligent Tavily Search Fallback for Amazon ASIN
+        print(f"🔍 [Amazon Fallback] Querying Tavily cache for ASIN {asin}...")
+        tavily_results = await query_tavily_search(f'site:amazon.com/dp/{asin} price', max_results=3)
+        if not tavily_results:
+            tavily_results = await query_tavily_search(f'"{asin}" amazon price', max_results=3)
+        if tavily_results:
+            for item in tavily_results:
+                txt = (item.get("title") or "") + " " + (item.get("content") or "")
+                pm = re.search(r'\$([0-9,]+\.[0-9]{2})', txt)
+                if pm:
+                    fallback_price = float(pm.group(1).replace(",", ""))
+                    if fallback_price > 10.0:
+                        raw_title = item.get("title", "").replace("Amazon.com:", "").strip()
+                        print(f"✅ [Amazon Tavily Hit] ${fallback_price:.2f} -> {raw_title[:60]}")
+                        return {
+                            "retailer": "Amazon",
+                            "title": raw_title or f"Amazon Product {asin}",
+                            "price": fallback_price,
+                            "originalPrice": None,
+                            "inStock": True,
+                            "isRefurbished": False,
+                            "url": url,
+                            "imageUrl": None,
+                            "brand": None,
+                            "source": "tavily-amazon"
+                        }
 
         return None
 
@@ -803,12 +886,15 @@ class BestBuyClient:
     }
 
     async def _fetch_with_zenrows(self, url: str) -> tuple[int, str]:
+        global ZENROWS_QUOTA_EXHAUSTED
+        if ZENROWS_QUOTA_EXHAUSTED:
+            return 0, ""
         zenrows_key = os.environ.get("ZENROWS_API_KEY", "") or ZENROWS_API_KEY
         if not zenrows_key:
             return 0, ""
         try:
             print(f"[ZenRows Proxy] Routing Best Buy request via ZenRows (residential stealth mode)...")
-            async with httpx.AsyncClient(timeout=40.0) as client:
+            async with httpx.AsyncClient(timeout=25.0) as client:
                 res = await client.get(
                     "https://api.zenrows.com/v1/",
                     params={
@@ -819,6 +905,9 @@ class BestBuyClient:
                         "proxy_country": "us",
                     }
                 )
+                if res.status_code in [401, 402]:
+                    ZENROWS_QUOTA_EXHAUSTED = True
+                    print(f"⚠️ [ZenRows Notice] ZenRows monthly quota exceeded (AUTH004). Skipping ZenRows for subsequent calls.")
                 return res.status_code, res.text
         except Exception as e:
             print(f"[Best Buy ZenRows Fallback Error] {e}")
@@ -828,23 +917,19 @@ class BestBuyClient:
         status_code = 0
         text = ""
 
-        # 1. Primary: Direct curl_cffi Chrome impersonation (0 ZenRows credits used)
+        # 1. Primary: Direct curl_cffi with HTTP/1.1 (prevents curl error 92 HTTP/2 stream reset)
         if HAS_CURL_CFFI:
             try:
+                kwargs = {"headers": self.HEADERS, "timeout": 6}
+                if CurlHttpVersion is not None:
+                    kwargs["http_version"] = CurlHttpVersion.V1_1
                 async with CurlAsyncSession(impersonate="chrome124") as session:
-                    res = await session.get(url, headers=self.HEADERS, timeout=12)
+                    res = await session.get(url, **kwargs)
                     status_code, text = res.status_code, res.text
-            except Exception as e:
-                print(f"[Best Buy curl_cffi Notice] {e}")
-
-        # Fallback to httpx if curl_cffi unavailable
-        if not text:
-            try:
-                async with httpx.AsyncClient(headers=self.HEADERS, follow_redirects=True, timeout=12.0) as client:
-                    res = await client.get(url)
-                    status_code, text = res.status_code, res.text
-            except Exception as e:
-                print(f"[Best Buy httpx Notice] {e}")
+                    if status_code == 200 and text and "access denied" not in text.lower():
+                        return status_code, text
+            except Exception:
+                pass
 
         # Check if Best Buy blocked or challenged the request
         is_blocked = (
@@ -855,8 +940,8 @@ class BestBuyClient:
             or status_code in [403, 429, 503]
         )
 
-        # 2. Secondary: Seamless ZenRows residential proxy fallback
-        if is_blocked:
+        # 2. Secondary: Seamless ZenRows residential proxy fallback (if not exhausted)
+        if is_blocked and not ZENROWS_QUOTA_EXHAUSTED:
             zenrows_key = os.environ.get("ZENROWS_API_KEY", "") or ZENROWS_API_KEY
             if zenrows_key:
                 print(f"🛡️ [Best Buy Direct] Direct request blocked ({status_code}); routing via ZenRows residential proxy...")
@@ -1021,6 +1106,38 @@ class BestBuyClient:
                     }
         except Exception as e:
             print(f"[Best Buy URL Lookup Error] {e}")
+
+        # Fallback: Query Tavily Search for Best Buy product price
+        try:
+            sku_m = re.search(r'/([0-9]{7})(?:\.p|\?)', url) or re.search(r'skuId=([0-9]{7})', url) or re.search(r'([0-9]{7})', url)
+            sku = sku_m.group(1) if sku_m else ""
+            t_query = f'site:bestbuy.com "{sku}"' if sku else f'site:bestbuy.com {url}'
+            print(f"🔍 [Best Buy Fallback] Querying Tavily cache: {t_query[:60]}...")
+            tavily_results = await query_tavily_search(t_query, max_results=2)
+            if tavily_results:
+                for it in tavily_results:
+                    txt = (it.get("title") or "") + " " + (it.get("content") or "")
+                    pm = re.search(r'\$([0-9,]+\.[0-9]{2})', txt)
+                    if pm:
+                        fallback_p = float(pm.group(1).replace(",", ""))
+                        if fallback_p > 10.0:
+                            raw_title = it.get("title", "").replace(" - Best Buy", "").replace("Best Buy:", "").strip()
+                            print(f"✅ [Best Buy Tavily Fallback Hit] ${fallback_p:.2f} -> {raw_title[:60]}")
+                            return {
+                                "retailer": "Best Buy",
+                                "title": raw_title or "Best Buy Hardware",
+                                "price": fallback_p,
+                                "originalPrice": None,
+                                "inStock": True,
+                                "isRefurbished": False,
+                                "url": url,
+                                "imageUrl": None,
+                                "brand": None,
+                                "source": "tavily-bestbuy"
+                            }
+        except Exception as e:
+            print(f"[Best Buy Tavily Fallback Notice] {e}")
+
         return None
 
 

@@ -525,8 +525,12 @@ async def execute_daily_price_refresh():
                             product_url = best_off["url"]
 
                 if new_price <= 0:
-                    print(f"⚠️ [Daily Refresh Notice] No price extracted from {product_url}, retaining ${old_price:.2f}")
-                    continue
+                    if old_price > 0:
+                        new_price = old_price
+                        print(f"ℹ️ [Daily Refresh Retained] \"{comp_name[:40]}\": ${old_price:.2f} (Retailer verification challenged, retaining last verified price)")
+                    else:
+                        print(f"⚠️ [Daily Refresh Notice] No price extracted from {product_url}, skipping.")
+                        continue
 
                 price_changed = abs(new_price - old_price) >= 0.01
                 new_atl = min(old_atl if old_atl > 0 else new_price, new_price)
@@ -742,7 +746,7 @@ async def execute_daily_price_refresh():
                     "retailer": best.get("retailer")
                 })
 
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(1.0)
 
         except Exception as item_err:
             print(f"[Daily Refresh Item Exception] {comp_name}: {item_err}")
@@ -765,37 +769,62 @@ async def execute_daily_price_refresh():
     }
 
 
-async def daily_refresh_background_daemon():
-    """Continuous 24-hour cycle loop that runs as long as the server is alive."""
-    while True:
-        # Sleep for 24 hours (86,400 seconds)
-        await asyncio.sleep(86400)
-        try:
-            await execute_daily_price_refresh()
-        except Exception as e:
-            print(f"[Daily Refresh Daemon Exception] {e}")
+# ─── API Endpoints & Scheduler Mutex ──────────────────────────────────────────
 
-
-# ─── API Endpoints ────────────────────────────────────────────────────────────
+_refresh_lock = asyncio.Lock()
+_is_refresh_running: bool = False
+_last_refresh_completed: datetime | None = None
 
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(sse_publisher())
-    asyncio.create_task(daily_refresh_background_daemon())
 
 
 @app.post("/api/cron/trigger-daily-update")
 @app.get("/api/cron/trigger-daily-update")
 async def api_trigger_daily_update():
     """
-    Triggered daily by GitHub Actions (daily-price-refresh.yml) or external cron services.
-    Kicks off execute_daily_price_refresh in the background and returns an immediate 200 OK.
+    Triggered daily by GitHub Actions (daily-price-refresh.yml).
+    Protected by concurrency lock and a 30-minute debounce to prevent back-to-back duplicate runs.
     """
-    asyncio.create_task(execute_daily_price_refresh())
+    global _is_refresh_running, _last_refresh_completed
+
+    if _is_refresh_running:
+        return {
+            "status": "already_running",
+            "message": "Daily price refresh is already in progress in the background.",
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+
+    now = datetime.now(timezone.utc)
+    if _last_refresh_completed:
+        elapsed_sec = (now - _last_refresh_completed).total_seconds()
+        if elapsed_sec < 1800:
+            mins_ago = int(elapsed_sec / 60)
+            return {
+                "status": "cooldown_skipped",
+                "message": f"Daily price refresh completed {mins_ago} minute(s) ago (30-minute cooldown active). Duplicate run blocked.",
+                "timestamp": now.isoformat()
+            }
+
+    _is_refresh_running = True
+
+    async def _safe_run():
+        global _is_refresh_running, _last_refresh_completed
+        async with _refresh_lock:
+            try:
+                await execute_daily_price_refresh()
+                _last_refresh_completed = datetime.now(timezone.utc)
+            except Exception as ex:
+                print(f"[Daily Refresh Execution Exception] {ex}")
+            finally:
+                _is_refresh_running = False
+
+    asyncio.create_task(_safe_run())
     return {
         "status": "queued",
         "message": "Daily multi-retailer hardware price refresh initiated in background.",
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": now.isoformat()
     }
 
 @app.get("/")
