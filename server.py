@@ -525,6 +525,40 @@ async def execute_daily_price_refresh():
                             product_url = best_off["url"]
 
                 if new_price <= 0:
+                    # ── Fallback: Run normal search scraper via HardwareAgent ──
+                    search_query = comp.get("model") or comp_name
+                    print(f"🔄 [Daily Refresh] Direct URL challenged for \"{comp_name[:45]}\". Falling back to normal scraper...")
+                    try:
+                        search_res = await agent_runner.run(search_query)
+                        scraped_offers = search_res.get("scrapedOffers") or []
+                        if scraped_offers:
+                            # 1. Look for matching offer from current retailer
+                            matched_ret_offer = next((o for o in scraped_offers if o.get("retailer", "").lower() == current_retailer.lower() and float(o.get("price") or 0) > 0), None)
+                            
+                            is_retailer_specific = any(comp_id.endswith(f"-{r}") for r in ["amazon", "ebay", "best-buy", "micro-center", "newegg", "bh"])
+                            if is_retailer_specific and matched_ret_offer:
+                                new_price = float(matched_ret_offer["price"])
+                                if matched_ret_offer.get("url"):
+                                    product_url = matched_ret_offer["url"]
+                                if not primary_offer:
+                                    primary_offer = {}
+                                primary_offer["imageUrl"] = matched_ret_offer.get("imageUrl")
+                                print(f"✅ [Daily Refresh Scraper Hit] Found {current_retailer} price: ${new_price:.2f}")
+                            elif not is_retailer_specific:
+                                best_offer = matched_ret_offer or scraped_offers[0]
+                                new_price = float(best_offer["price"])
+                                current_retailer = best_offer.get("retailer", current_retailer)
+                                if best_offer.get("url"):
+                                    product_url = best_offer["url"]
+                                if not primary_offer:
+                                    primary_offer = {}
+                                primary_offer["imageUrl"] = best_offer.get("imageUrl")
+                                retailer_offers = scraped_offers
+                                print(f"✅ [Daily Refresh Scraper Hit] Best price via normal scraper: ${new_price:.2f} at {current_retailer}")
+                    except Exception as scraper_err:
+                        print(f"⚠️ [Daily Refresh Fallback Notice] Normal scraper exception for {comp_name}: {scraper_err}")
+
+                if new_price <= 0:
                     if old_price > 0:
                         new_price = old_price
                         print(f"ℹ️ [Daily Refresh Retained] \"{comp_name[:40]}\": ${old_price:.2f} (Retailer verification challenged, retaining last verified price)")
