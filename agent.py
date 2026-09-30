@@ -992,6 +992,33 @@ class BestBuyClient:
             pass
         return None
 
+    @staticmethod
+    def _parse_tavily_snippet_prices(txt: str) -> tuple[float | None, float | None]:
+        """Accurately parses current price and original/was price from search snippets without picking up old historic prices."""
+        # 1. Detect 'the price was $XX.XX', 'was $XX.XX', 'regular price $XX.XX'
+        was_matches = re.findall(r"\b(?:the\s+price\s+was|was|regular(?:\s+price)?)\s*:?\s*\$([0-9,]+\.[0-9]{2})", txt, re.I)
+        was_prices = [float(p.replace(",", "")) for p in was_matches]
+
+        # 2. Check for explicit active price prefix ('New $XX.XX', 'Now $XX.XX', 'Sale $XX.XX', 'Current Price $XX.XX')
+        new_m = re.search(r"\b(?:New|Now|Sale|Current(?:\s*Price)?)\s*:?\s*\$([0-9,]+\.[0-9]{2})", txt, re.I)
+
+        # 3. Strip out 'was' prices so we don't accidentally treat stale historic prices as current
+        clean_txt = re.sub(r"\b(?:the\s+price\s+was|was|regular(?:\s+price)?)\s*:?\s*\$[0-9,]+\.[0-9]{2}", "", txt, flags=re.I)
+        active_prices = [float(p.replace(",", "")) for p in re.findall(r'\$([0-9,]+\.[0-9]{2})', clean_txt)]
+        valid_active = [p for p in active_prices if p > 5.0]
+
+        current_price = None
+        if new_m:
+            current_price = float(new_m.group(1).replace(",", ""))
+        elif valid_active:
+            current_price = valid_active[0]
+
+        orig_price = None
+        if was_prices and current_price and was_prices[0] > current_price:
+            orig_price = was_prices[0]
+
+        return current_price, orig_price
+
     async def _fallback_tavily_search(self, analysis: ProductAnalysis) -> dict | None:
         """Automated Tavily search fallback: queries Best Buy catalog via Tavily + priceBlocks API."""
         search_term = analysis.retailer_search_query
@@ -1036,14 +1063,14 @@ class BestBuyClient:
                         img_url = pb_item.get("imageUrl")
                         clean_url = pb_item.get("url") or clean_url
 
-                # 2. Fallback to Tavily content/title price regex
+                # 2. Fallback to smart snippet price extraction
                 if not price:
                     txt = (r.get("title") or "") + " " + (r.get("content") or "")
-                    prices = [float(p.replace(",", "")) for p in re.findall(r'\$([0-9,]+\.[0-9]{2})', txt)]
-                    if prices:
-                        valid_p = [p for p in prices if p > 15.0]
-                        if valid_p:
-                            price = min(valid_p)
+                    s_price, s_orig = self._parse_tavily_snippet_prices(txt)
+                    if s_price:
+                        price = s_price
+                    if s_orig and not orig_price:
+                        orig_price = s_orig
 
                 if price and price > 0:
                     is_valid, reason = ProductAnalyzer.validate_offer(analysis, title, price)
@@ -1265,24 +1292,23 @@ class BestBuyClient:
             if tavily_results:
                 for it in tavily_results:
                     txt = (it.get("title") or "") + " " + (it.get("content") or "")
-                    pm = re.search(r'\$([0-9,]+\.[0-9]{2})', txt)
-                    if pm:
-                        fallback_p = float(pm.group(1).replace(",", ""))
-                        if fallback_p > 10.0:
-                            raw_title = it.get("title", "").replace(" - Best Buy", "").replace("Best Buy:", "").strip()
-                            print(f"✅ [Best Buy Tavily Fallback Hit] ${fallback_p:.2f} -> {raw_title[:60]}")
-                            return {
-                                "retailer": "Best Buy",
-                                "title": raw_title or "Best Buy Hardware",
-                                "price": fallback_p,
-                                "originalPrice": None,
-                                "inStock": True,
-                                "isRefurbished": False,
-                                "url": url,
-                                "imageUrl": None,
-                                "brand": None,
-                                "source": "tavily-bestbuy"
-                            }
+                    s_price, s_orig = self._parse_tavily_snippet_prices(txt)
+                    if s_price and s_price > 10.0:
+                        raw_title = it.get("title", "").replace(" - Best Buy", "").replace("Best Buy:", "").strip()
+                        raw_title = re.sub(r'^(?:Customer Reviews:\s*|Questions and Answers:\s*)', '', raw_title, flags=re.I)
+                        print(f"✅ [Best Buy Tavily Fallback Hit] ${s_price:.2f} -> {raw_title[:60]}")
+                        return {
+                            "retailer": "Best Buy",
+                            "title": raw_title or "Best Buy Hardware",
+                            "price": s_price,
+                            "originalPrice": s_orig,
+                            "inStock": True,
+                            "isRefurbished": False,
+                            "url": url,
+                            "imageUrl": None,
+                            "brand": None,
+                            "source": "tavily-bestbuy"
+                        }
         except Exception as e:
             print(f"[Best Buy Tavily Fallback Notice] {e}")
 
