@@ -311,7 +311,7 @@ async def handle_scrape_request(target_query: str, user_id: str = None, pending_
                         "inStock": True
                     }]
 
-                # Broadcast cached offers over SSE so pending UI listeners immediately update
+                # Broadcast cached offers over SSE so pending UI listeners immediately updates
                 for off in offers:
                     o_price = float(off.get("price") or 0)
                     o_orig = float(off.get("originalPrice") or o_price)
