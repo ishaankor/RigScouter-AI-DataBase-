@@ -920,7 +920,7 @@ class BestBuyClient:
         # 1. Primary: Direct curl_cffi with HTTP/1.1 (prevents curl error 92 HTTP/2 stream reset)
         if HAS_CURL_CFFI:
             try:
-                kwargs = {"headers": self.HEADERS, "timeout": 6}
+                kwargs = {"headers": self.HEADERS, "timeout": 10}
                 if CurlHttpVersion is not None:
                     kwargs["http_version"] = CurlHttpVersion.V1_1
                 async with CurlAsyncSession(impersonate="chrome124") as session:
@@ -951,6 +951,128 @@ class BestBuyClient:
 
         return status_code, text
 
+    async def _lookup_priceblocks_sku(self, sku: str) -> dict | None:
+        """Hits Best Buy's official internal priceBlocks JSON API for exact live price and stock status."""
+        try:
+            url = f"https://www.bestbuy.com/api/3.0/priceBlocks?skus={sku}"
+            headers = {
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            }
+            if HAS_CURL_CFFI:
+                async with CurlAsyncSession(impersonate="chrome124") as session:
+                    res = await session.get(url, headers=headers, timeout=8)
+                    if res.status_code == 200:
+                        data = res.json()
+                        if data and isinstance(data, list) and len(data) > 0:
+                            sku_info = data[0].get("sku", {})
+                            price_info = sku_info.get("price", {})
+                            names = sku_info.get("names", {})
+                            btn = sku_info.get("buttonState", {})
+                            pdp_path = sku_info.get("url", "")
+
+                            c_price = price_info.get("currentPrice")
+                            r_price = price_info.get("regularPrice")
+                            title = names.get("short") or names.get("title")
+                            in_stock = btn.get("purchasable", True)
+
+                            if c_price and title:
+                                p_url = f"https://www.bestbuy.com{pdp_path}" if pdp_path.startswith("/") else (pdp_path or f"https://www.bestbuy.com/site/{sku}.p")
+                                img_url = f"https://pisces.bbystatic.com/image2/BestBuy_US/images/products/{sku[:4]}/{sku}_sd.jpg"
+                                return {
+                                    "title": title,
+                                    "price": float(c_price),
+                                    "originalPrice": float(r_price) if r_price else None,
+                                    "inStock": in_stock,
+                                    "url": p_url,
+                                    "imageUrl": img_url,
+                                    "sku": sku
+                                }
+        except Exception:
+            pass
+        return None
+
+    async def _fallback_tavily_search(self, analysis: ProductAnalysis) -> dict | None:
+        """Automated Tavily search fallback: queries Best Buy catalog via Tavily + priceBlocks API."""
+        search_term = analysis.retailer_search_query
+        print(f"🛡️ [Best Buy Fallback] Querying Best Buy via Tavily: \"{search_term}\"...")
+        t_query = f'site:bestbuy.com {search_term} price'
+
+        try:
+            results = await query_tavily_search(t_query, max_results=6)
+            if not results:
+                return None
+
+            candidates = []
+            for r in results:
+                u = r.get("url", "")
+                if "bestbuy.com" not in u or "/site/searchpage" in u or "/questions/" in u:
+                    continue
+
+                # Normalize review URLs to canonical product URLs
+                clean_url = u.replace("/site/reviews/", "/site/").replace("/reviews/", "/")
+
+                # Check for 7-digit SKU in URL
+                sku_m = re.search(r'/([0-9]{7})(?:\.p|\?)', clean_url) or re.search(r'sku(?:Id)?(?:/|=)([0-9]{7})', clean_url) or re.search(r'/([0-9]{7})', clean_url)
+                sku = sku_m.group(1) if sku_m else None
+
+                title = r.get("title", "")
+                title = re.sub(r'^(?:Customer Reviews:\s*|Questions and Answers:\s*)', '', title, flags=re.I)
+                title = re.sub(r'\s*-\s*Best\s*Buy.*$', '', title, flags=re.I).strip()
+
+                price = None
+                orig_price = None
+                in_stock = True
+                img_url = None
+
+                # 1. Try official priceBlocks API if SKU is extracted
+                if sku:
+                    pb_item = await self._lookup_priceblocks_sku(sku)
+                    if pb_item:
+                        title = pb_item.get("title") or title
+                        price = pb_item.get("price")
+                        orig_price = pb_item.get("originalPrice")
+                        in_stock = pb_item.get("inStock", True)
+                        img_url = pb_item.get("imageUrl")
+                        clean_url = pb_item.get("url") or clean_url
+
+                # 2. Fallback to Tavily content/title price regex
+                if not price:
+                    txt = (r.get("title") or "") + " " + (r.get("content") or "")
+                    prices = [float(p.replace(",", "")) for p in re.findall(r'\$([0-9,]+\.[0-9]{2})', txt)]
+                    if prices:
+                        valid_p = [p for p in prices if p > 15.0]
+                        if valid_p:
+                            price = min(valid_p)
+
+                if price and price > 0:
+                    is_valid, reason = ProductAnalyzer.validate_offer(analysis, title, price)
+                    if is_valid:
+                        candidates.append({
+                            "retailer": "Best Buy",
+                            "title": title,
+                            "price": price,
+                            "originalPrice": orig_price,
+                            "inStock": in_stock,
+                            "isRefurbished": any(w in title.lower() for w in ["refurbished", "open-box", "open box"]),
+                            "url": clean_url,
+                            "imageUrl": img_url,
+                            "brand": analysis.brand,
+                            "source": "bestbuy-fallback"
+                        })
+                    else:
+                        print(f"[Best Buy Filtered] Skipping '{title[:50]}...': {reason}")
+
+            if candidates:
+                candidates.sort(key=lambda x: x["price"])
+                best = candidates[0]
+                print(f"✅ [Best Buy Fallback Hit] ${best['price']:.2f} -> {best['title'][:60]}")
+                return best
+        except Exception as e:
+            print(f"[Best Buy Fallback Notice] {e}")
+
+        return None
+
     async def search(self, analysis: ProductAnalysis) -> dict | None:
         search_term = analysis.retailer_search_query
         print(f"[Best Buy Direct] Searching for '{search_term}'...")
@@ -960,8 +1082,8 @@ class BestBuyClient:
         try:
             status_code, text = await self._fetch_html(url)
             if status_code != 200 or not text:
-                print(f"⚠️ [Best Buy Direct] Failed to fetch search results for '{search_term}' (HTTP {status_code})")
-                return None
+                print(f"ℹ️ [Best Buy Direct] Search unavailable (HTTP {status_code}); switching to Best Buy fallback...")
+                return await self._fallback_tavily_search(analysis)
 
             # 1. Map skuId -> price from embedded pricing objects
             sku_prices = {}
@@ -1060,14 +1182,38 @@ class BestBuyClient:
                 print(f"✅ [Best Buy Hit] ${best['price']:.2f} -> {best['title'][:60]}")
                 return best
             else:
-                print(f"[Best Buy Direct] 0 valid standalone offers found for '{search_term}'")
+                print(f"[Best Buy Direct] 0 valid standalone offers found for '{search_term}'; engaging fallback...")
+                return await self._fallback_tavily_search(analysis)
         except Exception as e:
-            print(f"[Best Buy Direct Search Error] {e}")
+            print(f"[Best Buy Direct Search Notice] {e}; switching to fallback...")
+            return await self._fallback_tavily_search(analysis)
 
         return None
 
     async def lookup_url(self, url: str) -> dict | None:
         target_url = url + ("&intl=nosplash" if "?" in url else "?intl=nosplash") if "nosplash" not in url else url
+
+        # 1. Quick PriceBlocks API lookup if SKU is in the URL
+        sku_m = re.search(r'/([0-9]{7})(?:\.p|\?)', url) or re.search(r'sku(?:Id)?(?:/|=)([0-9]{7})', url) or re.search(r'([0-9]{7})', url)
+        sku = sku_m.group(1) if sku_m else ""
+        if sku:
+            pb_item = await self._lookup_priceblocks_sku(sku)
+            if pb_item:
+                print(f"✅ [Best Buy SKU Hit] ${pb_item['price']:.2f} -> {pb_item['title'][:60]}")
+                return {
+                    "retailer": "Best Buy",
+                    "title": pb_item["title"],
+                    "price": pb_item["price"],
+                    "originalPrice": pb_item.get("originalPrice"),
+                    "inStock": pb_item.get("inStock", True),
+                    "isRefurbished": any(w in pb_item["title"].lower() for w in ["refurbished", "open-box", "open box"]),
+                    "url": pb_item.get("url") or url,
+                    "imageUrl": pb_item.get("imageUrl"),
+                    "brand": None,
+                    "source": "bestbuy-api"
+                }
+
+        # 2. Try direct HTML fetch
         try:
             status_code, text = await self._fetch_html(target_url)
             if status_code == 200 and text:
@@ -1107,13 +1253,15 @@ class BestBuyClient:
         except Exception as e:
             print(f"[Best Buy URL Lookup Error] {e}")
 
-        # Fallback: Query Tavily Search for Best Buy product price
+        # 3. Fallback: Query Tavily Search with product keywords extracted from URL
         try:
-            sku_m = re.search(r'/([0-9]{7})(?:\.p|\?)', url) or re.search(r'skuId=([0-9]{7})', url) or re.search(r'([0-9]{7})', url)
-            sku = sku_m.group(1) if sku_m else ""
-            t_query = f'site:bestbuy.com "{sku}"' if sku else f'site:bestbuy.com {url}'
+            slug = re.sub(r'https?://(?:www\.)?bestbuy\.com/(?:site/|product/)?', '', url)
+            clean_slug = re.sub(r'[-_/]+', ' ', slug).replace('.p', '').strip()
+            clean_slug = ' '.join([w for w in clean_slug.split() if not w.isdigit() and len(w) > 1][:6])
+
+            t_query = f'site:bestbuy.com "{sku}"' if sku else f'site:bestbuy.com {clean_slug} price'
             print(f"🔍 [Best Buy Fallback] Querying Tavily cache: {t_query[:60]}...")
-            tavily_results = await query_tavily_search(t_query, max_results=2)
+            tavily_results = await query_tavily_search(t_query, max_results=3)
             if tavily_results:
                 for it in tavily_results:
                     txt = (it.get("title") or "") + " " + (it.get("content") or "")
