@@ -30,7 +30,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 EBAY_CLIENT_ID = os.environ.get("EBAY_CLIENT_ID", "")
 EBAY_CLIENT_SECRET = os.environ.get("EBAY_CLIENT_SECRET", "")
 ZENROWS_API_KEY = os.environ.get("ZENROWS_API_KEY", "91418034a0339b39d3cfab8f77d001a8006896a7")
-ZENROWS_QUOTA_EXHAUSTED = False
+ZENROWS_QUOTA_EXHAUSTED = True
 
 TAVILY_API_KEYS = [
     os.environ.get("TAVILY_API_KEY", ""),
@@ -238,9 +238,12 @@ class ProductAnalyzer:
             # Direct platform/system keywords
             system_words = [
                 "laptop", "notebook", "desktop pc", "gaming pc", "gaming desktop",
-                "computer", "barebone", "all-in-one", "aio pc", "gaming host",
-                "workstation pc"
+                "computer", "barebone", "aio pc", "aio desktop", "all-in-one pc", "all-in-one desktop",
+                "gaming host", "workstation pc"
             ]
+            if analysis.category != "Cooling":
+                system_words.extend(["all-in-one", "aio"])
+
             for sw in system_words:
                 if sw in title_lower and sw not in raw_lower:
                     return False, f"System/platform keyword detected: '{sw}'"
@@ -302,13 +305,74 @@ class ProductAnalyzer:
                     if mg in title_lower and mg not in raw_lower:
                         return False, f"Mobile/Laptop-only GPU detected: '{mg}'"
 
-        # 8. Model match check
+        # 8. Brand Conflict and Core Model Verification
+        GENERIC_HARDWARE_WORDS = {
+            "liquid", "air", "cooler", "cooling", "fan", "fans", "aio", "argb", "rgb",
+            "cpu", "gpu", "ram", "ssd", "nvme", "psu", "power", "supply", "case", "chassis",
+            "edition", "series", "black", "white", "pro", "plus", "max", "super", "ultra",
+            "ti", "xt", "xtx", "v2", "v3", "internal", "external", "drive", "card", "board",
+            "desktop", "pc", "gaming", "heatsink", "heat", "pipe", "pipes", "radiator",
+            "technology", "speeds", "up", "to", "speeds", "gen", "pci", "express", "pcie"
+        }
+
+        PRIMARY_BRANDS = [
+            "arctic", "thermalright", "corsair", "nzxt", "cooler master", "deepcool",
+            "be quiet", "lian li", "noctua", "ekwb", "ek", "phanteks", "montech",
+            "silverstone", "thermaltake", "id-cooling", "valkyrie", "antec", "zalman",
+            "nvidia", "amd", "intel", "asus", "msi", "gigabyte", "zotac", "pny",
+            "palit", "gainward", "inno3d", "galax", "kfa2", "asrock", "sapphire",
+            "powercolor", "xfx", "evga",
+            "samsung", "crucial", "western digital", "wd", "seagate", "sk hynix",
+            "sabrent", "kingston", "teamgroup", "g.skill", "gskill", "patriot",
+            "adata", "lexar", "klevv", "silicon power", "solidigm", "kioxia",
+            "seasonic", "super flower", "fractal design", "fractal", "enermax", "fsp"
+        ]
+
+        b_lower = (analysis.brand or "").lower().strip()
+        if b_lower:
+            # A. Brand conflict check: if listing contains a known competitor brand, reject immediately!
+            for cb in PRIMARY_BRANDS:
+                if cb != b_lower and re.search(r'\b' + re.escape(cb) + r'\b', title_lower):
+                    if not re.search(r'\b' + re.escape(b_lower) + r'\b', title_lower):
+                        return False, f"Competitor brand conflict: query requires '{analysis.brand}' but title is '{cb}'"
+
+            # Specific famous product line family ownership (blocks cross-brand leaks like Aqua Elite vs Liquid Freezer)
+            if analysis.category == "Cooling":
+                COOLER_FAMILIES = {
+                    "aqua elite": "thermalright", "peerless assassin": "thermalright",
+                    "phantom spirit": "thermalright", "frozen notte": "thermalright",
+                    "frozen warframe": "thermalright", "frozen edge": "thermalright",
+                    "liquid freezer": "arctic", "freezer iii": "arctic", "freezer ii": "arctic",
+                    "kraken": "nzxt", "hyper 212": "cooler master",
+                    "pure rock": "be quiet", "dark rock": "be quiet", "shadow rock": "be quiet",
+                    "pure loop": "be quiet", "silent loop": "be quiet",
+                    "nh-d15": "noctua", "nh-u12a": "noctua", "nh-l9": "noctua",
+                    "galahad": "lian li", "hydro series": "corsair", "icue link": "corsair",
+                    "nautilus": "corsair", "v8 ace": "cooler master"
+                }
+                for fam, fam_brand in COOLER_FAMILIES.items():
+                    if fam in title_lower and fam_brand != b_lower:
+                        if not re.search(r'\b' + re.escape(b_lower) + r'\b', title_lower):
+                            return False, f"Competitor cooler line conflict: '{fam}' belongs to {fam_brand.title()}, not {analysis.brand}"
+
+        # B. Distinctive model token check
         model_tokens = [t.lower() for t in re.split(r'[^a-zA-Z0-9]+', analysis.model) if len(t) > 1]
+        distinctive_tokens = [t for t in model_tokens if t not in GENERIC_HARDWARE_WORDS]
+
+        # If brand is omitted from title, ALL distinctive model tokens MUST match (e.g. 'freezer' for Liquid Freezer)
+        if b_lower and not re.search(r'\b' + re.escape(b_lower) + r'\b', title_lower):
+            if distinctive_tokens and not all(dt in title_lower for dt in distinctive_tokens):
+                missing = [dt for dt in distinctive_tokens if dt not in title_lower]
+                return False, f"Missing brand '{analysis.brand}' and distinctive model token(s): {missing}"
+
+        # C. Required digit tokens (e.g. 360, 240, 4070, 990, 850)
+        digit_tokens = [tok for tok in model_tokens if any(c.isdigit() for c in tok)]
+        if digit_tokens and not all(dt in title_lower for dt in digit_tokens):
+            return False, f"Missing required model token: {digit_tokens}"
+
+        # D. General token match count
         if model_tokens:
             matches = sum(1 for tok in model_tokens if tok in title_lower)
-            digit_tokens = [tok for tok in model_tokens if any(c.isdigit() for c in tok)]
-            if digit_tokens and not all(dt in title_lower for dt in digit_tokens):
-                return False, f"Missing required model token: {digit_tokens}"
             if matches < max(1, len(model_tokens) // 2):
                 return False, f"Insufficient model token match ({matches}/{len(model_tokens)})"
 
@@ -974,7 +1038,8 @@ class BestBuyClient:
                             c_price = price_info.get("currentPrice")
                             r_price = price_info.get("regularPrice")
                             title = names.get("short") or names.get("title")
-                            in_stock = btn.get("purchasable", True)
+                            btn_state = str(btn.get("buttonState", "")).upper()
+                            in_stock = bool(btn.get("purchasable", False) and btn_state in ["ADD_TO_CART", "PRE_ORDER"])
 
                             if c_price and title:
                                 p_url = f"https://www.bestbuy.com{pdp_path}" if pdp_path.startswith("/") else (pdp_path or f"https://www.bestbuy.com/site/{sku}.p")
@@ -1039,8 +1104,8 @@ class BestBuyClient:
                 # Normalize review URLs to canonical product URLs
                 clean_url = u.replace("/site/reviews/", "/site/").replace("/reviews/", "/")
 
-                # Check for 7-digit SKU in URL
-                sku_m = re.search(r'/([0-9]{7})(?:\.p|\?)', clean_url) or re.search(r'sku(?:Id)?(?:/|=)([0-9]{7})', clean_url) or re.search(r'/([0-9]{7})', clean_url)
+                # Check for 6-8 digit SKU in URL
+                sku_m = re.search(r'/([0-9]{6,8})(?:\.p|\?)', clean_url) or re.search(r'sku(?:Id)?(?:/|=)([0-9]{6,8})', clean_url) or re.search(r'/([0-9]{6,8})', clean_url)
                 sku = sku_m.group(1) if sku_m else None
 
                 title = r.get("title", "")
@@ -1064,13 +1129,23 @@ class BestBuyClient:
                         clean_url = pb_item.get("url") or clean_url
 
                 # 2. Fallback to smart snippet price extraction
+                txt = (r.get("title") or "") + " " + (r.get("content") or "")
                 if not price:
-                    txt = (r.get("title") or "") + " " + (r.get("content") or "")
                     s_price, s_orig = self._parse_tavily_snippet_prices(txt)
                     if s_price:
                         price = s_price
                     if s_orig and not orig_price:
                         orig_price = s_orig
+
+                # Check snippet for discontinued or sold-out indicators
+                if any(phrase in txt.lower() for phrase in [
+                    "no longer available in new condition",
+                    "no longer available",
+                    "sold out",
+                    "currently unavailable",
+                    "not available in new condition"
+                ]):
+                    in_stock = False
 
                 if price and price > 0:
                     is_valid, reason = ProductAnalyzer.validate_offer(analysis, title, price)
@@ -1091,9 +1166,11 @@ class BestBuyClient:
                         print(f"[Best Buy Filtered] Skipping '{title[:50]}...': {reason}")
 
             if candidates:
-                candidates.sort(key=lambda x: x["price"])
+                # Prioritize in-stock candidates first, then lowest price
+                candidates.sort(key=lambda x: (not x.get("inStock", True), x["price"]))
                 best = candidates[0]
-                print(f"✅ [Best Buy Fallback Hit] ${best['price']:.2f} -> {best['title'][:60]}")
+                status_note = "" if best.get("inStock", True) else " [Out of Stock]"
+                print(f"✅ [Best Buy Fallback Hit] ${best['price']:.2f}{status_note} -> {best['title'][:60]}")
                 return best
         except Exception as e:
             print(f"[Best Buy Fallback Notice] {e}")
@@ -1156,12 +1233,25 @@ class BestBuyClient:
                     print(f"[Best Buy Filtered] Skipping '{title[:50]}...': {reason}")
                     continue
 
+                btn_m = re.search(r'\"buttonState\":\s*\"([^\"]+)\"', chunk)
+                btn_state = (btn_m.group(1) if btn_m else "").upper()
+                is_sold_out = btn_state in ["SOLD_OUT", "UNAVAILABLE", "NOT_ORDERABLE"] or any(
+                    phrase in chunk.lower() for phrase in [
+                        "no longer available in new condition",
+                        "no longer available",
+                        "sold out",
+                        "currently unavailable",
+                        "not available in new condition"
+                    ]
+                )
+                in_stock = not is_sold_out
+
                 valid_offers.append({
                     "retailer": "Best Buy",
                     "title": title,
                     "price": price,
                     "originalPrice": None,
-                    "inStock": True,
+                    "inStock": in_stock,
                     "isRefurbished": any(w in title.lower() for w in ["refurbished", "open-box", "open box"]),
                     "url": pdp_url,
                     "imageUrl": img_url,
@@ -1190,12 +1280,24 @@ class BestBuyClient:
                     img_el = sku_b.find("img") if sku_b else None
                     p_img = img_el.get("src") if img_el else None
 
+                    info_txt = info.get_text().lower()
+                    is_sold_out = any(
+                        phrase in info_txt for phrase in [
+                            "no longer available in new condition",
+                            "no longer available",
+                            "sold out",
+                            "currently unavailable",
+                            "not available in new condition"
+                        ]
+                    )
+                    in_stock = not is_sold_out
+
                     valid_offers.append({
                         "retailer": "Best Buy",
                         "title": t,
                         "price": p_val,
                         "originalPrice": None,
-                        "inStock": True,
+                        "inStock": in_stock,
                         "isRefurbished": any(w in t.lower() for w in ["refurbished", "open-box", "open box"]),
                         "url": p_link,
                         "imageUrl": p_img,
@@ -1204,9 +1306,10 @@ class BestBuyClient:
                     })
 
             if valid_offers:
-                valid_offers.sort(key=lambda x: x["price"])
+                valid_offers.sort(key=lambda x: (not x.get("inStock", True), x["price"]))
                 best = valid_offers[0]
-                print(f"✅ [Best Buy Hit] ${best['price']:.2f} -> {best['title'][:60]}")
+                status_note = "" if best.get("inStock", True) else " [Out of Stock]"
+                print(f"✅ [Best Buy Hit] ${best['price']:.2f}{status_note} -> {best['title'][:60]}")
                 return best
             else:
                 print(f"[Best Buy Direct] 0 valid standalone offers found for '{search_term}'; engaging fallback...")
@@ -1220,13 +1323,14 @@ class BestBuyClient:
     async def lookup_url(self, url: str) -> dict | None:
         target_url = url + ("&intl=nosplash" if "?" in url else "?intl=nosplash") if "nosplash" not in url else url
 
-        # 1. Quick PriceBlocks API lookup if SKU is in the URL
-        sku_m = re.search(r'/([0-9]{7})(?:\.p|\?)', url) or re.search(r'sku(?:Id)?(?:/|=)([0-9]{7})', url) or re.search(r'([0-9]{7})', url)
+        # 1. Quick PriceBlocks API lookup if SKU is in the URL (6 to 8 digits)
+        sku_m = re.search(r'/([0-9]{6,8})(?:\.p|\?)', url) or re.search(r'sku(?:Id)?(?:/|=)([0-9]{6,8})', url) or re.search(r'\b([0-9]{6,8})\b', url)
         sku = sku_m.group(1) if sku_m else ""
         if sku:
             pb_item = await self._lookup_priceblocks_sku(sku)
             if pb_item:
-                print(f"✅ [Best Buy SKU Hit] ${pb_item['price']:.2f} -> {pb_item['title'][:60]}")
+                status_note = "" if pb_item.get("inStock", True) else " [Out of Stock]"
+                print(f"✅ [Best Buy SKU Hit] ${pb_item['price']:.2f}{status_note} -> {pb_item['title'][:60]}")
                 return {
                     "retailer": "Best Buy",
                     "title": pb_item["title"],
@@ -1264,13 +1368,22 @@ class BestBuyClient:
                 if img_m:
                     img = img_m.group(1)
 
+                is_sold_out = any(phrase in text.lower() for phrase in [
+                    "no longer available in new condition",
+                    "no longer available",
+                    "sold out",
+                    "currently unavailable",
+                    "not available in new condition"
+                ])
+                in_stock = not is_sold_out
+
                 if title and price:
                     return {
                         "retailer": "Best Buy",
                         "title": title,
                         "price": price,
                         "originalPrice": None,
-                        "inStock": True,
+                        "inStock": in_stock,
                         "isRefurbished": any(w in title.lower() for w in ["refurbished", "open-box", "open box"]),
                         "url": url,
                         "imageUrl": img,
@@ -1296,13 +1409,22 @@ class BestBuyClient:
                     if s_price and s_price > 10.0:
                         raw_title = it.get("title", "").replace(" - Best Buy", "").replace("Best Buy:", "").strip()
                         raw_title = re.sub(r'^(?:Customer Reviews:\s*|Questions and Answers:\s*)', '', raw_title, flags=re.I)
-                        print(f"✅ [Best Buy Tavily Fallback Hit] ${s_price:.2f} -> {raw_title[:60]}")
+                        is_sold_out = any(phrase in txt.lower() for phrase in [
+                            "no longer available in new condition",
+                            "no longer available",
+                            "sold out",
+                            "currently unavailable",
+                            "not available in new condition"
+                        ])
+                        in_stock = not is_sold_out
+                        status_note = "" if in_stock else " [Out of Stock]"
+                        print(f"✅ [Best Buy Tavily Fallback Hit] ${s_price:.2f}{status_note} -> {raw_title[:60]}")
                         return {
                             "retailer": "Best Buy",
                             "title": raw_title or "Best Buy Hardware",
                             "price": s_price,
                             "originalPrice": s_orig,
-                            "inStock": True,
+                            "inStock": in_stock,
                             "isRefurbished": False,
                             "url": url,
                             "imageUrl": None,
@@ -1502,8 +1624,8 @@ class HardwareAgent:
                         "offer": res
                     })
 
-        # 3. Sort offers by price ascending
-        scraped_offers.sort(key=lambda x: x["price"])
+        # 3. Sort offers: in-stock offers first, then ascending price
+        scraped_offers.sort(key=lambda x: (not x.get("inStock", True), x["price"]))
 
         # 4. Generate Summary
         if scraped_offers:
