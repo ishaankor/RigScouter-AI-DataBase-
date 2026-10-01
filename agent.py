@@ -154,229 +154,111 @@ class ProductAnalyzer:
         return ProductAnalysis(clean, None, clean, "Hardware", True, clean, [])
 
     @staticmethod
-    def validate_offer(analysis: ProductAnalysis, title: str, price: float) -> tuple[bool, str]:
-        """Strictly validates whether a retailer product candidate is genuine."""
+    def validate_offer_fast(analysis: ProductAnalysis, title: str, price: float) -> tuple[bool, str]:
+        """Lightweight fast-fail: only rejects $0 prices, obvious dummy items, and price-floor violations.
+        Real semantic validation is handled by validate_candidates_llm()."""
         title_lower = title.lower()
 
-        # 1. Price check: reject $0 or negative
         if price <= 0:
             return False, "Price is 0 or negative"
 
-        # 2. Universal dummy / replica / toy / packaging / broken exclusion patterns
+        # Hard dummy/replica/toy patterns — these are never real hardware regardless of context
         dummy_patterns = [
-            "replica", "scale replica", "scale model", "1:1 scale", "dummy", "mockup",
-            "toy", "miniature", "3d print", "3d printed", "prop", "fun display",
-            "display only", "display model", "box only", "empty box", "packaging only",
-            "for parts", "parts only", "not working", "broken", "as is", "as-is",
+            "replica", "1:1 scale", "scale model", "dummy", "mockup", "toy",
+            "3d print", "3d printed", "prop", "display only", "box only", "empty box",
+            "packaging only", "for parts", "parts only", "not working", "broken",
             "poster", "keychain", "sticker", "t-shirt", "hoodie", "mug"
         ]
         for dp in dummy_patterns:
             if re.search(r'\b' + re.escape(dp) + r'\b', title_lower):
                 if dp not in analysis.raw_query.lower():
-                    return False, f"Rejection pattern detected: '{dp}'"
+                    return False, f"Dummy/non-hardware item: '{dp}'"
 
-        # 3. Dynamic AI price floor (rejects accessories, toys, or brackets posing as main hardware)
+        # Price floor (rejects accessories and toy replicas priced way below realistic market value)
         if analysis.min_price and analysis.min_price > 0:
             floor_threshold = analysis.min_price * 0.4
             if price < floor_threshold:
-                return False, f"Price ${price:.2f} is suspiciously below minimum hardware threshold (${floor_threshold:.2f}) for {analysis.model}"
+                return False, f"Price ${price:.2f} is below hardware floor (${floor_threshold:.2f}) for {analysis.model}"
 
-        # 4. Rejection keywords check from analysis
-        for neg in analysis.negative_keywords:
-            neg_lower = neg.lower()
-            if re.search(r'\b' + re.escape(neg_lower) + r'\b', title_lower):
-                if neg_lower not in analysis.model.lower():
-                    return False, f"Matches negative keyword: '{neg}'"
+        return True, "Passed fast-fail"
 
-        # 5. Category sanity checks
-        if analysis.category == "Case":
-            if price > 600 and any(w in title_lower for w in ["gaming pc", "desktop pc", "ryzen", "rtx", "intel core"]):
-                return False, f"Prebuilt PC detected instead of standalone Case (${price:.2f})"
-        elif analysis.category == "CPU":
-            if any(w in title_lower for w in ["cooler only", "mounting bracket", "delid tool", "contact frame", "thermal paste"]):
-                return False, "Accessory / cooler detected instead of CPU"
+    @staticmethod
+    async def validate_candidates_llm(
+        candidates: list[dict],
+        analysis: ProductAnalysis
+    ) -> list[dict]:
+        """Uses the LLM to semantically validate a batch of raw retailer candidates.
+        Returns only the candidates that the LLM confirms are a genuine match."""
+        if not candidates:
+            return []
+        if not GROQ_API_KEY:
+            # No LLM available — pass everything through so we don't block scrapes
+            return candidates
 
-            # CPU tier mismatch check (e.g. Ryzen 7 query vs Ryzen 5 listing, or Core i7 vs Core i5)
-            def extract_cpu_tier(text: str) -> str | None:
-                m_r = re.search(r'\b(ryzen\s*[3579]|r[3579])\b', text, re.I)
-                if m_r: return re.sub(r'\s+', '', m_r.group(0).lower()).replace('r', 'ryzen')
-                m_i = re.search(r'\b(core\s*i[3579]|i[3579]-?\d{4,5})\b', text, re.I)
-                if m_i: return re.sub(r'[- ]', '', m_i.group(1).lower())
-                m_u = re.search(r'\bultra\s*[579]\b', text, re.I)
-                if m_u: return re.sub(r'\s+', '', m_u.group(0).lower())
-                return None
+        # Build a numbered list for the LLM to evaluate
+        lines = []
+        for i, c in enumerate(candidates):
+            lines.append(f"{i+1}. [{c['retailer']}] \"{c['title']}\" — ${c['price']:.2f}")
+        candidate_list = "\n".join(lines)
 
-            q_tier = extract_cpu_tier(analysis.model) or extract_cpu_tier(analysis.raw_query)
-            t_tier = extract_cpu_tier(title)
-            if q_tier and t_tier and q_tier != t_tier:
-                return False, f"CPU tier mismatch: Query requires '{q_tier.upper()}' but title is '{t_tier.upper()}'"
-        elif analysis.category == "GPU":
-            gpu_accessories = [
-                "bracket", "gpu sag", "backplate", "fan replacement", "cooler only",
-                "heatsink", "shroud", "thermal pad", "water block"
-            ]
-            if any(re.search(r'\b' + re.escape(acc) + r'\b', title_lower) for acc in gpu_accessories):
-                if not any(acc in analysis.raw_query.lower() for acc in gpu_accessories):
-                    return False, "GPU accessory/parts detected instead of Graphics Card"
+        system_prompt = (
+            "You are a senior PC hardware expert and procurement analyst. "
+            "Your job is to review a numbered list of retailer search results and decide which ones are a genuine match "
+            "for the user's search query. A genuine match must:\n"
+            "1. Be the exact product (correct brand, model line, and variant) — not a different tier, sub-variant, or accessory.\n"
+            "2. Be a standalone retail unit — not a prebuilt PC, laptop, bundle, upgrade kit, display prop, or broken/parts item.\n"
+            "3. Have a price consistent with the real market for this product.\n\n"
+            "Be lenient about brand name formatting quirks (e.g. 'be quiet!' vs 'be quiet', 'NVIDIA' in the title of a third-party card). "
+            "Be strict about wrong product tier (e.g. RTX 4070 Ti when query is RTX 4070) or wrong product category (e.g. laptop returned for GPU search).\n\n"
+            "Return valid JSON only: {\"valid_indices\": [list of 1-based indices of valid results], \"reasons\": {\"index\": \"brief reason if rejected\"}}"
+        )
 
-        # 6. GPU Sub-tier modifier check (prevents 3060 matching 3060 Ti, or 4070 matching 4070 Super)
-        if analysis.category == "GPU":
-            modifiers = ["ti", "super", "xtx", "xt", "gre"]
-            for mod in modifiers:
-                mod_pat = r'\b' + re.escape(mod) + r'\b'
-                in_model = bool(re.search(mod_pat, analysis.model.lower()))
-                in_title = bool(re.search(mod_pat, title_lower))
-                if in_title and not in_model:
-                    return False, f"Title has sub-tier '{mod.upper()}' but query does not"
-                if in_model and not in_title:
-                    return False, f"Query requires sub-tier '{mod.upper()}' but title is missing it"
+        user_prompt = (
+            f"Search query: \"{analysis.raw_query}\"\n"
+            f"Brand: {analysis.brand or 'unknown'} | Model: {analysis.model} | Category: {analysis.category}\n\n"
+            f"Candidates:\n{candidate_list}\n\n"
+            "Which of these are a genuine match? Return JSON."
+        )
 
-        # 7. Whole PC / Laptop / System / Platform check for standalone components
-        if analysis.category in ["GPU", "CPU", "RAM", "Power Supply", "Storage", "Cooling", "Motherboard"]:
-            raw_lower = analysis.raw_query.lower()
+        models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b"]
+        for model_name in models:
+            try:
+                async with httpx.AsyncClient() as client:
+                    res = await client.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                        json={
+                            "model": model_name,
+                            "messages": [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt}
+                            ],
+                            "temperature": 0,
+                            "response_format": {"type": "json_object"}
+                        },
+                        timeout=12.0
+                    )
+                if res.status_code == 200:
+                    data = json.loads(res.json()["choices"][0]["message"]["content"])
+                    valid_indices = set(data.get("valid_indices") or [])
+                    reasons = data.get("reasons") or {}
 
-            # Direct platform/system keywords
-            system_words = [
-                "laptop", "notebook", "desktop pc", "gaming pc", "gaming desktop",
-                "computer", "barebone", "aio pc", "aio desktop", "all-in-one pc", "all-in-one desktop",
-                "gaming host", "workstation pc"
-            ]
-            if analysis.category != "Cooling":
-                system_words.extend(["all-in-one", "aio"])
+                    validated = []
+                    for i, c in enumerate(candidates):
+                        idx = i + 1
+                        if idx in valid_indices:
+                            validated.append(c)
+                        else:
+                            reason = reasons.get(str(idx), "Rejected by LLM")
+                            print(f"[LLM Filtered] [{c['retailer']}] '{c['title'][:60]}': {reason}")
+                    return validated
+            except Exception as e:
+                print(f"[LLM Validator Error with {model_name}] {e}")
 
-            for sw in system_words:
-                if sw in title_lower and sw not in raw_lower:
-                    return False, f"System/platform keyword detected: '{sw}'"
+        # LLM unavailable — return all candidates rather than silently dropping everything
+        print("[LLM Validator] All models failed — passing all candidates through.")
+        return candidates
 
-            # Motherboard check (if not searching for a Motherboard)
-            if analysis.category != "Motherboard" and any(w in title_lower for w in ["motherboard", "mobo", "mainboard"]):
-                if not any(w in raw_lower for w in ["motherboard", "mobo", "mainboard"]):
-                    return False, "Motherboard detected instead of standalone component"
-
-            # GPU-specific platform/laptop leak checks
-            if analysis.category == "GPU":
-                # Known laptop product lines
-                laptop_lines = [
-                    "loq", "legion", "yoga", "ideapad", "thinkpad", "alienware",
-                    "rog zephyrus", "rog strix scar", "razer blade", "omen", "victus",
-                    "pavilion", "dell g15", "dell xps", "acer nitro", "predator",
-                    "katana", "stealth", "sword", "cyborg", "thin gf63", "macbook", "chromebook"
-                ]
-                for line in laptop_lines:
-                    if re.search(r'\b' + re.escape(line) + r'\b', title_lower) and line not in raw_lower:
-                        return False, f"Laptop product line detected: '{line}'"
-
-                # Screen / display specs
-                screen_indicators = [
-                    r'\b(?:144|165|240|360|120)\s*hz\b',
-                    r'\b(?:fhd|qhd|uhd|wqhd|oled|ips)\s+display\b',
-                    r'\b(?:13\.3|14|15\.6|16|17\.3)[\"”\s]',
-                    r'\btouchscreen\b'
-                ]
-                for pat in screen_indicators:
-                    if re.search(pat, title_lower):
-                        return False, "Integrated display / laptop screen spec detected on GPU"
-
-                # CPU specs inside GPU search
-                cpu_indicators = [
-                    r'\bi[3579]-[\d]{4,5}[a-z]{0,2}\b',
-                    r'\bcore\s+ultra\s+[579]\b',
-                    r'\bintel\s+core\b',
-                    r'\bamd\s+ryzen\s+[3579]\b',
-                    r'\bryzen\s+[3579]\s+[\d]{4}[a-z]{0,2}\b'
-                ]
-                for pat in cpu_indicators:
-                    if re.search(pat, title_lower) and not re.search(pat, raw_lower):
-                        return False, "CPU specification detected inside standalone GPU search"
-
-                # System storage + RAM bundles
-                storage_patterns = [
-                    r'\b\d+\s*(?:gb|tb)\s*ssd\b',
-                    r'\b\d+\s*gb\s+\d+\s*(?:gb|tb)\b',
-                    r'\b\d+\s*gb\s+ram\b'
-                ]
-                for pat in storage_patterns:
-                    if re.search(pat, title_lower):
-                        return False, "System storage/RAM bundle detected inside standalone GPU search"
-
-                # Mobile/laptop GPU indicator
-                mobile_gpu = ["laptop gpu", "notebook gpu", "mobile gpu", "mobil gpu", "max-q"]
-                for mg in mobile_gpu:
-                    if mg in title_lower and mg not in raw_lower:
-                        return False, f"Mobile/Laptop-only GPU detected: '{mg}'"
-
-        # 8. Brand Conflict and Core Model Verification
-        GENERIC_HARDWARE_WORDS = {
-            "liquid", "air", "cooler", "cooling", "fan", "fans", "aio", "argb", "rgb",
-            "cpu", "gpu", "ram", "ssd", "nvme", "psu", "power", "supply", "case", "chassis",
-            "edition", "series", "black", "white", "pro", "plus", "max", "super", "ultra",
-            "ti", "xt", "xtx", "v2", "v3", "internal", "external", "drive", "card", "board",
-            "desktop", "pc", "gaming", "heatsink", "heat", "pipe", "pipes", "radiator",
-            "technology", "speeds", "up", "to", "speeds", "gen", "pci", "express", "pcie"
-        }
-
-        PRIMARY_BRANDS = [
-            "arctic", "thermalright", "corsair", "nzxt", "cooler master", "deepcool",
-            "be quiet", "lian li", "noctua", "ekwb", "ek", "phanteks", "montech",
-            "silverstone", "thermaltake", "id-cooling", "valkyrie", "antec", "zalman",
-            "nvidia", "amd", "intel", "asus", "msi", "gigabyte", "zotac", "pny",
-            "palit", "gainward", "inno3d", "galax", "kfa2", "asrock", "sapphire",
-            "powercolor", "xfx", "evga",
-            "samsung", "crucial", "western digital", "wd", "seagate", "sk hynix",
-            "sabrent", "kingston", "teamgroup", "g.skill", "gskill", "patriot",
-            "adata", "lexar", "klevv", "silicon power", "solidigm", "kioxia",
-            "seasonic", "super flower", "fractal design", "fractal", "enermax", "fsp"
-        ]
-
-        b_lower = (analysis.brand or "").lower().strip()
-        if b_lower:
-            # A. Brand conflict check: if listing contains a known competitor brand, reject immediately!
-            for cb in PRIMARY_BRANDS:
-                if cb != b_lower and re.search(r'\b' + re.escape(cb) + r'\b', title_lower):
-                    if not re.search(r'\b' + re.escape(b_lower) + r'\b', title_lower):
-                        return False, f"Competitor brand conflict: query requires '{analysis.brand}' but title is '{cb}'"
-
-            # Specific famous product line family ownership (blocks cross-brand leaks like Aqua Elite vs Liquid Freezer)
-            if analysis.category == "Cooling":
-                COOLER_FAMILIES = {
-                    "aqua elite": "thermalright", "peerless assassin": "thermalright",
-                    "phantom spirit": "thermalright", "frozen notte": "thermalright",
-                    "frozen warframe": "thermalright", "frozen edge": "thermalright",
-                    "liquid freezer": "arctic", "freezer iii": "arctic", "freezer ii": "arctic",
-                    "kraken": "nzxt", "hyper 212": "cooler master",
-                    "pure rock": "be quiet", "dark rock": "be quiet", "shadow rock": "be quiet",
-                    "pure loop": "be quiet", "silent loop": "be quiet",
-                    "nh-d15": "noctua", "nh-u12a": "noctua", "nh-l9": "noctua",
-                    "galahad": "lian li", "hydro series": "corsair", "icue link": "corsair",
-                    "nautilus": "corsair", "v8 ace": "cooler master"
-                }
-                for fam, fam_brand in COOLER_FAMILIES.items():
-                    if fam in title_lower and fam_brand != b_lower:
-                        if not re.search(r'\b' + re.escape(b_lower) + r'\b', title_lower):
-                            return False, f"Competitor cooler line conflict: '{fam}' belongs to {fam_brand.title()}, not {analysis.brand}"
-
-        # B. Distinctive model token check
-        model_tokens = [t.lower() for t in re.split(r'[^a-zA-Z0-9]+', analysis.model) if len(t) > 1]
-        distinctive_tokens = [t for t in model_tokens if t not in GENERIC_HARDWARE_WORDS]
-
-        # If brand is omitted from title, ALL distinctive model tokens MUST match (e.g. 'freezer' for Liquid Freezer)
-        if b_lower and not re.search(r'\b' + re.escape(b_lower) + r'\b', title_lower):
-            if distinctive_tokens and not all(dt in title_lower for dt in distinctive_tokens):
-                missing = [dt for dt in distinctive_tokens if dt not in title_lower]
-                return False, f"Missing brand '{analysis.brand}' and distinctive model token(s): {missing}"
-
-        # C. Required digit tokens (e.g. 360, 240, 4070, 990, 850)
-        digit_tokens = [tok for tok in model_tokens if any(c.isdigit() for c in tok)]
-        if digit_tokens and not all(dt in title_lower for dt in digit_tokens):
-            return False, f"Missing required model token: {digit_tokens}"
-
-        # D. General token match count
-        if model_tokens:
-            matches = sum(1 for tok in model_tokens if tok in title_lower)
-            if matches < max(1, len(model_tokens) // 2):
-                return False, f"Insufficient model token match ({matches}/{len(model_tokens)})"
-
-        return True, "Valid offer"
 
 
 # ─── 2. AMAZON CLIENT (Direct HTTP/2 Engine - Unlimited & Zero-Quota) ─────────
@@ -633,10 +515,11 @@ class AmazonClient:
                 return res
         return None
 
-    async def search(self, analysis: ProductAnalysis) -> dict | None:
+    async def search(self, analysis: ProductAnalysis) -> list[dict]:
         asin = self.extract_asin(analysis.raw_query)
         if asin and ("amazon.com" in analysis.raw_query or len(analysis.raw_query.strip()) == 10):
-            return await self.lookup_asin(asin)
+            result = await self.lookup_asin(asin)
+            return [result] if result else []
 
         search_term = analysis.retailer_search_query
         print(f"[Amazon Direct] Searching for '{search_term}'...")
@@ -680,10 +563,10 @@ class AmazonClient:
                         continue
                     price_val = float(m.group(1).replace(",", ""))
 
-                    # Semantic validation
-                    is_valid, reason = ProductAnalyzer.validate_offer(analysis, title, price_val)
+                    # Fast-fail only (LLM validation happens centrally in HardwareAgent.run)
+                    is_valid, reason = ProductAnalyzer.validate_offer_fast(analysis, title, price_val)
                     if not is_valid:
-                        print(f"[Amazon Filtered] Skipping '{title[:50]}...': {reason}")
+                        print(f"[Amazon Skipped] '{title[:50]}...': {reason}")
                         continue
 
                     img = it.find("img", class_="s-image")
@@ -708,16 +591,15 @@ class AmazonClient:
 
                 if valid_offers:
                     valid_offers.sort(key=lambda x: x["price"])
-                    best = valid_offers[0]
-                    print(f"✅ [Amazon Hit] ${best['price']:.2f} -> {best['title'][:60]}")
-                    return best
+                    print(f"[Amazon Raw] {len(valid_offers)} candidate(s) collected (pre-LLM)")
+                    return valid_offers
                 else:
-                    print(f"[Amazon Direct] 0 valid standalone offers found for '{search_term}'")
+                    print(f"[Amazon Direct] 0 candidates after fast-fail for '{search_term}'")
             else:
                 print(f"⚠️ [Amazon Direct] HTTP {status_code} received for '{search_term}'")
         except Exception as e:
             print(f"[Amazon Direct Search Error] {e}")
-        return None
+        return []
 
 
 # ─── 3. EBAY CLIENT (eBay Browse API with OAuth2) ────────────────────────────
@@ -780,12 +662,12 @@ class EbayClient:
             print(f"[eBay Auth Exception] {e}")
         return None
 
-    async def search(self, analysis: ProductAnalysis) -> dict | None:
+    async def search(self, analysis: ProductAnalysis) -> list[dict]:
         client_id = os.environ.get("EBAY_CLIENT_ID", "") or EBAY_CLIENT_ID
         token = await self.get_access_token()
         if not token:
             print("[eBay API] ℹ️ EBAY_CLIENT_ID / EBAY_CLIENT_SECRET not configured, skipping eBay.")
-            return None
+            return []
 
         search_query = analysis.retailer_search_query
         print(f"[eBay API] Searching for '{search_query}'...")
@@ -806,7 +688,7 @@ class EbayClient:
                 )
                 if res.status_code == 200:
                     items = res.json().get("itemSummaries", [])
-                    valid_offers = []
+                    raw_offers = []
                     for it in items:
                         title = it.get("title", "")
                         price_obj = it.get("price", {})
@@ -816,20 +698,20 @@ class EbayClient:
 
                         condition = it.get("condition", "New")
                         if any(w in condition.lower() for w in ["parts", "not working", "broken", "faulty", "as is"]):
-                            print(f"[eBay Filtered] Skipping '{title[:50]}...': Condition is '{condition}'")
+                            print(f"[eBay Skipped] '{title[:50]}...': Bad condition '{condition}'")
                             continue
 
                         price_val = float(price_str)
-                        is_valid, reason = ProductAnalyzer.validate_offer(analysis, title, price_val)
+                        is_valid, reason = ProductAnalyzer.validate_offer_fast(analysis, title, price_val)
                         if not is_valid:
-                            print(f"[eBay Filtered] Skipping '{title[:50]}...': {reason}")
+                            print(f"[eBay Skipped] '{title[:50]}...': {reason}")
                             continue
 
                         is_refurb = any(w in condition.lower() for w in ["refurbished", "used", "seller refurbished"])
                         image_url = (it.get("image") or {}).get("imageUrl")
                         item_url = it.get("itemWebUrl") or f"https://www.ebay.com/itm/{it.get('itemId')}"
 
-                        valid_offers.append({
+                        raw_offers.append({
                             "retailer": "eBay",
                             "title": title,
                             "price": price_val,
@@ -842,16 +724,17 @@ class EbayClient:
                             "source": "ebay-api"
                         })
 
-                    if valid_offers:
-                        valid_offers.sort(key=lambda x: x["price"])
-                        best = valid_offers[0]
-                        print(f"✅ [eBay Hit] ${best['price']:.2f} -> {best['title'][:60]}")
-                        return best
+                    # Return all raw offers — LLM validation happens centrally in HardwareAgent.run()
+                    if raw_offers:
+                        raw_offers.sort(key=lambda x: x["price"])
+                        print(f"[eBay Raw] {len(raw_offers)} candidate(s) collected (pre-LLM)")
+                        return raw_offers
+                    return []
                 else:
                     print(f"⚠️ [eBay Search Error] {res.status_code}: {res.text}")
         except Exception as e:
             print(f"[eBay Search Exception] {e}")
-        return None
+        return []
 
     @staticmethod
     def extract_item_id(text: str) -> str | None:
@@ -1084,7 +967,7 @@ class BestBuyClient:
 
         return current_price, orig_price
 
-    async def _fallback_tavily_search(self, analysis: ProductAnalysis) -> dict | None:
+    async def _fallback_tavily_search(self, analysis: ProductAnalysis) -> list[dict]:
         """Automated Tavily search fallback: queries Best Buy catalog via Tavily + priceBlocks API."""
         search_term = analysis.retailer_search_query
         print(f"🛡️ [Best Buy Fallback] Querying Best Buy via Tavily: \"{search_term}\"...")
@@ -1148,7 +1031,7 @@ class BestBuyClient:
                     in_stock = False
 
                 if price and price > 0:
-                    is_valid, reason = ProductAnalyzer.validate_offer(analysis, title, price)
+                    is_valid, reason = ProductAnalyzer.validate_offer_fast(analysis, title, price)
                     if is_valid:
                         candidates.append({
                             "retailer": "Best Buy",
@@ -1163,19 +1046,16 @@ class BestBuyClient:
                             "source": "bestbuy-fallback"
                         })
                     else:
-                        print(f"[Best Buy Filtered] Skipping '{title[:50]}...': {reason}")
+                        print(f"[Best Buy Fallback Skipped] '{title[:50]}...': {reason}")
 
             if candidates:
-                # Prioritize in-stock candidates first, then lowest price
                 candidates.sort(key=lambda x: (not x.get("inStock", True), x["price"]))
-                best = candidates[0]
-                status_note = "" if best.get("inStock", True) else " [Out of Stock]"
-                print(f"✅ [Best Buy Fallback Hit] ${best['price']:.2f}{status_note} -> {best['title'][:60]}")
-                return best
+                print(f"[Best Buy Fallback Raw] {len(candidates)} candidate(s) collected (pre-LLM)")
+                return candidates
         except Exception as e:
             print(f"[Best Buy Fallback Notice] {e}")
 
-        return None
+        return []
 
     async def search(self, analysis: ProductAnalysis) -> dict | None:
         search_term = analysis.retailer_search_query
@@ -1227,10 +1107,10 @@ class BestBuyClient:
                 if not price or price <= 0:
                     continue
 
-                # Semantic validation
-                is_valid, reason = ProductAnalyzer.validate_offer(analysis, title, price)
+                # Fast-fail only (LLM handles semantic matching centrally)
+                is_valid, reason = ProductAnalyzer.validate_offer_fast(analysis, title, price)
                 if not is_valid:
-                    print(f"[Best Buy Filtered] Skipping '{title[:50]}...': {reason}")
+                    print(f"[Best Buy Skipped] '{title[:50]}...': {reason}")
                     continue
 
                 btn_m = re.search(r'\"buttonState\":\s*\"([^\"]+)\"', chunk)
@@ -1271,7 +1151,7 @@ class BestBuyClient:
                     if not pm:
                         continue
                     p_val = float(pm.group(1).replace(",", ""))
-                    is_valid, reason = ProductAnalyzer.validate_offer(analysis, t, p_val)
+                    is_valid, reason = ProductAnalyzer.validate_offer_fast(analysis, t, p_val)
                     if not is_valid:
                         continue
                     link_el = info.find("a", href=re.compile(r"/product/")) or (info.parent.find("a", href=re.compile(r"/product/")) if info.parent else None)
@@ -1307,18 +1187,16 @@ class BestBuyClient:
 
             if valid_offers:
                 valid_offers.sort(key=lambda x: (not x.get("inStock", True), x["price"]))
-                best = valid_offers[0]
-                status_note = "" if best.get("inStock", True) else " [Out of Stock]"
-                print(f"✅ [Best Buy Hit] ${best['price']:.2f}{status_note} -> {best['title'][:60]}")
-                return best
+                print(f"[Best Buy Raw] {len(valid_offers)} candidate(s) collected (pre-LLM)")
+                return valid_offers
             else:
-                print(f"[Best Buy Direct] 0 valid standalone offers found for '{search_term}'; engaging fallback...")
+                print(f"[Best Buy Direct] 0 valid candidates for '{search_term}'; engaging fallback...")
                 return await self._fallback_tavily_search(analysis)
         except Exception as e:
             print(f"[Best Buy Direct Search Notice] {e}; switching to fallback...")
             return await self._fallback_tavily_search(analysis)
 
-        return None
+        return []
 
     async def lookup_url(self, url: str) -> dict | None:
         target_url = url + ("&intl=nosplash" if "?" in url else "?intl=nosplash") if "nosplash" not in url else url
@@ -1588,6 +1466,7 @@ class HardwareAgent:
             }
 
         # 2. Concurrently scrape retailers (Amazon + eBay + Best Buy)
+        # Each retailer now returns a LIST of raw candidates (pre-validation)
         tasks = [
             self.amazon.search(analysis),
             self.ebay.search(analysis),
@@ -1595,36 +1474,65 @@ class HardwareAgent:
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        scraped_offers = []
+        # Flatten all raw candidates into one pool
+        raw_pool: list[dict] = []
         for res in results:
-            if isinstance(res, dict) and res.get("price"):
-                p_val = float(res["price"])
-                orig_val = float(res["originalPrice"]) if res.get("originalPrice") else p_val
-                res["previousPrice"] = res.get("previousPrice") or p_val
-                res["previousPrice24h"] = res.get("previousPrice24h") or p_val
-                res["previousPrice7d"] = res.get("previousPrice7d") or (orig_val if orig_val > p_val else p_val)
-                res["previousPrice30d"] = res.get("previousPrice30d") or (orig_val if orig_val > p_val else p_val)
-                scraped_offers.append(res)
-                if emit_fn:
-                    emit_fn("retailer_found", {
-                        "query": analysis.model,
-                        "original_query": clean_prompt,
-                        "retailer": res["retailer"],
-                        "title": res["title"],
-                        "price": res["price"],
-                        "originalPrice": res.get("originalPrice"),
-                        "previousPrice": res["previousPrice"],
-                        "previousPrice24h": res["previousPrice24h"],
-                        "previousPrice7d": res["previousPrice7d"],
-                        "previousPrice30d": res["previousPrice30d"],
-                        "url": res["url"],
-                        "imageUrl": res.get("imageUrl"),
-                        "inStock": res.get("inStock", True),
-                        "pending_id": pending_id,
-                        "offer": res
-                    })
+            if isinstance(res, list):
+                raw_pool.extend(res)
+            elif isinstance(res, dict) and res.get("price"):
+                # Direct URL lookups (ebay/amazon lookup_url) return a single dict
+                raw_pool.append(res)
 
-        # 3. Sort offers: in-stock offers first, then ascending price
+        print(f"[HardwareAgent] Raw pool: {len(raw_pool)} candidate(s) before LLM validation")
+
+        # 3. LLM batch validation — the single intelligence layer that decides genuine matches
+        validated_pool = await ProductAnalyzer.validate_candidates_llm(raw_pool, analysis)
+        print(f"[HardwareAgent] Validated pool: {len(validated_pool)} candidate(s) after LLM validation")
+
+        # 4. Pick best (cheapest in-stock) per retailer from validated pool
+        best_per_retailer: dict[str, dict] = {}
+        for c in validated_pool:
+            retailer = c.get("retailer", "Unknown")
+            existing = best_per_retailer.get(retailer)
+            # Prefer in-stock; within same stock status prefer lower price
+            if existing is None:
+                best_per_retailer[retailer] = c
+            else:
+                c_better = (c.get("inStock", True) and not existing.get("inStock", True)) or \
+                           (c.get("inStock", True) == existing.get("inStock", True) and c["price"] < existing["price"])
+                if c_better:
+                    best_per_retailer[retailer] = c
+
+        scraped_offers = []
+        for res in best_per_retailer.values():
+            p_val = float(res["price"])
+            orig_val = float(res["originalPrice"]) if res.get("originalPrice") else p_val
+            res["previousPrice"] = res.get("previousPrice") or p_val
+            res["previousPrice24h"] = res.get("previousPrice24h") or p_val
+            res["previousPrice7d"] = res.get("previousPrice7d") or (orig_val if orig_val > p_val else p_val)
+            res["previousPrice30d"] = res.get("previousPrice30d") or (orig_val if orig_val > p_val else p_val)
+            scraped_offers.append(res)
+            print(f"\u2705 [{res['retailer']}] ${res['price']:.2f} \u2192 {res['title'][:60]}")
+            if emit_fn:
+                emit_fn("retailer_found", {
+                    "query": analysis.model,
+                    "original_query": clean_prompt,
+                    "retailer": res["retailer"],
+                    "title": res["title"],
+                    "price": res["price"],
+                    "originalPrice": res.get("originalPrice"),
+                    "previousPrice": res["previousPrice"],
+                    "previousPrice24h": res["previousPrice24h"],
+                    "previousPrice7d": res["previousPrice7d"],
+                    "previousPrice30d": res["previousPrice30d"],
+                    "url": res["url"],
+                    "imageUrl": res.get("imageUrl"),
+                    "inStock": res.get("inStock", True),
+                    "pending_id": pending_id,
+                    "offer": res
+                })
+
+        # 5. Sort: in-stock first, then ascending price
         scraped_offers.sort(key=lambda x: (not x.get("inStock", True), x["price"]))
 
         # 4. Generate Summary
