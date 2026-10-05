@@ -60,7 +60,9 @@ async def query_tavily_search(query: str, max_results: int = 3) -> list[dict]:
 class ProductAnalysis:
     def __init__(self, raw_query: str, brand: str | None, model: str, category: str,
                  is_pc_part: bool, retailer_search_query: str, negative_keywords: list[str],
-                 min_price: float | None = None):
+                 min_price: float | None = None,
+                 product_exists: bool = True,
+                 correction_suggestion: str | None = None):
         self.raw_query = raw_query
         self.brand = brand
         self.model = model
@@ -69,6 +71,8 @@ class ProductAnalysis:
         self.retailer_search_query = retailer_search_query
         self.negative_keywords = negative_keywords
         self.min_price = min_price
+        self.product_exists = product_exists
+        self.correction_suggestion = correction_suggestion
 
     def to_dict(self) -> dict:
         return {
@@ -80,6 +84,8 @@ class ProductAnalysis:
             "retailer_search_query": self.retailer_search_query,
             "negative_keywords": self.negative_keywords,
             "min_price": self.min_price,
+            "product_exists": self.product_exists,
+            "correction_suggestion": self.correction_suggestion,
         }
 
 class ProductAnalyzer:
@@ -102,6 +108,12 @@ class ProductAnalyzer:
             "- \"model\": The core model / part name (e.g. 'King 95', 'RTX 5090', 'Ryzen 7 9800X3D', 'Trident Z5', 'RM850x').\n"
             "- \"category\": Exactly one of: 'GPU', 'CPU', 'RAM', 'Motherboard', 'Storage', 'Power Supply', 'Case', 'Cooling', 'Monitor', 'Peripherals', or 'Other'.\n"
             "- \"is_pc_part\": true if it is a PC component, computer part, or peripheral; false if food, clothing, or unrelated.\n"
+            "- \"product_exists\": true if this is a real product that was actually manufactured and sold commercially. "
+            "false if the model number/name combination is fictitious or was never produced "
+            "(e.g. 'RTX 1080 Ti' — NVIDIA never made an RTX-tier 1080, the 1080 Ti is GTX only; "
+            "'AMD RX 590X' — no such SKU exists). When in doubt, set true.\n"
+            "- \"correction_suggestion\": If product_exists is false, provide the closest real product the user likely meant "
+            "(e.g. 'GTX 1080 Ti' or 'RTX 2080 Ti' for 'RTX 1080 Ti'). null if product_exists is true.\n"
             "- \"min_price\": Realistic minimum market price in USD for a functional, genuine unit of this hardware component (e.g. 1400 for RTX 4090, 180 for RTX 3060, 220 for 7800X3D, 50 for King 95, 30 for 16GB RAM). Used to automatically discard dummy replicas, 1:1 scale toys, empty boxes, and brackets.\n"
             "- \"retailer_search_query\": Clean search term optimized for retailer product catalogs (e.g. 'Montech King 95 PC Case', 'AMD Ryzen 7 9800X3D', 'RTX 5090').\n"
             "- \"negative_keywords\": Array of terms that indicate a candidate result is the WRONG product, accessory, toy, or broken item. For instance:\n"
@@ -146,7 +158,9 @@ class ProductAnalyzer:
                         is_pc_part=bool(data.get("is_pc_part", True)),
                         retailer_search_query=data.get("retailer_search_query") or clean,
                         negative_keywords=data.get("negative_keywords") or [],
-                        min_price=min_p
+                        min_price=min_p,
+                        product_exists=bool(data.get("product_exists", True)),
+                        correction_suggestion=data.get("correction_suggestion") or None
                     )
             except Exception as e:
                 print(f"[ProductAnalyzer Error with {model_name}] {e}")
@@ -878,6 +892,15 @@ class BestBuyClient:
             except Exception:
                 pass
 
+        # 2. httpx fallback if curl_cffi failed or was unavailable
+        if not text or status_code != 200:
+            try:
+                async with httpx.AsyncClient(headers=self.HEADERS, follow_redirects=True, timeout=12.0) as client:
+                    res = await client.get(url)
+                    status_code, text = res.status_code, res.text
+            except Exception as e:
+                print(f"[Best Buy Direct httpx Notice] {e}")
+
         # Check if Best Buy blocked or challenged the request
         is_blocked = (
             status_code != 200
@@ -887,7 +910,7 @@ class BestBuyClient:
             or status_code in [403, 429, 503]
         )
 
-        # 2. Secondary: Seamless ZenRows residential proxy fallback (if not exhausted)
+        # 3. ZenRows residential proxy fallback (if not exhausted)
         if is_blocked and not ZENROWS_QUOTA_EXHAUSTED:
             zenrows_key = os.environ.get("ZENROWS_API_KEY", "") or ZENROWS_API_KEY
             if zenrows_key:
@@ -1461,6 +1484,41 @@ class HardwareAgent:
                 "query": clean_prompt,
                 "normalized_query": analysis.model,
                 "category": analysis.category,
+                "scrapedOffers": [],
+                "failed_retailers": []
+            }
+
+        if not analysis.product_exists:
+            suggestion = analysis.correction_suggestion
+            if suggestion:
+                msg = f"'{analysis.model}' does not appear to be a real product. Did you mean '{suggestion}'?"
+            else:
+                msg = f"'{analysis.model}' does not appear to be a real product that was ever manufactured."
+            print(f"[Invalid Product Rejected] {msg}")
+            if emit_fn:
+                emit_fn("agent_error", {
+                    "query": clean_prompt,
+                    "original_query": clean_prompt,
+                    "error_type": "INVALID_PRODUCT",
+                    "message": msg,
+                    "correction_suggestion": suggestion,
+                    "pending_id": pending_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                })
+                emit_fn("agent_complete", {
+                    "query": clean_prompt,
+                    "original_query": clean_prompt,
+                    "category": analysis.category,
+                    "scrapedOffers": [],
+                    "summary": msg,
+                    "pending_id": pending_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                })
+            return {
+                "query": clean_prompt,
+                "normalized_query": analysis.model,
+                "category": analysis.category,
+                "correction_suggestion": suggestion,
                 "scrapedOffers": [],
                 "failed_retailers": []
             }
