@@ -182,11 +182,11 @@ class ProductAnalyzer:
                 if dp not in analysis.raw_query.lower():
                     return False, f"Dummy/non-hardware item: '{dp}'"
 
-        # Price floor (rejects accessories and toy replicas priced way below realistic market value)
+        # Price floor (only reject obvious non-hardware accessories/stickers or items priced under 15% of floor)
         if analysis.min_price and analysis.min_price > 0:
-            floor_threshold = analysis.min_price * 0.4
+            floor_threshold = max(8.0, analysis.min_price * 0.15)
             if price < floor_threshold:
-                return False, f"Price ${price:.2f} is below hardware floor (${floor_threshold:.2f}) for {analysis.model}"
+                return False, f"Price ${price:.2f} is below minimum accessory floor (${floor_threshold:.2f}) for {analysis.model}"
 
         return True, "Passed fast-fail"
 
@@ -215,7 +215,7 @@ class ProductAnalyzer:
             "for the user's search query. A genuine match must:\n"
             "1. Be the exact product (correct brand, model line, and variant) — not a different tier, sub-variant, or accessory.\n"
             "2. Be a standalone retail unit — not a prebuilt PC, laptop, bundle, upgrade kit, display prop, or broken/parts item.\n"
-            "3. Have a price consistent with the real market for this product.\n\n"
+            "3. CRITICAL: NEVER reject an offer simply because the price is low or cheap! Older CPUs, used hardware, and refurbished components sell for cheap on eBay and marketplaces. As long as it is the genuine working component, mark it VALID.\n\n"
             "Be lenient about brand name formatting quirks (e.g. 'be quiet!' vs 'be quiet', 'NVIDIA' in the title of a third-party card). "
             "Be strict about wrong product tier (e.g. RTX 4070 Ti when query is RTX 4070) or wrong product category (e.g. laptop returned for GPU search).\n\n"
             "Return valid JSON only: {\"valid_indices\": [list of 1-based indices of valid results], \"reasons\": {\"index\": \"brief reason if rejected\"}}"
@@ -1416,6 +1416,68 @@ class HardwareAgent:
         self.ebay = EbayClient()
         self.bestbuy = BestBuyClient()
         self.generic = GenericRetailerClient()
+        try:
+            from app.scrapers.newegg import NeweggScraper
+            from app.scrapers.microcenter import MicroCenterScraper
+            self.newegg = NeweggScraper()
+            self.microcenter = MicroCenterScraper()
+        except ImportError:
+            self.newegg = None
+            self.microcenter = None
+
+    async def _search_newegg(self, query: str, analysis: ProductAnalysis) -> list[dict]:
+        if not getattr(self, "newegg", None):
+            return []
+        try:
+            print(f"[Newegg Direct] Searching for '{query}'...")
+            offers = await self.newegg.search(query)
+            candidates = []
+            for o in offers:
+                candidates.append({
+                    "retailer": "Newegg",
+                    "title": o.title,
+                    "price": o.price,
+                    "originalPrice": o.original_price,
+                    "inStock": o.in_stock,
+                    "isRefurbished": any(w in (o.title or "").lower() for w in ["refurbished", "open box", "open-box"]),
+                    "url": o.url,
+                    "imageUrl": o.image_url,
+                    "brand": analysis.brand,
+                    "source": "newegg-direct"
+                })
+            if candidates:
+                print(f"[Newegg Raw] {len(candidates)} candidate(s) collected")
+            return candidates
+        except Exception as e:
+            print(f"[Newegg Scraper Notice] {e}")
+            return []
+
+    async def _search_microcenter(self, query: str, analysis: ProductAnalysis) -> list[dict]:
+        if not getattr(self, "microcenter", None):
+            return []
+        try:
+            print(f"[Micro Center Direct] Searching for '{query}'...")
+            offers = await self.microcenter.search(query)
+            candidates = []
+            for o in offers:
+                candidates.append({
+                    "retailer": "Micro Center",
+                    "title": o.title,
+                    "price": o.price,
+                    "originalPrice": o.original_price,
+                    "inStock": o.in_stock,
+                    "isRefurbished": any(w in (o.title or "").lower() for w in ["refurbished", "open box", "open-box"]),
+                    "url": o.url,
+                    "imageUrl": o.image_url,
+                    "brand": analysis.brand,
+                    "source": "microcenter-direct"
+                })
+            if candidates:
+                print(f"[Micro Center Raw] {len(candidates)} candidate(s) collected")
+            return candidates
+        except Exception as e:
+            print(f"[Micro Center Scraper Notice] {e}")
+            return []
 
     async def scrape_product_url(self, url: str) -> dict | None:
         """Directly scrapes the SAME product URL to get latest price without search query hallucinations."""
@@ -1492,12 +1554,14 @@ class HardwareAgent:
             else:
                 print(f"[Product Notice] '{analysis.model}' may be a custom or new SKU; attempting catalog search directly")
 
-        # 2. Concurrently scrape retailers (Amazon + eBay + Best Buy)
-        # Each retailer now returns a LIST of raw candidates (pre-validation)
+        # 2. Concurrently scrape ALL 5 major retailers
+        search_target = analysis.retailer_search_query or analysis.model or clean_prompt
         tasks = [
             self.amazon.search(analysis),
             self.ebay.search(analysis),
             self.bestbuy.search(analysis),
+            self._search_newegg(search_target, analysis),
+            self._search_microcenter(search_target, analysis),
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
