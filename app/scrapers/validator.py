@@ -28,29 +28,60 @@ def validate_offer_fast(
 
     # Category / Model specific validation if analysis provided
     if analysis:
+        cat_upper = (analysis.category or "").upper()
+        raw_lower = (analysis.canonical_name or "").lower()
+        model_lower = (analysis.model or "").lower()
+
+        # Category accessory filtering
+        if cat_upper in ["CPU", "PROCESSOR"]:
+            cpu_acc = [
+                "cpu cooler", "air cooler", "liquid cooler", "aio cooler", "water cooler",
+                "cooler master", "thermalright", "noctua", "deepcool", "thermal paste",
+                "contact frame", "mounting bracket", "retention bracket", "cpu fan"
+            ]
+            for acc in cpu_acc:
+                if re.search(r'\b' + re.escape(acc) + r'\b', t_lower):
+                    if acc not in raw_lower and acc not in model_lower:
+                        return False, f"Accessory item: '{acc}'"
+        elif cat_upper in ["GPU", "GRAPHICS CARD"]:
+            gpu_acc = [
+                "gpu bracket", "support bracket", "riser cable", "vertical mount",
+                "backplate", "water block", "cooling fan replacement"
+            ]
+            for acc in gpu_acc:
+                if re.search(r'\b' + re.escape(acc) + r'\b', t_lower):
+                    if acc not in raw_lower and acc not in model_lower:
+                        return False, f"Accessory item: '{acc}'"
+
         # Negative keywords from product analysis
         negatives = analysis.specs.get("negative_keywords", [])
         for neg in negatives:
             if neg.lower() in t_lower:
                 return False, f"Matches negative keyword: '{neg}'"
 
-        # Price floor check (rejects waterblocks/cables masquerading as GPUs/CPUs)
+        # Numeric model token matching (e.g. 4770, 10700, 6700, 7800, 4070)
+        nums = re.findall(r'(?<!\d)(\d{3,5})(?!\d)', analysis.model)
+        for num in nums:
+            if not re.search(r'(?<!\d)' + num + r'(?!\d)', t_lower):
+                return False, f"Missing model number {num}"
+
+        # Critical variant suffix matching (e.g. K, KF, F, X, X3D, Ti, XT, XTX, Super)
+        critical_suffixes = ["x3d", "xtx", "kf", "ti", "xt", "super", "k", "f", "x"]
+        found_suffix = None
+        for s in critical_suffixes:
+            if re.search(r'(?:\b|(?<=\d))' + re.escape(s) + r'\b', model_lower):
+                found_suffix = s
+                break
+
+        if found_suffix and nums:
+            if not re.search(r'(?:\b|(?<=\d))' + re.escape(found_suffix) + r'\b', t_lower):
+                return False, f"Missing requested variant '{found_suffix.upper()}'"
+
+        # Relaxed price floor check (preserves genuine cheap used/refurb deals, rejects $2 stickers/cables)
         min_price = analysis.target_price or analysis.specs.get("min_price")
         if min_price and float(min_price) > 0:
-            floor = float(min_price) * 0.35
+            floor = max(8.0, float(min_price) * 0.15)
             if price < floor:
                 return False, f"Price ${price:.2f} is below minimum hardware floor (${floor:.2f})"
-
-        # Model specificity checks
-        # Prevent e.g. "RTX 4070" from matching "RTX 4070 Ti" or "RTX 4070 Super" if target didn't specify Ti/Super
-        model_clean = analysis.model.lower()
-        if "super" not in model_clean and " super" in t_lower:
-            return False, "Candidate is Super variant, but target is non-Super"
-        if "ti" not in model_clean and (" ti " in t_lower or " ti-" in t_lower or t_lower.endswith(" ti")):
-            return False, "Candidate is Ti variant, but target is non-Ti"
-        if "xtx" not in model_clean and "xtx" in t_lower:
-            return False, "Candidate is XTX variant, but target is non-XTX"
-        if "xt" not in model_clean and (" xt " in t_lower or t_lower.endswith(" xt")):
-            return False, "Candidate is XT variant, but target is non-XT"
 
     return True, "Valid offer"

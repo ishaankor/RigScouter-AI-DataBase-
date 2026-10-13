@@ -73,22 +73,27 @@ class NeweggScraper(BaseScraper):
             results = await query_tavily_search(t_query, max_results=4)
             for item in results:
                 url = item.get("url", "")
-                if "newegg.com/p/" not in url:
+                if "newegg.com/p/" not in url or "/reviews" in url:
                     continue
 
                 raw_title = item.get("title", "")
+                clean_t = re.sub(r'\s*[|\-]\s*Newegg\.com\s*$', '', raw_title, flags=re.I).strip()
+                # Skip search query landing pages
+                if clean_t.lower() == clean_query.lower() or len(clean_t) < 15:
+                    continue
+
                 snippet = item.get("content", "")
                 price, orig = parse_tavily_snippet_prices(snippet + " " + raw_title)
 
-                if price:
-                    is_valid, _ = validate_offer_fast(raw_title, price, analysis)
+                if price and price > 15.0:
+                    is_valid, _ = validate_offer_fast(clean_t, price, analysis)
                     if is_valid:
                         offers.append(Offer(
                             retailer=self.retailer_name,
                             price=price,
                             original_price=orig,
                             url=url,
-                            title=raw_title,
+                            title=clean_t,
                             snippet=snippet,
                             in_stock=True
                         ))

@@ -162,15 +162,62 @@ class ProductAnalyzer:
         return ProductAnalysis(clean, None, clean, "Hardware", True, clean, [])
 
     @staticmethod
+    def is_legacy_or_discontinued(analysis: ProductAnalysis) -> bool:
+        """Returns True if component is legacy/discontinued hardware no longer stocked by retail chains.
+        Prevents Best Buy / Micro Center timeout hangs and false prebuilt/review matches."""
+        model = (analysis.model or "").upper()
+        raw = (analysis.raw_query or "").upper()
+        combined = f"{model} {raw}"
+
+        # 1. Intel CPUs: Discontinued <= 11th Gen (2xxx - 11xxx, e.g. i7-4770K, i7-6700K, i7-10700KF)
+        # Modern retail: 12xxx, 13xxx, 14xxx, Core Ultra 1xx/2xx
+        if any(k in combined for k in ["INTEL", "CORE", "I3-", "I5-", "I7-", "I9-", "I3 ", "I5 ", "I7 ", "I9 "]):
+            m = re.search(r'\b(?:I[3579][ -]?)?([2-9]\d{3}|1[01]\d{3})([A-Z]{0,3})\b', combined)
+            if m:
+                num = int(m.group(1))
+                if num <= 11900:
+                    return True
+            if any(w in combined for w in ["CORE 2", "LGA 1150", "LGA 1155", "LGA 1151", "LGA 775", "LGA 1366"]):
+                return True
+
+        # 2. AMD CPUs: Ryzen 1000, 2000, 3000 series, FX series, Phenom, Athlon
+        if any(k in combined for k in ["RYZEN", "AMD"]):
+            m = re.search(r'\b(?:RYZEN\s*[3579]\s*)?([1-3]\d{3})([A-Z]{0,3})\b', combined)
+            if m:
+                return True
+            if any(w in combined for w in ["FX-", "FX ", "AM3", "AM3+", "PHENOM", "ATHLON"]):
+                return True
+
+        # 3. NVIDIA GPUs: GTX series, RTX 2060/2070/2080
+        if any(k in combined for k in ["GTX", "NVIDIA", "GEFORCE"]):
+            if re.search(r'\bGTX\s*(?:\d{3,4})\b', combined):
+                return True
+            if re.search(r'\bRTX\s*20\d{2}\b', combined):
+                return True
+
+        # 4. AMD GPUs: RX 400/500 series, RX Vega, R9, R7
+        if any(k in combined for k in ["RADEON", "AMD", "RX"]):
+            if re.search(r'\bRX\s*[45][6-9]0\b', combined):
+                return True
+            if any(w in combined for w in ["VEGA 56", "VEGA 64", "R9 390", "R9 290"]):
+                return True
+
+        # 5. DDR3 RAM
+        if "DDR3" in combined:
+            return True
+
+        return False
+
+    @staticmethod
     def validate_offer_fast(analysis: ProductAnalysis, title: str, price: float) -> tuple[bool, str]:
-        """Lightweight fast-fail: only rejects $0 prices, obvious dummy items, and price-floor violations.
+        """Lightweight fast-fail: rejects $0 prices, dummy items, wrong SKU numbers, accessories, and price-floor violations.
         Real semantic validation is handled by validate_candidates_llm()."""
         title_lower = title.lower()
 
         if price <= 0:
             return False, "Price is 0 or negative"
 
-        # Hard dummy/replica/toy patterns — these are never real hardware regardless of context
+        # Hard dummy/replica/toy patterns
         dummy_patterns = [
             "replica", "1:1 scale", "scale model", "dummy", "mockup", "toy",
             "3d print", "3d printed", "prop", "display only", "box only", "empty box",
@@ -181,6 +228,48 @@ class ProductAnalyzer:
             if re.search(r'\b' + re.escape(dp) + r'\b', title_lower):
                 if dp not in analysis.raw_query.lower():
                     return False, f"Dummy/non-hardware item: '{dp}'"
+
+        # Accessory filtering based on category
+        cat_upper = (analysis.category or "").upper()
+        if cat_upper in ["CPU", "PROCESSOR"]:
+            cpu_acc = [
+                "cpu cooler", "air cooler", "liquid cooler", "aio cooler", "water cooler",
+                "cooler master", "thermalright", "noctua", "deepcool", "thermal paste",
+                "contact frame", "mounting bracket", "retention bracket", "cpu fan"
+            ]
+            for acc in cpu_acc:
+                if re.search(r'\b' + re.escape(acc) + r'\b', title_lower):
+                    if acc not in analysis.raw_query.lower() and acc not in analysis.model.lower():
+                        return False, f"Accessory item: '{acc}'"
+        elif cat_upper in ["GPU", "GRAPHICS CARD"]:
+            gpu_acc = [
+                "gpu bracket", "support bracket", "riser cable", "vertical mount",
+                "backplate", "water block", "cooling fan replacement"
+            ]
+            for acc in gpu_acc:
+                if re.search(r'\b' + re.escape(acc) + r'\b', title_lower):
+                    if acc not in analysis.raw_query.lower() and acc not in analysis.model.lower():
+                        return False, f"Accessory item: '{acc}'"
+
+        # Numeric model token matching (e.g. 4770, 10700, 6700, 7800, 4070)
+        nums = re.findall(r'(?<!\d)(\d{3,5})(?!\d)', analysis.model)
+        if not nums:
+            nums = re.findall(r'(?<!\d)(\d{3,5})(?!\d)', analysis.retailer_search_query)
+        for num in nums:
+            if not re.search(r'(?<!\d)' + num + r'(?!\d)', title_lower):
+                return False, f"Missing model number {num}"
+
+        # Critical variant suffix matching (e.g. K, KF, F, X, X3D, Ti, XT, XTX, Super)
+        critical_suffixes = ["x3d", "xtx", "kf", "ti", "xt", "super", "k", "f", "x"]
+        found_suffix = None
+        for s in critical_suffixes:
+            if re.search(r'(?:\b|(?<=\d))' + re.escape(s) + r'\b', analysis.model.lower()):
+                found_suffix = s
+                break
+
+        if found_suffix and nums:
+            if not re.search(r'(?:\b|(?<=\d))' + re.escape(found_suffix) + r'\b', title_lower):
+                return False, f"Missing requested variant '{found_suffix.upper()}'"
 
         # Price floor (only reject obvious non-hardware accessories/stickers or items priced under 15% of floor)
         if analysis.min_price and analysis.min_price > 0:
@@ -465,19 +554,32 @@ class AmazonClient:
                 product_url = f"https://www.amazon.com/dp/{asin}?smid={merchant_id}" if merchant_id else url
 
                 if title and price_val:
+                    t_lower = title.lower()
+                    if "renewed" in t_lower or "refurbished" in t_lower:
+                        cond_tag = "refurbished"
+                        cond_label = "Amazon Renewed"
+                    elif "used" in t_lower:
+                        cond_tag = "used"
+                        cond_label = "Used"
+                    else:
+                        cond_tag = "new"
+                        cond_label = "Brand New"
+
                     offer = {
                         "retailer": "Amazon",
                         "title": title,
                         "price": price_val,
                         "originalPrice": None,
                         "inStock": in_stock,
-                        "isRefurbished": "renewed" in title.lower() or "refurbished" in title.lower(),
+                        "condition": cond_tag,
+                        "conditionLabel": cond_label,
+                        "isRefurbished": cond_tag in ["refurbished", "used"],
                         "url": product_url,
                         "imageUrl": image_url,
                         "brand": None,
                         "source": "amazon-direct"
                     }
-                    print(f"✅ [Amazon Hit] ${offer['price']:.2f} -> {offer['title'][:60]}")
+                    print(f"✅ [Amazon Hit] ${offer['price']:.2f} ({cond_label}) -> {offer['title'][:60]}")
                     return offer
             else:
                 print(f"⚠️ [Amazon Direct] HTTP {status_code} received when fetching ASIN {asin}")
@@ -497,14 +599,27 @@ class AmazonClient:
                     fallback_price = float(pm.group(1).replace(",", ""))
                     if fallback_price > 10.0:
                         raw_title = item.get("title", "").replace("Amazon.com:", "").strip()
-                        print(f"✅ [Amazon Tavily Hit] ${fallback_price:.2f} -> {raw_title[:60]}")
+                        t_lower = raw_title.lower()
+                        if "renewed" in t_lower or "refurbished" in t_lower:
+                            cond_tag = "refurbished"
+                            cond_label = "Amazon Renewed"
+                        elif "used" in t_lower:
+                            cond_tag = "used"
+                            cond_label = "Used"
+                        else:
+                            cond_tag = "new"
+                            cond_label = "Brand New"
+
+                        print(f"✅ [Amazon Tavily Hit] ${fallback_price:.2f} ({cond_label}) -> {raw_title[:60]}")
                         return {
                             "retailer": "Amazon",
                             "title": raw_title or f"Amazon Product {asin}",
                             "price": fallback_price,
                             "originalPrice": None,
                             "inStock": True,
-                            "isRefurbished": False,
+                            "condition": cond_tag,
+                            "conditionLabel": cond_label,
+                            "isRefurbished": cond_tag in ["refurbished", "used"],
                             "url": url,
                             "imageUrl": None,
                             "brand": None,
@@ -584,13 +699,26 @@ class AmazonClient:
                     merchant_id = merchant_input.get("value") if merchant_input else None
                     product_url = f"https://www.amazon.com/dp/{item_asin}?smid={merchant_id}" if merchant_id else f"https://www.amazon.com/dp/{item_asin}"
 
+                    t_lower = title.lower()
+                    if "renewed" in t_lower or "refurbished" in t_lower:
+                        cond_tag = "refurbished"
+                        cond_label = "Amazon Renewed"
+                    elif "used" in t_lower:
+                        cond_tag = "used"
+                        cond_label = "Used"
+                    else:
+                        cond_tag = "new"
+                        cond_label = "Brand New"
+
                     valid_offers.append({
                         "retailer": "Amazon",
                         "title": title,
                         "price": price_val,
                         "originalPrice": None,
                         "inStock": True,
-                        "isRefurbished": "renewed" in title.lower() or "refurbished" in title.lower(),
+                        "condition": cond_tag,
+                        "conditionLabel": cond_label,
+                        "isRefurbished": cond_tag in ["refurbished", "used"],
                         "url": product_url,
                         "imageUrl": image_url,
                         "brand": analysis.brand,
@@ -704,9 +832,10 @@ class EbayClient:
                         if not title or not price_str:
                             continue
 
-                        condition = it.get("condition", "New")
-                        if any(w in condition.lower() for w in ["parts", "not working", "broken", "faulty", "as is"]):
-                            print(f"[eBay Skipped] '{title[:50]}...': Bad condition '{condition}'")
+                        condition_raw = it.get("condition", "Used")
+                        c_lower = condition_raw.lower()
+                        if any(w in c_lower for w in ["parts", "not working", "broken", "faulty", "as is"]):
+                            print(f"[eBay Skipped] '{title[:50]}...': Bad condition '{condition_raw}'")
                             continue
 
                         price_val = float(price_str)
@@ -715,7 +844,19 @@ class EbayClient:
                             print(f"[eBay Skipped] '{title[:50]}...': {reason}")
                             continue
 
-                        is_refurb = any(w in condition.lower() for w in ["refurbished", "used", "seller refurbished"])
+                        if "refurbished" in c_lower:
+                            cond_tag = "refurbished"
+                            cond_label = "Refurbished"
+                        elif any(w in c_lower for w in ["used", "pre-owned"]):
+                            cond_tag = "used"
+                            cond_label = "Used (Tested)"
+                        elif "open" in c_lower:
+                            cond_tag = "open_box"
+                            cond_label = "Open Box"
+                        else:
+                            cond_tag = "new"
+                            cond_label = "Brand New"
+
                         image_url = (it.get("image") or {}).get("imageUrl")
                         item_url = it.get("itemWebUrl") or f"https://www.ebay.com/itm/{it.get('itemId')}"
 
@@ -725,7 +866,9 @@ class EbayClient:
                             "price": price_val,
                             "originalPrice": None,
                             "inStock": True,
-                            "isRefurbished": is_refurb,
+                            "condition": cond_tag,
+                            "conditionLabel": cond_label,
+                            "isRefurbished": cond_tag in ["refurbished", "used"],
                             "url": item_url,
                             "imageUrl": image_url,
                             "brand": analysis.brand,
@@ -788,8 +931,21 @@ class EbayClient:
                     if price_str:
                         price_val = float(price_str)
                         title = data.get("title", "")
-                        condition = data.get("condition", "New")
-                        is_refurb = any(w in condition.lower() for w in ["refurbished", "used", "seller refurbished"])
+                        condition_raw = data.get("condition", "Used")
+                        c_lower = condition_raw.lower()
+                        if "refurbished" in c_lower:
+                            cond_tag = "refurbished"
+                            cond_label = "Refurbished"
+                        elif any(w in c_lower for w in ["used", "pre-owned"]):
+                            cond_tag = "used"
+                            cond_label = "Used (Tested)"
+                        elif "open" in c_lower:
+                            cond_tag = "open_box"
+                            cond_label = "Open Box"
+                        else:
+                            cond_tag = "new"
+                            cond_label = "Brand New"
+
                         image_url = (data.get("image") or {}).get("imageUrl")
                         item_url = data.get("itemWebUrl") or f"https://www.ebay.com/itm/{item_id}"
 
@@ -804,13 +960,15 @@ class EbayClient:
                             "price": price_val,
                             "originalPrice": None,
                             "inStock": in_stock,
-                            "isRefurbished": is_refurb,
+                            "condition": cond_tag,
+                            "conditionLabel": cond_label,
+                            "isRefurbished": cond_tag in ["refurbished", "used"],
                             "url": item_url,
                             "imageUrl": image_url,
                             "brand": None,
                             "source": "ebay-api"
                         }
-                        print(f"✅ [eBay Hit] ${offer['price']:.2f} -> {offer['title'][:60]}")
+                        print(f"✅ [eBay Hit] ${offer['price']:.2f} ({cond_label}) -> {offer['title'][:60]}")
                         return offer
                 else:
                     print(f"⚠️ [eBay Lookup Status] {res.status_code} for item {item_id}")
@@ -875,7 +1033,7 @@ class BestBuyClient:
         # 1. Primary: Direct curl_cffi with HTTP/1.1 (prevents curl error 92 HTTP/2 stream reset)
         if HAS_CURL_CFFI:
             try:
-                kwargs = {"headers": self.HEADERS, "timeout": 10}
+                kwargs = {"headers": self.HEADERS, "timeout": 2.5}
                 if CurlHttpVersion is not None:
                     kwargs["http_version"] = CurlHttpVersion.V1_1
                 async with CurlAsyncSession(impersonate="chrome124") as session:
@@ -889,7 +1047,7 @@ class BestBuyClient:
         # 2. httpx fallback if curl_cffi failed or was unavailable
         if not text or status_code != 200:
             try:
-                async with httpx.AsyncClient(headers=self.HEADERS, follow_redirects=True, timeout=12.0) as client:
+                async with httpx.AsyncClient(headers=self.HEADERS, follow_redirects=True, timeout=2.5) as client:
                     res = await client.get(url)
                     status_code, text = res.status_code, res.text
             except Exception as e:
@@ -1050,13 +1208,28 @@ class BestBuyClient:
                 if price and price > 0:
                     is_valid, reason = ProductAnalyzer.validate_offer_fast(analysis, title, price)
                     if is_valid:
+                        t_lower = title.lower()
+                        is_refurb = "refurbished" in t_lower
+                        is_open_box = any(w in t_lower for w in ["open-box", "open box"])
+                        if is_refurb:
+                            cond_tag = "refurbished"
+                            cond_label = "Geek Squad Certified"
+                        elif is_open_box:
+                            cond_tag = "open_box"
+                            cond_label = "Open Box"
+                        else:
+                            cond_tag = "new"
+                            cond_label = "Brand New"
+
                         candidates.append({
                             "retailer": "Best Buy",
                             "title": title,
                             "price": price,
                             "originalPrice": orig_price,
                             "inStock": in_stock,
-                            "isRefurbished": any(w in title.lower() for w in ["refurbished", "open-box", "open box"]),
+                            "condition": cond_tag,
+                            "conditionLabel": cond_label,
+                            "isRefurbished": cond_tag in ["refurbished", "open_box"],
                             "url": clean_url,
                             "imageUrl": img_url,
                             "brand": analysis.brand,
@@ -1143,13 +1316,28 @@ class BestBuyClient:
                 )
                 in_stock = not is_sold_out
 
+                t_lower = title.lower()
+                is_refurb = "refurbished" in t_lower
+                is_open_box = any(w in t_lower for w in ["open-box", "open box"])
+                if is_refurb:
+                    cond_tag = "refurbished"
+                    cond_label = "Geek Squad Certified"
+                elif is_open_box:
+                    cond_tag = "open_box"
+                    cond_label = "Open Box"
+                else:
+                    cond_tag = "new"
+                    cond_label = "Brand New"
+
                 valid_offers.append({
                     "retailer": "Best Buy",
                     "title": title,
                     "price": price,
                     "originalPrice": None,
                     "inStock": in_stock,
-                    "isRefurbished": any(w in title.lower() for w in ["refurbished", "open-box", "open box"]),
+                    "condition": cond_tag,
+                    "conditionLabel": cond_label,
+                    "isRefurbished": cond_tag in ["refurbished", "open_box"],
                     "url": pdp_url,
                     "imageUrl": img_url,
                     "brand": analysis.brand,
@@ -1189,13 +1377,28 @@ class BestBuyClient:
                     )
                     in_stock = not is_sold_out
 
+                    t_dom_lower = t.lower()
+                    is_dom_refurb = "refurbished" in t_dom_lower
+                    is_dom_open = any(w in t_dom_lower for w in ["open-box", "open box"])
+                    if is_dom_refurb:
+                        dom_cond_tag = "refurbished"
+                        dom_cond_label = "Geek Squad Certified"
+                    elif is_dom_open:
+                        dom_cond_tag = "open_box"
+                        dom_cond_label = "Open Box"
+                    else:
+                        dom_cond_tag = "new"
+                        dom_cond_label = "Brand New"
+
                     valid_offers.append({
                         "retailer": "Best Buy",
                         "title": t,
                         "price": p_val,
                         "originalPrice": None,
                         "inStock": in_stock,
-                        "isRefurbished": any(w in t.lower() for w in ["refurbished", "open-box", "open box"]),
+                        "condition": dom_cond_tag,
+                        "conditionLabel": dom_cond_label,
+                        "isRefurbished": dom_cond_tag in ["refurbished", "open_box"],
                         "url": p_link,
                         "imageUrl": p_img,
                         "brand": analysis.brand,
@@ -1433,13 +1636,28 @@ class HardwareAgent:
             offers = await self.newegg.search(query)
             candidates = []
             for o in offers:
+                t_lower = (o.title or "").lower()
+                is_refurb = "refurbished" in t_lower
+                is_open_box = any(w in t_lower for w in ["open box", "open-box"])
+                if is_refurb:
+                    cond_tag = "refurbished"
+                    cond_label = "Refurbished"
+                elif is_open_box:
+                    cond_tag = "open_box"
+                    cond_label = "Open Box"
+                else:
+                    cond_tag = "new"
+                    cond_label = "Brand New"
+
                 candidates.append({
                     "retailer": "Newegg",
                     "title": o.title,
                     "price": o.price,
                     "originalPrice": o.original_price,
                     "inStock": o.in_stock,
-                    "isRefurbished": any(w in (o.title or "").lower() for w in ["refurbished", "open box", "open-box"]),
+                    "condition": cond_tag,
+                    "conditionLabel": cond_label,
+                    "isRefurbished": is_refurb or is_open_box,
                     "url": o.url,
                     "imageUrl": o.image_url,
                     "brand": analysis.brand,
@@ -1460,13 +1678,19 @@ class HardwareAgent:
             offers = await self.microcenter.search(query)
             candidates = []
             for o in offers:
+                t_lower = (o.title or "").lower()
+                is_open_box = any(w in t_lower for w in ["refurbished", "open box", "open-box"])
+                cond_tag = "open_box" if is_open_box else "new"
+                cond_label = "Open Box" if is_open_box else "Brand New"
                 candidates.append({
                     "retailer": "Micro Center",
                     "title": o.title,
                     "price": o.price,
                     "originalPrice": o.original_price,
                     "inStock": o.in_stock,
-                    "isRefurbished": any(w in (o.title or "").lower() for w in ["refurbished", "open box", "open-box"]),
+                    "condition": cond_tag,
+                    "conditionLabel": cond_label,
+                    "isRefurbished": is_open_box,
                     "url": o.url,
                     "imageUrl": o.image_url,
                     "brand": analysis.brand,
@@ -1554,15 +1778,26 @@ class HardwareAgent:
             else:
                 print(f"[Product Notice] '{analysis.model}' may be a custom or new SKU; attempting catalog search directly")
 
-        # 2. Concurrently scrape ALL 5 major retailers
+        # 2. Concurrently scrape retailers with lifecycle intelligence
         search_target = analysis.retailer_search_query or analysis.model or clean_prompt
-        tasks = [
-            self.amazon.search(analysis),
-            self.ebay.search(analysis),
-            self.bestbuy.search(analysis),
-            self._search_newegg(search_target, analysis),
-            self._search_microcenter(search_target, analysis),
-        ]
+        is_legacy = ProductAnalyzer.is_legacy_or_discontinued(analysis)
+
+        if is_legacy:
+            print(f"📦 [Hardware Lifecycle] '{analysis.model}' identified as legacy/discontinued hardware.")
+            print(f"   Skipping retail-only chains (Best Buy, Micro Center); focusing on secondary marketplaces (eBay, Amazon Renewed, Newegg).")
+            tasks = [
+                self.amazon.search(analysis),
+                self.ebay.search(analysis),
+                self._search_newegg(search_target, analysis),
+            ]
+        else:
+            tasks = [
+                self.amazon.search(analysis),
+                self.ebay.search(analysis),
+                self.bestbuy.search(analysis),
+                self._search_newegg(search_target, analysis),
+                self._search_microcenter(search_target, analysis),
+            ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Flatten all raw candidates into one pool
@@ -1603,7 +1838,8 @@ class HardwareAgent:
             res["previousPrice7d"] = res.get("previousPrice7d") or (orig_val if orig_val > p_val else p_val)
             res["previousPrice30d"] = res.get("previousPrice30d") or (orig_val if orig_val > p_val else p_val)
             scraped_offers.append(res)
-            print(f"\u2705 [{res['retailer']}] ${res['price']:.2f} \u2192 {res['title'][:60]}")
+            cond_str = f" ({res.get('conditionLabel', 'New')})" if res.get("conditionLabel") else ""
+            print(f"✅ [{res['retailer']}] ${res['price']:.2f}{cond_str} → {res['title'][:60]}")
             if emit_fn:
                 emit_fn("retailer_found", {
                     "query": analysis.model,
@@ -1616,6 +1852,8 @@ class HardwareAgent:
                     "previousPrice24h": res["previousPrice24h"],
                     "previousPrice7d": res["previousPrice7d"],
                     "previousPrice30d": res["previousPrice30d"],
+                    "condition": res.get("condition", "new"),
+                    "conditionLabel": res.get("conditionLabel", "Brand New"),
                     "url": res["url"],
                     "imageUrl": res.get("imageUrl"),
                     "inStock": res.get("inStock", True),
@@ -1629,13 +1867,15 @@ class HardwareAgent:
         # 4. Generate Summary
         if scraped_offers:
             best = scraped_offers[0]
-            summary = f"Best price for {analysis.model} is ${best['price']:.2f} at {best['retailer']} ({len(scraped_offers)} retailers found)."
+            cond_str = f" ({best.get('conditionLabel', 'New')})" if best.get("conditionLabel") else ""
+            summary = f"Best price for {analysis.model} is ${best['price']:.2f}{cond_str} at {best['retailer']} ({len(scraped_offers)} retailers found)."
             print(f"\n--- FINAL MULTI-RETAILER RESULTS ---")
             print(f"Total Offers: {len(scraped_offers)}")
             for o in scraped_offers:
-                print(f"  • {o['retailer']}: ${o['price']:.2f} ({o['title'][:55]}...)")
+                c_str = f" [{o.get('conditionLabel', 'New')}]" if o.get("conditionLabel") else ""
+                print(f"  • {o['retailer']}: ${o['price']:.2f}{c_str} ({o['title'][:55]}...)")
         else:
-            summary = f"No verified in-stock offers found for {analysis.model} on Amazon, eBay, or Best Buy."
+            summary = f"No verified in-stock offers found for {analysis.model} on tested retailers."
             print(f"\n[HardwareAgent] No valid offers found across retailers.")
 
         best_offer = scraped_offers[0] if scraped_offers else None
