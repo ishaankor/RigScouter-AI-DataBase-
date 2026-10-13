@@ -104,23 +104,17 @@ class ProductAnalyzer:
             "You are an expert PC hardware and technology analyzer. "
             "Given a user search query, extract structured information without relying on hardcoded lists. "
             "Return valid JSON with:\n"
-            "- \"brand\": The hardware manufacturer or brand if known/implied (e.g. 'Montech', 'NVIDIA', 'AMD', 'ASUS', 'Corsair', 'Lian Li'), or null.\n"
-            "- \"model\": The core model / part name (e.g. 'King 95', 'RTX 5090', 'Ryzen 7 9800X3D', 'Trident Z5', 'RM850x').\n"
+            "- \"brand\": The hardware manufacturer or brand if known/implied (e.g. 'Intel', 'AMD', 'NVIDIA', 'ASUS', 'Corsair', 'Montech'), or null.\n"
+            "- \"model\": The core model / part name (e.g. 'Core Ultra 7 265K', 'RTX 5090', 'Ryzen 7 9800X3D', 'King 95').\n"
             "- \"category\": Exactly one of: 'GPU', 'CPU', 'RAM', 'Motherboard', 'Storage', 'Power Supply', 'Case', 'Cooling', 'Monitor', 'Peripherals', or 'Other'.\n"
-            "- \"is_pc_part\": true if it is a PC component, computer part, or peripheral; false if food, clothing, or unrelated.\n"
-            "- \"product_exists\": true if this is a real product that was actually manufactured and sold commercially. "
-            "false if the model number/name combination is fictitious or was never produced "
-            "(e.g. 'RTX 1080 Ti' — NVIDIA never made an RTX-tier 1080, the 1080 Ti is GTX only; "
-            "'AMD RX 590X' — no such SKU exists). When in doubt, set true.\n"
-            "- \"correction_suggestion\": If product_exists is false, provide the closest real product the user likely meant "
-            "(e.g. 'GTX 1080 Ti' or 'RTX 2080 Ti' for 'RTX 1080 Ti'). null if product_exists is true.\n"
+            "- \"is_pc_part\": true if it is a PC component, computer part, or peripheral; false only if food, clothing, or completely unrelated items.\n"
+            "- \"product_exists\": true if this is a real product or close variant. Note: descriptive words like 'Plus', 'OC', 'Gaming', 'White', 'Pro' do NOT make a product fictitious. "
+            "Also note modern architectures: Intel Core Ultra (Series 2 Arrow Lake desktop: Core Ultra 9 285K, Core Ultra 7 265K, Core Ultra 5 245K; Series 1 mobile: Core Ultra 7 155H). "
+            "If the query refers to a Core Ultra 7 2xxK, the true desktop SKU is Core Ultra 7 265K. When in doubt, always set product_exists: true.\n"
+            "- \"correction_suggestion\": If the user made an obvious typo in an SKU (e.g. '270K' instead of '265K' for Core Ultra 7, or 'RTX 1080 Ti' instead of 'GTX 1080 Ti'), provide the closest real product (e.g. 'Intel Core Ultra 7 265K'). null if product_exists is true.\n"
             "- \"min_price\": Realistic minimum market price in USD for a functional, genuine unit of this hardware component (e.g. 1400 for RTX 4090, 180 for RTX 3060, 220 for 7800X3D, 50 for King 95, 30 for 16GB RAM). Used to automatically discard dummy replicas, 1:1 scale toys, empty boxes, and brackets.\n"
-            "- \"retailer_search_query\": Clean search term optimized for retailer product catalogs (e.g. 'Montech King 95 PC Case', 'AMD Ryzen 7 9800X3D', 'RTX 5090').\n"
-            "- \"negative_keywords\": Array of terms that indicate a candidate result is the WRONG product, accessory, toy, or broken item. For instance:\n"
-            "   * If Case: reject ['Prebuilt', 'Gaming PC', 'Desktop PC', 'Cable', 'Bracket', 'Screws'].\n"
-            "   * If CPU: reject ['Prebuilt', 'Desktop PC', 'Cooler', 'Motherboard Combo', 'Keychain', 'Delid'].\n"
-            "   * If GPU: reject ['Prebuilt', 'Desktop PC', 'Bracket', 'Backplate', 'Heatsink', 'Shroud', 'Poster', 'Replica', 'Display Only', 'Dummy'].\n"
-            "   * If Cooler: reject ['Case', 'Prebuilt', 'Thermal Paste Only']."
+            "- \"retailer_search_query\": Clean search term optimized for retailer catalogs (e.g. 'Intel Core Ultra 7 265K', 'Montech King 95 PC Case', 'AMD Ryzen 7 9800X3D'). If there is a typo or extra fluff like 'Plus', clean it here to maximize retailer search hits.\n"
+            "- \"negative_keywords\": Array of terms that indicate a candidate result is the WRONG product, accessory, toy, or broken item."
         )
 
         models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b", "groq/compound"]
@@ -1488,40 +1482,15 @@ class HardwareAgent:
                 "failed_retailers": []
             }
 
+        # If product does not strictly exist as typed, auto-route search to suggestion instead of crashing
         if not analysis.product_exists:
             suggestion = analysis.correction_suggestion
             if suggestion:
-                msg = f"'{analysis.model}' does not appear to be a real product. Did you mean '{suggestion}'?"
+                print(f"[Product Notice] '{analysis.model}' not recognized as exact SKU; auto-routing search to '{suggestion}'")
+                analysis.retailer_search_query = suggestion
+                analysis.model = suggestion
             else:
-                msg = f"'{analysis.model}' does not appear to be a real product that was ever manufactured."
-            print(f"[Invalid Product Rejected] {msg}")
-            if emit_fn:
-                emit_fn("agent_error", {
-                    "query": clean_prompt,
-                    "original_query": clean_prompt,
-                    "error_type": "INVALID_PRODUCT",
-                    "message": msg,
-                    "correction_suggestion": suggestion,
-                    "pending_id": pending_id,
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                })
-                emit_fn("agent_complete", {
-                    "query": clean_prompt,
-                    "original_query": clean_prompt,
-                    "category": analysis.category,
-                    "scrapedOffers": [],
-                    "summary": msg,
-                    "pending_id": pending_id,
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                })
-            return {
-                "query": clean_prompt,
-                "normalized_query": analysis.model,
-                "category": analysis.category,
-                "correction_suggestion": suggestion,
-                "scrapedOffers": [],
-                "failed_retailers": []
-            }
+                print(f"[Product Notice] '{analysis.model}' may be a custom or new SKU; attempting catalog search directly")
 
         # 2. Concurrently scrape retailers (Amazon + eBay + Best Buy)
         # Each retailer now returns a LIST of raw candidates (pre-validation)
