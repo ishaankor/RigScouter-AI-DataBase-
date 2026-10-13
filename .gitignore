@@ -8,4 +8,3 @@ venv/
 scratch/
 keep_alive.py
 keep_alive_cron.sql
-tests/

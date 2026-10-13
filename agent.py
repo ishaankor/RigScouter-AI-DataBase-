@@ -101,24 +101,19 @@ class ProductAnalyzer:
             return ProductAnalysis(clean, None, clean, "Hardware", True, clean, [])
 
         prompt = (
-            "You are an expert PC hardware and technology analyzer. "
+            "You are an expert PC hardware and technology analyzer for all custom PC rig components. "
+            "A user can search for ANY rig part across all categories: "
+            "CPUs, GPUs, Motherboards, RAM, Storage (SSDs/HDDs), Power Supplies (PSUs), Cases, "
+            "Cooling (AIO liquid coolers, air coolers, case fans), Monitors, and Peripherals.\n"
             "Given a user search query, extract structured information without relying on hardcoded lists. "
             "Return valid JSON with:\n"
-            "- \"brand\": The hardware manufacturer or brand if known/implied (e.g. 'Intel', 'AMD', 'NVIDIA', 'ASUS', 'Corsair', 'Montech'), or null.\n"
-            "- \"model\": The core model / part name (e.g. 'Core Ultra 7 265K', 'RTX 5090', 'Ryzen 5 9600X', 'Ryzen 7 9800X3D', 'King 95').\n"
+            "- \"brand\": The hardware manufacturer or brand if present/identifiable (e.g. Corsair, Lian Li, ASUS, MSI, Noctua, AMD, Intel, NVIDIA, Samsung, Fractal Design, Seasonic, NZXT, G.Skill, Thermalright, Western Digital, be quiet!), or null.\n"
+            "- \"model\": The specific model name or part identifier (e.g. 'King 95', 'RM850x', 'O11 Dynamic', '990 Pro', 'B650 Tomahawk', 'Trident Z5', 'Peerless Assassin 120', 'Kraken Elite 360', 'Ryzen 5 9600X', 'RTX 5090').\n"
             "- \"category\": Exactly one of: 'GPU', 'CPU', 'RAM', 'Motherboard', 'Storage', 'Power Supply', 'Case', 'Cooling', 'Monitor', 'Peripherals', or 'Other'.\n"
-            "- \"is_pc_part\": true if it is a PC component, computer part, or peripheral; false only if food, clothing, or completely unrelated items.\n"
-            "- \"product_exists\": true if this is a real product or close variant. Note: descriptive words like 'Plus', 'OC', 'Gaming', 'White', 'Pro' do NOT make a product fictitious.\n"
-            "CRITICAL ARCHITECTURE KNOWLEDGE:\n"
-            "1. AMD Ryzen 9000 (Zen 5 desktop): Ryzen 5 9600X, Ryzen 7 9700X, Ryzen 9 9900X, Ryzen 9 9950X, Ryzen 7 9800X3D, Ryzen 9 9900X3D, Ryzen 9 9950X3D are REAL, active products! NEVER downgrade Ryzen 9000 to older Ryzen 5000 or 7000!\n"
-            "2. AMD Ryzen 7000/8000 (Zen 4): Ryzen 5 7600/7600X, Ryzen 7 7700/7700X/7800X3D, Ryzen 9 7900/7900X/7950X/7950X3D, 8600G, 8700G.\n"
-            "3. Intel Core Ultra Series 2 (Arrow Lake desktop): Core Ultra 9 285K, Core Ultra 7 265K/265KF, Core Ultra 5 245K/245KF, Core Ultra 5 225. (If query is 270K, suggestion is 265K).\n"
-            "4. Intel 14th Gen: i9-14900K/KF/KS, i7-14700K/KF, i5-14600K/KF, i5-14400.\n"
-            "5. NVIDIA RTX 50 series (Blackwell): RTX 5090, RTX 5080, RTX 5070 Ti, RTX 5070.\n"
-            "When in doubt, always set product_exists: true.\n"
-            "- \"correction_suggestion\": If the user made an obvious typo in an SKU (e.g. '270K' instead of '265K' for Core Ultra 7, or 'RTX 1080 Ti' instead of 'GTX 1080 Ti'), provide the closest real product. null if product_exists is true. NEVER downgrade a generation (e.g. 9600X to 5600X is NOT a typo).\n"
-            "- \"min_price\": Realistic minimum market price in USD for a functional, genuine unit of this hardware component (e.g. 1400 for RTX 4090, 180 for RTX 3060, 180 for 9600X, 220 for 7800X3D, 50 for King 95, 30 for 16GB RAM). Used to automatically discard dummy replicas, 1:1 scale toys, empty boxes, and brackets.\n"
-            "- \"retailer_search_query\": Clean search term optimized for retailer catalogs (e.g. 'AMD Ryzen 5 9600X', 'Intel Core Ultra 7 265K', 'Montech King 95 PC Case'). If there is a typo or extra fluff like 'Plus', clean it here to maximize retailer search hits.\n"
+            "- \"is_pc_part\": true for any PC hardware component or computer peripheral; false only if completely unrelated items (food, clothing, household goods).\n"
+            "- \"product_exists\": true for any real or plausible PC hardware part. Never assume a product does not exist just because it is new or custom.\n"
+            "- \"min_price\": Realistic minimum market price in USD for a genuine unit of this hardware component (e.g. 15 for fans/paste, 35 for budget RAM/coolers, 50 for budget cases/storage, 70 for budget PSUs/motherboards, 100+ for mid-range components). Used to automatically discard dummy replicas, 1:1 scale toys, empty boxes, and brackets.\n"
+            "- \"retailer_search_query\": Clean search term optimized for retailer catalogs (e.g. brand + model without search noise like 'buy', 'price', etc.). NEVER change or substitute the user's component model!\n"
             "- \"negative_keywords\": Array of terms that indicate a candidate result is the WRONG product, accessory, toy, or broken item."
         )
 
@@ -149,28 +144,8 @@ class ProductAnalyzer:
                         except (ValueError, TypeError):
                             pass
 
-                    parsed_exists = bool(data.get("product_exists", True))
-                    sugg = data.get("correction_suggestion") or None
-                    clean_lower = clean.lower()
-
-                    # Safety guard: if query matches standard PC component naming convention, never downgrade
-                    is_valid_sku_format = bool(
-                        re.search(r'\bryzen\s*[3579]\s*(?:[1-9]\d{3}|[1-9]\d{2})[a-z0-9]*\b', clean_lower) or
-                        re.search(r'\b(?:core\s*)?(?:ultra\s*)?[iI]?[3579]-?\s*\d{3,5}[a-z0-9]*\b', clean_lower) or
-                        re.search(r'\b(?:rtx|gtx)\s*\d{3,4}(?:\s*ti|\s*super)?\b', clean_lower) or
-                        re.search(r'\brx\s*\d{3,4}(?:\s*xt|\s*xtx)?\b', clean_lower)
-                    )
-                    if is_valid_sku_format:
-                        parsed_exists = True
-                        sugg = None
-
-                    # If model number in suggestion differs from model number in query, drop suggestion
-                    if sugg:
-                        orig_nums = re.findall(r'\b\d{3,5}\b', clean)
-                        sugg_nums = re.findall(r'\b\d{3,5}\b', sugg)
-                        if orig_nums and sugg_nums and orig_nums[0] != sugg_nums[0]:
-                            sugg = None
-                            parsed_exists = True
+                    # Ground retailer search query firmly in the user's searched component
+                    ret_query = data.get("retailer_search_query") or clean
 
                     return ProductAnalysis(
                         raw_query=clean,
@@ -178,11 +153,11 @@ class ProductAnalyzer:
                         model=data.get("model") or clean,
                         category=data.get("category") or "Other",
                         is_pc_part=bool(data.get("is_pc_part", True)),
-                        retailer_search_query=clean if is_valid_sku_format else (data.get("retailer_search_query") or clean),
+                        retailer_search_query=ret_query,
                         negative_keywords=data.get("negative_keywords") or [],
                         min_price=min_p,
-                        product_exists=parsed_exists,
-                        correction_suggestion=sugg
+                        product_exists=True,
+                        correction_suggestion=None
                     )
             except Exception as e:
                 print(f"[ProductAnalyzer Error with {model_name}] {e}")
@@ -238,80 +213,9 @@ class ProductAnalyzer:
 
     @staticmethod
     def validate_offer_fast(analysis: ProductAnalysis, title: str, price: float) -> tuple[bool, str]:
-        """Lightweight fast-fail: rejects $0 prices, dummy items, wrong SKU numbers, accessories, and price-floor violations.
-        Real semantic validation is handled by validate_candidates_llm()."""
-        title_lower = title.lower()
-
-        if price <= 0:
-            return False, "Price is 0 or negative"
-
-        # Hard dummy/replica/toy patterns
-        dummy_patterns = [
-            "replica", "1:1 scale", "scale model", "dummy", "mockup", "toy",
-            "3d print", "3d printed", "prop", "display only", "box only", "empty box",
-            "packaging only", "for parts", "parts only", "not working", "broken",
-            "poster", "keychain", "sticker", "t-shirt", "hoodie", "mug"
-        ]
-        for dp in dummy_patterns:
-            if re.search(r'\b' + re.escape(dp) + r'\b', title_lower):
-                if dp not in analysis.raw_query.lower():
-                    return False, f"Dummy/non-hardware item: '{dp}'"
-
-        # Accessory filtering based on category
-        cat_upper = (analysis.category or "").upper()
-        if cat_upper in ["CPU", "PROCESSOR"]:
-            cpu_acc = [
-                "cpu cooler", "air cooler", "liquid cooler", "aio cooler", "water cooler",
-                "cooler master", "thermalright", "noctua", "deepcool", "thermal paste",
-                "contact frame", "mounting bracket", "retention bracket", "cpu fan"
-            ]
-            for acc in cpu_acc:
-                if re.search(r'\b' + re.escape(acc) + r'\b', title_lower):
-                    if acc not in analysis.raw_query.lower() and acc not in analysis.model.lower():
-                        return False, f"Accessory item: '{acc}'"
-        elif cat_upper in ["GPU", "GRAPHICS CARD"]:
-            gpu_acc = [
-                "gpu bracket", "support bracket", "riser cable", "vertical mount",
-                "backplate", "water block", "cooling fan replacement"
-            ]
-            for acc in gpu_acc:
-                if re.search(r'\b' + re.escape(acc) + r'\b', title_lower):
-                    if acc not in analysis.raw_query.lower() and acc not in analysis.model.lower():
-                        return False, f"Accessory item: '{acc}'"
-
-        # Numeric model token matching (e.g. 4770, 10700, 6700, 7800, 4070)
-        nums = re.findall(r'(?<!\d)(\d{3,5})(?!\d)', analysis.model)
-        if not nums:
-            nums = re.findall(r'(?<!\d)(\d{3,5})(?!\d)', analysis.retailer_search_query)
-        for num in nums:
-            if not re.search(r'(?<!\d)' + num + r'(?!\d)', title_lower):
-                return False, f"Missing model number {num}"
-
-        # Critical variant suffix matching (e.g. K, KF, F, X, X3D, Ti, XT, XTX, Super)
-        critical_suffixes = ["x3d", "xtx", "kf", "ti", "xt", "super", "k", "f", "x"]
-        found_suffix = None
-        for s in critical_suffixes:
-            if re.search(r'(?:\b|(?<=\d))' + re.escape(s) + r'\b', analysis.model.lower()):
-                found_suffix = s
-                break
-
-        if found_suffix and nums:
-            if not re.search(r'(?:\b|(?<=\d))' + re.escape(found_suffix) + r'\b', title_lower):
-                return False, f"Missing requested variant '{found_suffix.upper()}'"
-
-        # Price floor (only reject obvious non-hardware accessories/stickers or items priced under 15% of floor)
-        if analysis.min_price and analysis.min_price > 0:
-            floor_threshold = max(8.0, analysis.min_price * 0.15)
-            if price < floor_threshold:
-                return False, f"Price ${price:.2f} is below minimum accessory floor (${floor_threshold:.2f}) for {analysis.model}"
-
-            # Price ceiling (reject desktop prebuilts, motherboard bundles, and recommended carousel leaks)
-            ceiling_multiplier = 3.0 if cat_upper in ["CPU", "PROCESSOR"] else 3.5
-            ceiling_threshold = max(analysis.min_price * ceiling_multiplier, analysis.min_price + 250.0)
-            if price > ceiling_threshold:
-                return False, f"Price ${price:.2f} exceeds realistic ceiling (${ceiling_threshold:.2f}) for standalone {analysis.model} (likely prebuilt, bundle, or carousel recommendation)"
-
-        return True, "Passed fast-fail"
+        """Universal fast-fail check across all PC rig categories (CPU, GPU, Case, Cooler, RAM, Storage, PSU, etc.)."""
+        from app.scrapers.validator import validate_offer_fast as universal_validate
+        return universal_validate(title, price, analysis)
 
     @staticmethod
     async def validate_candidates_llm(
@@ -1807,25 +1711,8 @@ class HardwareAgent:
                 "failed_retailers": []
             }
 
-        # If product does not strictly exist as typed, auto-route search to suggestion only if it is a true minor typo
-        if not analysis.product_exists:
-            suggestion = analysis.correction_suggestion
-            orig_nums = re.findall(r'\b\d{3,5}\b', analysis.model)
-            sugg_nums = re.findall(r'\b\d{3,5}\b', suggestion or "")
-            # Protect against cross-generation downgrade (e.g. 9600X -> 5600X)
-            if orig_nums and sugg_nums and orig_nums[0] != sugg_nums[0]:
-                print(f"[Product Notice] Suggestion '{suggestion}' has different model number than '{analysis.model}'; preserving original user query.")
-                suggestion = None
-
-            if suggestion:
-                print(f"[Product Notice] '{analysis.model}' not recognized as exact SKU; auto-routing search to '{suggestion}'")
-                analysis.retailer_search_query = suggestion
-                analysis.model = suggestion
-            else:
-                print(f"[Product Notice] '{analysis.model}' may be a new or custom SKU; attempting catalog search directly")
-
         # 2. Concurrently scrape retailers with lifecycle intelligence
-        search_target = analysis.retailer_search_query or analysis.model or clean_prompt
+        search_target = clean_prompt
         is_legacy = ProductAnalyzer.is_legacy_or_discontinued(analysis)
 
         if is_legacy:
