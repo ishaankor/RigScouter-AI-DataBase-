@@ -1,11 +1,28 @@
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from app.core.database import supabase
 from app.services.scraper_service import scraper_service
 from app.services.pricing_service import pricing_service
 
 logger = logging.getLogger("rigscouter.tasks.refresh")
+
+async def prune_old_price_snapshots(retention_days: int = 90):
+    """
+    Deletes sub-hourly price snapshots older than `retention_days` to prevent
+    unbounded table bloat, maintaining peak database query performance.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
+    try:
+        res = await asyncio.to_thread(
+            supabase.table("price_snapshots")
+            .delete()
+            .lt("scraped_at", cutoff)
+            .execute
+        )
+        logger.info(f"🧹 [Snapshot Pruning] Cleared old snapshots prior to {cutoff}")
+    except Exception as e:
+        logger.debug(f"[Snapshot Pruning Notice] {e}")
 
 async def run_daily_price_refresh_job():
     """
@@ -33,12 +50,20 @@ async def run_daily_price_refresh_job():
 
             if not offers:
                 search_q = comp.get("model") or name
-                offers = await scraper_service.find_all_offers(search_q)
+                # Force live scrape during scheduled daily refresh
+                offers = await scraper_service.find_all_offers(
+                    query=search_q,
+                    comp_id=comp_id,
+                    force=True
+                )
 
             if offers:
                 await pricing_service.update_component_and_watchlist(comp_id, name, offers)
 
             await asyncio.sleep(1.0)  # Gentle spacing to avoid hitting rate limits
+
+        # Run maintenance cleanup at the end of refresh
+        await prune_old_price_snapshots(retention_days=90)
 
         logger.info("✅ [Daily Price Refresh Job Completed]")
     except Exception as e:
