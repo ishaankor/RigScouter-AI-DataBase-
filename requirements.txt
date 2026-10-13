@@ -9,3 +9,5 @@ beautifulsoup4
 lxml
 firecrawl-py
 curl_cffi
+apscheduler
+pydantic
