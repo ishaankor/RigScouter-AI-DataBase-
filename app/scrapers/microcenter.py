@@ -41,7 +41,18 @@ class MicroCenterScraper(BaseScraper):
             snippet = item.get("content", "")
             price, orig = parse_tavily_snippet_prices(snippet + " " + raw_title)
 
-            if price:
+            # Detect out of stock indicators in snippet and title
+            txt_lower = f"{raw_title} {snippet}".lower()
+            is_sold_out = any(
+                phrase in txt_lower for phrase in [
+                    "0 in stock", "sold out", "out of stock", "currently unavailable",
+                    "not in stock", "backorder", "pick up in store only - 0",
+                    "0 available", "not available online", "discontinued"
+                ]
+            )
+            in_stock = not is_sold_out
+
+            if price and price > 0:
                 is_valid, _ = validate_offer_fast(raw_title, price, analysis)
                 if is_valid:
                     offers.append(Offer(
@@ -51,9 +62,12 @@ class MicroCenterScraper(BaseScraper):
                         url=url,
                         title=raw_title,
                         snippet=snippet,
-                        in_stock=True
+                        in_stock=in_stock
                     ))
-                    break
+
+        if offers:
+            # Sort to prioritize in-stock offers first, then best price
+            offers.sort(key=lambda x: (not x.in_stock, x.price))
 
         return offers
 

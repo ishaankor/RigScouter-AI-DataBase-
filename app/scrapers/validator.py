@@ -84,4 +84,10 @@ def validate_offer_fast(
             if price < floor:
                 return False, f"Price ${price:.2f} is below minimum hardware floor (${floor:.2f})"
 
+            # Realistic ceiling check (rejects prebuilts, motherboard bundles, and recommended carousel leaks)
+            mult = 3.0 if cat_upper in ["CPU", "PROCESSOR"] else 3.5
+            ceiling = max(float(min_price) * mult, float(min_price) + 250.0)
+            if price > ceiling:
+                return False, f"Price ${price:.2f} exceeds realistic ceiling (${ceiling:.2f}) for standalone {analysis.model}"
+
     return True, "Valid offer"

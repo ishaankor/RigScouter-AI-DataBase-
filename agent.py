@@ -105,15 +105,20 @@ class ProductAnalyzer:
             "Given a user search query, extract structured information without relying on hardcoded lists. "
             "Return valid JSON with:\n"
             "- \"brand\": The hardware manufacturer or brand if known/implied (e.g. 'Intel', 'AMD', 'NVIDIA', 'ASUS', 'Corsair', 'Montech'), or null.\n"
-            "- \"model\": The core model / part name (e.g. 'Core Ultra 7 265K', 'RTX 5090', 'Ryzen 7 9800X3D', 'King 95').\n"
+            "- \"model\": The core model / part name (e.g. 'Core Ultra 7 265K', 'RTX 5090', 'Ryzen 5 9600X', 'Ryzen 7 9800X3D', 'King 95').\n"
             "- \"category\": Exactly one of: 'GPU', 'CPU', 'RAM', 'Motherboard', 'Storage', 'Power Supply', 'Case', 'Cooling', 'Monitor', 'Peripherals', or 'Other'.\n"
             "- \"is_pc_part\": true if it is a PC component, computer part, or peripheral; false only if food, clothing, or completely unrelated items.\n"
-            "- \"product_exists\": true if this is a real product or close variant. Note: descriptive words like 'Plus', 'OC', 'Gaming', 'White', 'Pro' do NOT make a product fictitious. "
-            "Also note modern architectures: Intel Core Ultra (Series 2 Arrow Lake desktop: Core Ultra 9 285K, Core Ultra 7 265K, Core Ultra 5 245K; Series 1 mobile: Core Ultra 7 155H). "
-            "If the query refers to a Core Ultra 7 2xxK, the true desktop SKU is Core Ultra 7 265K. When in doubt, always set product_exists: true.\n"
-            "- \"correction_suggestion\": If the user made an obvious typo in an SKU (e.g. '270K' instead of '265K' for Core Ultra 7, or 'RTX 1080 Ti' instead of 'GTX 1080 Ti'), provide the closest real product (e.g. 'Intel Core Ultra 7 265K'). null if product_exists is true.\n"
-            "- \"min_price\": Realistic minimum market price in USD for a functional, genuine unit of this hardware component (e.g. 1400 for RTX 4090, 180 for RTX 3060, 220 for 7800X3D, 50 for King 95, 30 for 16GB RAM). Used to automatically discard dummy replicas, 1:1 scale toys, empty boxes, and brackets.\n"
-            "- \"retailer_search_query\": Clean search term optimized for retailer catalogs (e.g. 'Intel Core Ultra 7 265K', 'Montech King 95 PC Case', 'AMD Ryzen 7 9800X3D'). If there is a typo or extra fluff like 'Plus', clean it here to maximize retailer search hits.\n"
+            "- \"product_exists\": true if this is a real product or close variant. Note: descriptive words like 'Plus', 'OC', 'Gaming', 'White', 'Pro' do NOT make a product fictitious.\n"
+            "CRITICAL ARCHITECTURE KNOWLEDGE:\n"
+            "1. AMD Ryzen 9000 (Zen 5 desktop): Ryzen 5 9600X, Ryzen 7 9700X, Ryzen 9 9900X, Ryzen 9 9950X, Ryzen 7 9800X3D, Ryzen 9 9900X3D, Ryzen 9 9950X3D are REAL, active products! NEVER downgrade Ryzen 9000 to older Ryzen 5000 or 7000!\n"
+            "2. AMD Ryzen 7000/8000 (Zen 4): Ryzen 5 7600/7600X, Ryzen 7 7700/7700X/7800X3D, Ryzen 9 7900/7900X/7950X/7950X3D, 8600G, 8700G.\n"
+            "3. Intel Core Ultra Series 2 (Arrow Lake desktop): Core Ultra 9 285K, Core Ultra 7 265K/265KF, Core Ultra 5 245K/245KF, Core Ultra 5 225. (If query is 270K, suggestion is 265K).\n"
+            "4. Intel 14th Gen: i9-14900K/KF/KS, i7-14700K/KF, i5-14600K/KF, i5-14400.\n"
+            "5. NVIDIA RTX 50 series (Blackwell): RTX 5090, RTX 5080, RTX 5070 Ti, RTX 5070.\n"
+            "When in doubt, always set product_exists: true.\n"
+            "- \"correction_suggestion\": If the user made an obvious typo in an SKU (e.g. '270K' instead of '265K' for Core Ultra 7, or 'RTX 1080 Ti' instead of 'GTX 1080 Ti'), provide the closest real product. null if product_exists is true. NEVER downgrade a generation (e.g. 9600X to 5600X is NOT a typo).\n"
+            "- \"min_price\": Realistic minimum market price in USD for a functional, genuine unit of this hardware component (e.g. 1400 for RTX 4090, 180 for RTX 3060, 180 for 9600X, 220 for 7800X3D, 50 for King 95, 30 for 16GB RAM). Used to automatically discard dummy replicas, 1:1 scale toys, empty boxes, and brackets.\n"
+            "- \"retailer_search_query\": Clean search term optimized for retailer catalogs (e.g. 'AMD Ryzen 5 9600X', 'Intel Core Ultra 7 265K', 'Montech King 95 PC Case'). If there is a typo or extra fluff like 'Plus', clean it here to maximize retailer search hits.\n"
             "- \"negative_keywords\": Array of terms that indicate a candidate result is the WRONG product, accessory, toy, or broken item."
         )
 
@@ -144,17 +149,40 @@ class ProductAnalyzer:
                         except (ValueError, TypeError):
                             pass
 
+                    parsed_exists = bool(data.get("product_exists", True))
+                    sugg = data.get("correction_suggestion") or None
+                    clean_lower = clean.lower()
+
+                    # Safety guard: if query matches standard PC component naming convention, never downgrade
+                    is_valid_sku_format = bool(
+                        re.search(r'\bryzen\s*[3579]\s*(?:[1-9]\d{3}|[1-9]\d{2})[a-z0-9]*\b', clean_lower) or
+                        re.search(r'\b(?:core\s*)?(?:ultra\s*)?[iI]?[3579]-?\s*\d{3,5}[a-z0-9]*\b', clean_lower) or
+                        re.search(r'\b(?:rtx|gtx)\s*\d{3,4}(?:\s*ti|\s*super)?\b', clean_lower) or
+                        re.search(r'\brx\s*\d{3,4}(?:\s*xt|\s*xtx)?\b', clean_lower)
+                    )
+                    if is_valid_sku_format:
+                        parsed_exists = True
+                        sugg = None
+
+                    # If model number in suggestion differs from model number in query, drop suggestion
+                    if sugg:
+                        orig_nums = re.findall(r'\b\d{3,5}\b', clean)
+                        sugg_nums = re.findall(r'\b\d{3,5}\b', sugg)
+                        if orig_nums and sugg_nums and orig_nums[0] != sugg_nums[0]:
+                            sugg = None
+                            parsed_exists = True
+
                     return ProductAnalysis(
                         raw_query=clean,
                         brand=data.get("brand"),
                         model=data.get("model") or clean,
                         category=data.get("category") or "Other",
                         is_pc_part=bool(data.get("is_pc_part", True)),
-                        retailer_search_query=data.get("retailer_search_query") or clean,
+                        retailer_search_query=clean if is_valid_sku_format else (data.get("retailer_search_query") or clean),
                         negative_keywords=data.get("negative_keywords") or [],
                         min_price=min_p,
-                        product_exists=bool(data.get("product_exists", True)),
-                        correction_suggestion=data.get("correction_suggestion") or None
+                        product_exists=parsed_exists,
+                        correction_suggestion=sugg
                     )
             except Exception as e:
                 print(f"[ProductAnalyzer Error with {model_name}] {e}")
@@ -276,6 +304,12 @@ class ProductAnalyzer:
             floor_threshold = max(8.0, analysis.min_price * 0.15)
             if price < floor_threshold:
                 return False, f"Price ${price:.2f} is below minimum accessory floor (${floor_threshold:.2f}) for {analysis.model}"
+
+            # Price ceiling (reject desktop prebuilts, motherboard bundles, and recommended carousel leaks)
+            ceiling_multiplier = 3.0 if cat_upper in ["CPU", "PROCESSOR"] else 3.5
+            ceiling_threshold = max(analysis.min_price * ceiling_multiplier, analysis.min_price + 250.0)
+            if price > ceiling_threshold:
+                return False, f"Price ${price:.2f} exceeds realistic ceiling (${ceiling_threshold:.2f}) for standalone {analysis.model} (likely prebuilt, bundle, or carousel recommendation)"
 
         return True, "Passed fast-fail"
 
@@ -1185,10 +1219,15 @@ class BestBuyClient:
                         in_stock = pb_item.get("inStock", True)
                         img_url = pb_item.get("imageUrl")
                         clean_url = pb_item.get("url") or clean_url
+                    else:
+                        # Product SKU is discontinued or inactive on Best Buy.
+                        # Never parse raw snippet text for inactive SKUs as it leaks
+                        # "Customers Also Viewed" AM5/AM4 carousel prices (e.g. $559).
+                        continue
 
-                # 2. Fallback to smart snippet price extraction
+                # 2. Fallback to snippet price extraction ONLY when no SKU was present in URL
                 txt = (r.get("title") or "") + " " + (r.get("content") or "")
-                if not price:
+                if not price and not sku:
                     s_price, s_orig = self._parse_tavily_snippet_prices(txt)
                     if s_price:
                         price = s_price
@@ -1675,7 +1714,7 @@ class HardwareAgent:
             return []
         try:
             print(f"[Micro Center Direct] Searching for '{query}'...")
-            offers = await self.microcenter.search(query)
+            offers = await self.microcenter.search(query, analysis)
             candidates = []
             for o in offers:
                 t_lower = (o.title or "").lower()
@@ -1768,15 +1807,22 @@ class HardwareAgent:
                 "failed_retailers": []
             }
 
-        # If product does not strictly exist as typed, auto-route search to suggestion instead of crashing
+        # If product does not strictly exist as typed, auto-route search to suggestion only if it is a true minor typo
         if not analysis.product_exists:
             suggestion = analysis.correction_suggestion
+            orig_nums = re.findall(r'\b\d{3,5}\b', analysis.model)
+            sugg_nums = re.findall(r'\b\d{3,5}\b', suggestion or "")
+            # Protect against cross-generation downgrade (e.g. 9600X -> 5600X)
+            if orig_nums and sugg_nums and orig_nums[0] != sugg_nums[0]:
+                print(f"[Product Notice] Suggestion '{suggestion}' has different model number than '{analysis.model}'; preserving original user query.")
+                suggestion = None
+
             if suggestion:
                 print(f"[Product Notice] '{analysis.model}' not recognized as exact SKU; auto-routing search to '{suggestion}'")
                 analysis.retailer_search_query = suggestion
                 analysis.model = suggestion
             else:
-                print(f"[Product Notice] '{analysis.model}' may be a custom or new SKU; attempting catalog search directly")
+                print(f"[Product Notice] '{analysis.model}' may be a new or custom SKU; attempting catalog search directly")
 
         # 2. Concurrently scrape retailers with lifecycle intelligence
         search_target = analysis.retailer_search_query or analysis.model or clean_prompt
