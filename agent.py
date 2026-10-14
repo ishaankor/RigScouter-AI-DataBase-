@@ -1129,24 +1129,19 @@ class BestBuyClient:
                         # "Customers Also Viewed" AM5/AM4 carousel prices (e.g. $559).
                         continue
 
-                # 2. Fallback to snippet price extraction ONLY when no SKU was present in URL
-                txt = (r.get("title") or "") + " " + (r.get("content") or "")
+                # 2. Fallback to smart snippet extraction ONLY when no SKU was present in URL
+                txt = (r.get("title") or "") + "\n" + (r.get("content") or "")
                 if not price and not sku:
-                    s_price, s_orig = self._parse_tavily_snippet_prices(txt)
-                    if s_price:
-                        price = s_price
-                    if s_orig and not orig_price:
-                        orig_price = s_orig
-
-                # Check snippet for discontinued or sold-out indicators
-                if any(phrase in txt.lower() for phrase in [
-                    "no longer available in new condition",
-                    "no longer available",
-                    "sold out",
-                    "currently unavailable",
-                    "not available in new condition"
-                ]):
-                    in_stock = False
+                    from app.scrapers.smart import parse_result_text
+                    smart_listings = await parse_result_text(txt, "Best Buy", clean_url, analysis.raw_query, analysis.category)
+                    if smart_listings:
+                        sl = smart_listings[0]
+                        title = sl.get("title") or title
+                        price = sl["price"]
+                        orig_price = sl.get("original_price")
+                        in_stock = sl.get("in_stock", True)
+                    else:
+                        continue
 
                 if price and price > 0:
                     is_valid, reason = ProductAnalyzer.validate_offer_fast(analysis, title, price)
@@ -1444,36 +1439,34 @@ class BestBuyClient:
             print(f"🔍 [Best Buy Fallback] Querying Tavily cache: {t_query[:60]}...")
             tavily_results = await query_tavily_search(t_query, max_results=3)
             if tavily_results:
+                from app.scrapers.smart import parse_result_text
                 for it in tavily_results:
-                    txt = (it.get("title") or "") + " " + (it.get("content") or "")
-                    s_price, s_orig = self._parse_tavily_snippet_prices(txt)
-                    if s_price and s_price > 10.0:
-                        raw_title = it.get("title", "").replace(" - Best Buy", "").replace("Best Buy:", "").strip()
-                        raw_title = re.sub(r'^(?:Customer Reviews:\s*|Questions and Answers:\s*)', '', raw_title, flags=re.I)
-                        is_sold_out = any(phrase in txt.lower() for phrase in [
-                            "no longer available in new condition",
-                            "no longer available",
-                            "sold out",
-                            "currently unavailable",
-                            "not available in new condition"
-                        ])
-                        in_stock = not is_sold_out
+                    txt = (it.get("title") or "") + "\n" + (it.get("content") or "")
+                    smart_listings = await parse_result_text(txt, "Best Buy", url, clean_slug)
+                    if smart_listings:
+                        sl = smart_listings[0]
+                        s_price = sl["price"]
+                        s_orig = sl.get("original_price")
+                        raw_title = sl.get("title") or it.get("title", "")
+                        in_stock = sl.get("in_stock", True)
+                        cond = sl.get("condition", "new")
                         status_note = "" if in_stock else " [Out of Stock]"
-                        print(f"✅ [Best Buy Tavily Fallback Hit] ${s_price:.2f}{status_note} -> {raw_title[:60]}")
+                        print(f"✅ [Best Buy Smart Fallback Hit] ${s_price:.2f}{status_note} -> {raw_title[:60]}")
                         return {
                             "retailer": "Best Buy",
                             "title": raw_title or "Best Buy Hardware",
                             "price": s_price,
                             "originalPrice": s_orig,
                             "inStock": in_stock,
-                            "isRefurbished": False,
+                            "condition": cond,
+                            "isRefurbished": cond in ["refurbished", "open_box"],
                             "url": url,
                             "imageUrl": None,
                             "brand": None,
-                            "source": "tavily-bestbuy"
+                            "source": "smart-bestbuy"
                         }
         except Exception as e:
-            print(f"[Best Buy Tavily Fallback Notice] {e}")
+            print(f"[Best Buy Smart Fallback Notice] {e}")
 
         return None
 
@@ -1576,9 +1569,13 @@ class HardwareAgent:
             return []
         try:
             print(f"[Newegg Direct] Searching for '{query}'...")
-            offers = await self.newegg.search(query)
+            offers = await self.newegg.search(query, analysis)
             candidates = []
             for o in offers:
+                # Strictly reject any search listing link (e.g. /p/pl?d=...)
+                if hasattr(self.newegg, "is_product_url") and not self.newegg.is_product_url(o.url):
+                    continue
+
                 t_lower = (o.title or "").lower()
                 is_refurb = "refurbished" in t_lower
                 is_open_box = any(w in t_lower for w in ["open box", "open-box"])

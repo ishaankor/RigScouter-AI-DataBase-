@@ -66,10 +66,28 @@ class BestBuyScraper(BaseScraper):
                     price = pb.get("customerPrice")
                     orig_price = pb.get("regularPrice")
 
-            if not price:
-                price, orig_price = parse_tavily_snippet_prices(snippet + " " + raw_title)
+            in_stock = True
+            cond = "new"
 
-            if price:
+            if not price:
+                from app.scrapers.smart import parse_result_text
+                txt = (raw_title or "") + "\n" + (snippet or "")
+                smart_listings = await parse_result_text(
+                    txt,
+                    self.retailer_name,
+                    url,
+                    clean_query,
+                    getattr(analysis, "category", None)
+                )
+                if smart_listings:
+                    sl = smart_listings[0]
+                    price = sl.get("price")
+                    orig_price = sl.get("original_price")
+                    raw_title = sl.get("title") or raw_title
+                    in_stock = sl.get("in_stock", True)
+                    cond = sl.get("condition", "new")
+
+            if price and price > 0:
                 is_valid, _ = validate_offer_fast(raw_title, price, analysis)
                 if is_valid:
                     offers.append(Offer(
@@ -79,7 +97,8 @@ class BestBuyScraper(BaseScraper):
                         url=url,
                         title=raw_title,
                         snippet=snippet,
-                        in_stock=True
+                        in_stock=in_stock,
+                        condition=cond
                     ))
                     if len(offers) >= 2:
                         break
@@ -101,18 +120,23 @@ class BestBuyScraper(BaseScraper):
                     title="Best Buy Product"
                 )
 
-        # Fallback to Tavily
+        # Fallback to smart parsing
         t_hits = await query_tavily_search(f'"{url}" price', max_results=2)
         if t_hits:
             hit = t_hits[0]
-            p, orig = parse_tavily_snippet_prices(hit.get("content", "") + " " + hit.get("title", ""))
-            if p:
+            from app.scrapers.smart import parse_result_text
+            txt = (hit.get("title", "") or "") + "\n" + (hit.get("content", "") or "")
+            smart_listings = await parse_result_text(txt, self.retailer_name, url, sku or url)
+            if smart_listings:
+                sl = smart_listings[0]
                 return Offer(
                     retailer=self.retailer_name,
-                    price=p,
-                    original_price=orig,
+                    price=sl["price"],
+                    original_price=sl.get("original_price"),
                     url=url,
-                    title=hit.get("title")
+                    title=sl.get("title") or hit.get("title"),
+                    in_stock=sl.get("in_stock", True),
+                    condition=sl.get("condition", "new")
                 )
 
         return None

@@ -34,32 +34,27 @@ async def query_tavily_search(query: str, max_results: int = 4) -> List[Dict]:
 def parse_tavily_snippet_prices(txt: str) -> Tuple[Optional[float], Optional[float]]:
     """
     Extracts current price and original/was price from search snippets.
-    Supports formats like:
-      - '$549.99'
-      - 'Was $699.99' / 'Reg. $799.99' / 'Save $100'
-      - '$549.99 (Save $150)'
+    Filters out discounts (e.g. 'Save $30', '$50 off') and distinguishes
+    original MSRP from current selling prices.
     """
     if not txt:
         return None, None
 
-    # Find all dollar amounts
-    raw_matches = re.findall(r"\$\s*([0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?)", txt)
-    prices: List[float] = []
-    for m in raw_matches:
-        try:
-            val = float(m.replace(",", ""))
-            if 5.0 <= val <= 9999.0:
-                prices.append(val)
-        except ValueError:
-            pass
+    working_txt = txt
 
-    if not prices:
-        return None, None
+    # 1. Identify and strip discount/savings amounts (e.g. 'Save $30', '$50 off', 'Instant Savings $40')
+    discount_patterns = [
+        r"(?:save|off|discount|instant rebate|rebate|coupon)\s*(?:up to\s*)?:?\s*\$\s*[0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?",
+        r"\$\s*[0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?\s*(?:off|rebate|discount|coupon|instant savings)"
+    ]
+    for pat in discount_patterns:
+        working_txt = re.sub(pat, " ", working_txt, flags=re.IGNORECASE)
 
-    # Check for original/was price patterns
+    # 2. Extract original / was / regular / MSRP price
+    orig_pattern = r"(?:original(?:ly)?(?:\s+price)?|reg(?:ular)?(?:\s+price)?|list\s+price|msrp|previous(?:ly)?(?:\s+price)?|was(?:\s+the\s+price)?)\s*:?\s*\$\s*([0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?)"
     orig_match = re.search(
-        r"(?:was|reg(?:ular)?\.?|original(?:ly)?|list price)\s*:?\s*\$\s*([0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?)",
-        txt,
+        orig_pattern,
+        working_txt,
         re.IGNORECASE
     )
     original_price: Optional[float] = None
@@ -71,8 +66,49 @@ def parse_tavily_snippet_prices(txt: str) -> Tuple[Optional[float], Optional[flo
         except ValueError:
             pass
 
-    # The current selling price is typically the lowest non-trivial price found
-    current_price = min(prices)
+    # Strip the was/original price substring from working text
+    working_txt = re.sub(
+        orig_pattern,
+        " ",
+        working_txt,
+        flags=re.IGNORECASE
+    )
+
+    # 3. Check for explicit active price indicators ('today $XX', 'now $XX', 'sale $XX', 'todays price $XX')
+    active_match = re.search(
+        r"(?:today(?:'s)?(?:\s+price)?|now|sale(?:\s+price)?|current(?:\s*price)?|our\s*price|special\s*price|deal(?:\s+price)?)\s*:?\s*\$\s*([0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?)",
+        working_txt,
+        re.IGNORECASE
+    )
+    if active_match:
+        try:
+            val = float(active_match.group(1).replace(",", ""))
+            if 5.0 <= val <= 9999.0:
+                return val, original_price
+        except ValueError:
+            pass
+
+    # 4. Find all remaining dollar amounts
+    raw_matches = re.findall(r"\$\s*([0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?)", working_txt)
+    prices: List[float] = []
+    for m in raw_matches:
+        try:
+            val = float(m.replace(",", ""))
+            if 5.0 <= val <= 9999.0:
+                prices.append(val)
+        except ValueError:
+            pass
+
+    if not prices:
+        return None, original_price
+
+    # Filter out original_price from prices if present
+    candidate_prices = [p for p in prices if original_price is None or abs(p - original_price) > 0.01]
+    if candidate_prices:
+        current_price = candidate_prices[0]
+    else:
+        current_price = prices[0]
+
     if original_price and original_price <= current_price:
         original_price = None
 

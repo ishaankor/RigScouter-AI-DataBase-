@@ -95,10 +95,11 @@ class AmazonScraper(BaseScraper):
                 except Exception:
                     continue
 
-        # If direct search was blocked or returned no items, use Tavily fallback
+        # If direct search was blocked or returned no items, use smart Tavily search
         if not offers:
-            logger.info(f"🔍 [Amazon Scraper] Using Tavily fallback for query: '{clean_query}'")
+            logger.info(f"🔍 [Amazon Scraper] Using smart Tavily search for query: '{clean_query}'")
             tavily_hits = await query_tavily_search(f'site:amazon.com "{clean_query}" price', max_results=4)
+            from app.scrapers.smart import parse_result_text
             for hit in tavily_hits:
                 url = hit.get("url", "")
                 if "amazon.com/dp/" not in url and "/gp/product/" not in url:
@@ -106,19 +107,37 @@ class AmazonScraper(BaseScraper):
 
                 raw_title = hit.get("title", "")
                 snippet = hit.get("content", "")
-                current_p, orig_p = parse_tavily_snippet_prices(snippet + " " + raw_title)
+                txt = (raw_title or "") + "\n" + (snippet or "")
 
-                if current_p:
-                    is_valid, _ = validate_offer_fast(raw_title, current_p, analysis)
+                smart_listings = await parse_result_text(
+                    txt,
+                    self.retailer_name,
+                    url,
+                    clean_query,
+                    getattr(analysis, "category", None)
+                )
+                if not smart_listings:
+                    continue
+
+                sl = smart_listings[0]
+                current_p = sl.get("price")
+                orig_p = sl.get("original_price")
+                parsed_title = sl.get("title") or raw_title
+                in_stock = sl.get("in_stock", True)
+                cond = sl.get("condition", "new")
+
+                if current_p and current_p > 0:
+                    is_valid, _ = validate_offer_fast(parsed_title, current_p, analysis)
                     if is_valid:
                         offers.append(Offer(
                             retailer=self.retailer_name,
                             price=current_p,
                             original_price=orig_p,
                             url=url,
-                            title=raw_title,
+                            title=parsed_title,
                             snippet=snippet,
-                            in_stock=True
+                            in_stock=in_stock,
+                            condition=cond
                         ))
                         break
 
@@ -143,19 +162,24 @@ class AmazonScraper(BaseScraper):
                         title = title_el.text.strip() if title_el else "Amazon Product"
                         return Offer(retailer=self.retailer_name, price=p, url=target_url, title=title)
 
-        # Tavily fallback for exact URL lookup
+        # Smart fallback for exact URL lookup
         if asin:
             t_hits = await query_tavily_search(f"site:amazon.com/dp/{asin} price", max_results=2)
             if t_hits:
                 hit = t_hits[0]
-                p, orig = parse_tavily_snippet_prices(hit.get("content", "") + " " + hit.get("title", ""))
-                if p:
+                from app.scrapers.smart import parse_result_text
+                txt = (hit.get("title", "") or "") + "\n" + (hit.get("content", "") or "")
+                smart_listings = await parse_result_text(txt, self.retailer_name, target_url, asin)
+                if smart_listings:
+                    sl = smart_listings[0]
                     return Offer(
                         retailer=self.retailer_name,
-                        price=p,
-                        original_price=orig,
+                        price=sl["price"],
+                        original_price=sl.get("original_price"),
                         url=target_url,
-                        title=hit.get("title")
+                        title=sl.get("title") or hit.get("title"),
+                        in_stock=sl.get("in_stock", True),
+                        condition=sl.get("condition", "new")
                     )
 
         return None

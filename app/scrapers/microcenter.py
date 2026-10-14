@@ -6,7 +6,8 @@ from bs4 import BeautifulSoup
 from app.models.offer import Offer, ProductAnalysis
 from app.scrapers.base import BaseScraper
 from app.scrapers.validator import validate_offer_fast
-from app.scrapers.search_fallback import query_tavily_search, parse_tavily_snippet_prices
+from app.scrapers.search_fallback import query_tavily_search
+from app.scrapers.smart import parse_result_text
 
 logger = logging.getLogger("rigscouter.scrapers.microcenter")
 
@@ -32,6 +33,8 @@ class MicroCenterScraper(BaseScraper):
         t_query = f'site:microcenter.com/product/ "{clean_query}" price'
         results = await query_tavily_search(t_query, max_results=4)
 
+        cat = getattr(analysis, "category", None) if analysis else None
+
         for item in results:
             url = item.get("url", "")
             if "microcenter.com/product/" not in url:
@@ -39,30 +42,27 @@ class MicroCenterScraper(BaseScraper):
 
             raw_title = item.get("title", "")
             snippet = item.get("content", "")
-            price, orig = parse_tavily_snippet_prices(snippet + " " + raw_title)
 
-            # Detect out of stock indicators in snippet and title
-            txt_lower = f"{raw_title} {snippet}".lower()
-            is_sold_out = any(
-                phrase in txt_lower for phrase in [
-                    "0 in stock", "sold out", "out of stock", "currently unavailable",
-                    "not in stock", "backorder", "pick up in store only - 0",
-                    "0 available", "not available online", "discontinued"
-                ]
+            # Smart LLM-powered extraction
+            smart_listings = await parse_result_text(
+                f"{raw_title}\n{snippet}",
+                self.retailer_name,
+                url,
+                clean_query,
+                cat
             )
-            in_stock = not is_sold_out
-
-            if price and price > 0:
-                is_valid, _ = validate_offer_fast(raw_title, price, analysis)
+            for sl in smart_listings:
+                is_valid, _ = validate_offer_fast(sl["title"], sl["price"], analysis)
                 if is_valid:
                     offers.append(Offer(
                         retailer=self.retailer_name,
-                        price=price,
-                        original_price=orig,
+                        price=sl["price"],
+                        original_price=sl.get("original_price"),
                         url=url,
-                        title=raw_title,
+                        title=sl["title"],
                         snippet=snippet,
-                        in_stock=in_stock
+                        in_stock=sl.get("in_stock", True),
+                        condition=sl.get("condition", "new")
                     ))
 
         if offers:
@@ -75,13 +75,18 @@ class MicroCenterScraper(BaseScraper):
         t_hits = await query_tavily_search(f'"{url}" price', max_results=2)
         if t_hits:
             hit = t_hits[0]
-            p, orig = parse_tavily_snippet_prices(hit.get("content", "") + " " + hit.get("title", ""))
-            if p:
+            from app.scrapers.smart import parse_result_text
+            txt = (hit.get("title", "") or "") + "\n" + (hit.get("content", "") or "")
+            smart_listings = await parse_result_text(txt, self.retailer_name, url, url)
+            if smart_listings:
+                sl = smart_listings[0]
                 return Offer(
                     retailer=self.retailer_name,
-                    price=p,
-                    original_price=orig,
+                    price=sl["price"],
+                    original_price=sl.get("original_price"),
                     url=url,
-                    title=hit.get("title")
+                    title=sl.get("title") or hit.get("title"),
+                    in_stock=sl.get("in_stock", True),
+                    condition=sl.get("condition", "new")
                 )
         return None
