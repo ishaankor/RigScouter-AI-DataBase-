@@ -23,7 +23,7 @@ app = FastAPI(title="RigScouter-AI Multi-Retailer Pricing Engine")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origin_regex=r".*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -905,9 +905,11 @@ async def stream(request: Request):
                         "data": json.dumps({"timestamp": datetime.now(timezone.utc).isoformat()})
                     }
         finally:
-            sse_clients.remove(client_queue)
-
-    return EventSourceResponse(event_generator())
+            sse_clients.discard(client_queue)
+    return EventSourceResponse(
+        event_generator(),
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache, no-transform"}
+    )
 
 @app.post("/api/agent/run")
 @app.post("/api/scrape")
