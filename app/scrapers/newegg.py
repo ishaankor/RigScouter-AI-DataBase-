@@ -111,12 +111,8 @@ class NeweggScraper(BaseScraper):
 
         # 2. Targeted Product Page Search Fallback (excluding /p/pl landing pages)
         if not offers:
-            # Explicitly exclude /p/pl from search queries so Tavily targets direct /p/N82E... product pages
-            t_query = f'site:newegg.com/p/ -inurl:pl "{clean_query}" price'
-            results = await query_tavily_search(t_query, max_results=6)
-            if not results:
-                # Fallback search without inurl filter, relying on is_product_url validator
-                results = await query_tavily_search(f'site:newegg.com/p/ "{clean_query}" price', max_results=6)
+            t_query = f'site:newegg.com "{clean_query}" price'
+            results = await query_tavily_search(t_query, max_results=8)
 
             for item in results:
                 url = item.get("url", "")

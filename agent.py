@@ -112,9 +112,9 @@ class ProductAnalyzer:
             "- \"category\": Exactly one of: 'GPU', 'CPU', 'RAM', 'Motherboard', 'Storage', 'Power Supply', 'Case', 'Cooling', 'Monitor', 'Peripherals', or 'Other'.\n"
             "- \"is_pc_part\": true for any PC hardware component or computer peripheral; false only if completely unrelated items (food, clothing, household goods).\n"
             "- \"product_exists\": true for any real or plausible PC hardware part. Never assume a product does not exist just because it is new or custom.\n"
-            "- \"min_price\": Realistic minimum market price in USD for a genuine unit of this hardware component (e.g. 15 for fans/paste, 35 for budget RAM/coolers, 50 for budget cases/storage, 70 for budget PSUs/motherboards, 100+ for mid-range components). Used to automatically discard dummy replicas, 1:1 scale toys, empty boxes, and brackets.\n"
+            "- \"min_price\": Realistic minimum market price in USD for a genuine unit of this hardware component (e.g. 15 for fans/paste, 35 for budget RAM/coolers, 50 for budget cases/storage, 70 for budget PSUs/motherboards, 150-250 for budget/mid CPUs and GPUs, 350-500+ for high-end/flagship CPUs like Ryzen 7/9 X3D or Core i7/i9, 500-1500+ for high-end GPUs). Used to automatically discard dummy replicas, 1:1 scale toys, empty boxes, and brackets.\n"
             "- \"retailer_search_query\": Clean search term optimized for retailer catalogs (e.g. brand + model without search noise like 'buy', 'price', etc.). NEVER change or substitute the user's component model!\n"
-            "- \"negative_keywords\": Array of terms that indicate a candidate result is the WRONG product, accessory, toy, or broken item."
+            "- \"negative_keywords\": Array of terms that indicate a candidate result is the WRONG product, accessory, toy, or broken item. CRITICAL: NEVER include standard hardware specification terms (e.g. 'socket', 'am5', 'am4', 'lga', 'pcie', 'ddr5', 'cores', 'threads') as negative keywords, because genuine hardware components always include their socket and specs in their titles."
         )
 
         models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b", "groq/compound"]

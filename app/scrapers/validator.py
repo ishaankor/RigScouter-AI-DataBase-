@@ -61,9 +61,19 @@ def validate_offer_fast(
                 return False, f"Matches non-hardware / fake keyword: '{spam}'"
 
     if analysis:
-        # Negative keywords from analysis
+        # Negative keywords from analysis (protecting standard specification terms)
+        PROTECTED_SPEC_TERMS = {
+            "socket", "am5", "am4", "lga", "lga1700", "lga1851", "pcie", "ddr4", "ddr5",
+            "cores", "threads", "unlocked", "boxed", "processor", "cache", "ghz", "mhz",
+            "atx", "matx", "itx", "nvme", "m.2", "sata", "watt", "gold", "platinum", "modular"
+        }
         for neg in negatives:
-            if neg.lower() in t_lower and neg.lower() not in raw_lower:
+            neg_clean = (neg or "").lower().strip()
+            if not neg_clean or neg_clean in PROTECTED_SPEC_TERMS:
+                continue
+            if neg_clean in raw_lower or neg_clean in model_lower:
+                continue
+            if re.search(r'\b' + re.escape(neg_clean) + r'\b', t_lower):
                 return False, f"Matches negative keyword: '{neg}'"
 
         # Accessory filtering: ONLY filter accessories if the user is NOT searching for that accessory category!
@@ -112,14 +122,28 @@ def validate_offer_fast(
                 break
 
         if found_suffix and nums:
-            if not re.search(r'(?:\b|(?<=\d))' + re.escape(found_suffix) + r'\b', t_lower):
+            # Allow optional space or hyphen for compound suffixes like 'x 3d' or 'xt x'
+            if found_suffix == "x3d":
+                suffix_pat = r'(?:\b|(?<=\d))(?:x3d|x[\s\-_]*3d)\b'
+            elif found_suffix == "xtx":
+                suffix_pat = r'(?:\b|(?<=\d))(?:xtx|xt[\s\-_]*x)\b'
+            else:
+                suffix_pat = r'(?:\b|(?<=\d))' + re.escape(found_suffix) + r'\b'
+
+            if not re.search(suffix_pat, t_lower):
                 return False, f"Missing requested variant '{found_suffix.upper()}'"
 
         # Universal Price Floor Check:
-        # Prevents $2-$5 cables/stickers from passing for expensive parts,
-        # but allows genuinely cheap items (used parts, budget fans, thermal paste).
+        # Prevents $2-$5 cables/stickers and misidentified motherboard bundle discounts
+        # from passing for expensive flagship components
         if min_price and min_price > 0:
-            floor = max(8.0, min_price * 0.15)
+            if cat_upper in ["CPU", "PROCESSOR", "GPU", "GRAPHICS CARD"]:
+                floor = max(30.0, min_price * 0.50)
+            elif cat_upper in ["MOTHERBOARD", "POWER SUPPLY"]:
+                floor = max(25.0, min_price * 0.40)
+            else:
+                floor = max(10.0, min_price * 0.35)
+
             if price < floor:
                 return False, f"Price ${price:.2f} is below minimum hardware floor (${floor:.2f})"
 
