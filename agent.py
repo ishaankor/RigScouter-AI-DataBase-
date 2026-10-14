@@ -1661,7 +1661,15 @@ class HardwareAgent:
             return await self.generic.lookup_url(clean_url)
 
     async def run(self, prompt: str, emit_fn=None, user_id: str = None, pending_id: str = None) -> dict:
-        clean_prompt = prompt.strip()
+        clean_prompt = re.sub(r'[\t\r\n]+', ' ', prompt).strip()
+        # Deduplicate if user accidentally pasted duplicated text (e.g. "Part \t Part" or "Part Part")
+        words = clean_prompt.split()
+        if len(words) >= 4 and len(words) % 2 == 0:
+            half = len(words) // 2
+            if [w.lower() for w in words[:half]] == [w.lower() for w in words[half:]]:
+                clean_prompt = " ".join(words[:half])
+
+
         print(f"\n======================================================")
         print(f"[HardwareAgent] Processing Query: \"{clean_prompt}\"")
         print(f"======================================================")
