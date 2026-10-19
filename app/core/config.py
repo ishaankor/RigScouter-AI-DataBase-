@@ -21,21 +21,15 @@ class Settings:
     OPENROUTER_API_KEY: str = os.environ.get("OPENROUTER_API_KEY", "")
 
     # Retailer & Proxy APIs
-    ZENROWS_API_KEY: str = os.environ.get("ZENROWS_API_KEY", "91418034a0339b39d3cfab8f77d001a8006896a7")
-    ZENROWS_QUOTA_EXHAUSTED: bool = True  # Managed flag for ZenRows availability
+    ZENROWS_API_KEY: str = os.environ.get("ZENROWS_API_KEY", "")
+    ZENROWS_QUOTA_EXHAUSTED: bool = False if os.environ.get("ZENROWS_API_KEY") else True
     
     EBAY_CLIENT_ID: str = os.environ.get("EBAY_CLIENT_ID", "")
     EBAY_CLIENT_SECRET: str = os.environ.get("EBAY_CLIENT_SECRET", "")
     EBAY_DEV_ID: str = os.environ.get("EBAY_DEV_ID", "")
 
     TAVILY_API_KEYS: List[str] = [
-        k for k in [
-            os.environ.get("TAVILY_API_KEY", ""),
-            "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",
-            "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",
-            "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",
-            "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"
-        ] if k
+        k.strip() for k in os.environ.get("TAVILY_API_KEYS", os.environ.get("TAVILY_API_KEY", "")).split(",") if k.strip()
     ]
 
     # Email & Notifications

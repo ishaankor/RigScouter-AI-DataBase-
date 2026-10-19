@@ -15,13 +15,15 @@ SMART_PARSER_SYSTEM_PROMPT = (
     "CRITICAL RULES:\n"
     "1. ACTIVE PRICE: Extract the actual current checkout price in USD (e.g. 219.99). "
     "Do NOT confuse 'Save $50', '$50 off', 'Instant Rebate $30', or 'Was $299' with the current price! "
-    "Do NOT pick up prices of recommended items or carousel products (e.g. 'Customers also viewed $559').\n"
+    "Do NOT pick up prices of recommended items, carousel products (e.g. 'Customers also viewed $559'), "
+    "or add-on accessories (e.g. 'Compressed Air Duster $29.99', 'Ultra Duster $9.99', 'Thermal Paste', 'Protection Plan'). "
+    "Extract ONLY the price of the standalone component itself.\n"
     "2. ORIGINAL PRICE: If there is a clear previous/original price ('Was $XXX', 'Regular Price $XXX', 'List Price $XXX'), "
     "extract it; otherwise null.\n"
     "3. STOCK STATUS: Determine if the product is in stock (true) or out of stock (false). "
     "Words like '0 in stock', 'sold out', 'out of stock', 'currently unavailable', 'backorder', 'not available online' mean in_stock: false.\n"
     "4. STANDALONE COMPONENT MATCH: The user is looking for a standalone PC rig part. "
-    "If the item is a full desktop PC prebuilt, laptop, motherboard bundle, upgrade kit, or accessory (sticker, empty box, toy, poster, cable), "
+    "If the item is a full desktop PC prebuilt, laptop, motherboard bundle, upgrade kit, or accessory (air duster, sticker, empty box, toy, poster, cable), "
     "set is_standalone_match: false. If it is the genuine standalone hardware component, set is_standalone_match: true.\n"
     "5. CONDITION: One of: 'new', 'open_box', 'refurbished', 'used'. Default is 'new'.\n"
     "6. CLEAN TITLE: Extract the accurate, clean product title without retailer branding noise (e.g. strip '| Newegg.com', 'Best Buy:').\n\n"
@@ -71,9 +73,8 @@ async def parse_result_text(
 
     models_to_try = [
         settings.GROQ_MODEL,
-        "openai/gpt-oss-20b",
-        "qwen/qwen3.6-27b",
-        "groq/compound"
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant"
     ]
 
     for model_name in models_to_try:

@@ -82,11 +82,6 @@ class PricingService:
         Updates hardware_components and all corresponding watchlist_items with new pricing,
         calculating all-time-low (ATL) and 24h, 7d, 30d history.
         """
-        if not offers:
-            return {"updated": False}
-
-        best = offers[0]
-        new_price = float(best.price)
         now_iso = datetime.now(timezone.utc).isoformat()
 
         # Fetch existing record for baseline ATL and price history
@@ -94,26 +89,69 @@ class PricingService:
             supabase.table("hardware_components").select("*").eq("id", comp_id).limit(1).execute
         )
         existing = res.data[0] if res.data else {}
+        raw_specs = existing.get("specs") or {}
+        specs_dict = json.loads(raw_specs) if isinstance(raw_specs, str) else raw_specs
+
+        if not offers:
+            misses = int(specs_dict.get("consecutive_misses", 0)) + 1
+            specs_dict["consecutive_misses"] = misses
+            specs_dict["in_stock"] = False
+            specs_dict["is_sold_out"] = True
+            if misses >= 3:
+                specs_dict["is_expired"] = True
+            await asyncio.to_thread(
+                supabase.table("hardware_components").update({
+                    "deal_score": 0,
+                    "specs": json.dumps(specs_dict),
+                    "updated_at": now_iso
+                }).eq("id", comp_id).execute
+            )
+            return {"updated": False}
+
+        in_stock_offers = [o for o in offers if getattr(o, "in_stock", True) and float(o.price) > 0]
+        is_currently_in_stock = len(in_stock_offers) > 0
+        best = in_stock_offers[0] if is_currently_in_stock else offers[0]
+        new_price = float(best.price)
 
         old_price = float(existing.get("current_price") or 0.0)
         old_atl = float(existing.get("lowest_price_90d") or old_price or new_price)
         new_atl = min(old_atl if old_atl > 0 else new_price, new_price)
 
         # Merge price history
-        raw_specs = existing.get("specs") or {}
-        specs_dict = json.loads(raw_specs) if isinstance(raw_specs, str) else raw_specs
         history = list(specs_dict.get("price_history") or [])
-        history.append({"price": new_price, "timestamp": now_iso})
+        if new_price > 0:
+            history.append({"price": new_price, "timestamp": now_iso})
         if len(history) > 60:
             history = history[-60:]
 
         specs_dict["RetailerOffers"] = [o.dict() for o in offers]
         specs_dict["price_history"] = history
+        specs_dict["in_stock"] = is_currently_in_stock
+        specs_dict["is_sold_out"] = not is_currently_in_stock
+
+        if not is_currently_in_stock:
+            misses = int(specs_dict.get("consecutive_misses", 0)) + 1
+            specs_dict["consecutive_misses"] = misses
+            if misses >= 3:
+                specs_dict["is_expired"] = True
+            deal_score = 0
+        else:
+            specs_dict["consecutive_misses"] = 0
+            specs_dict["is_expired"] = False
+            specs_dict["last_verified_stock_at"] = now_iso
+            msrp = float(existing.get("msrp") or 0.0)
+            if msrp > new_price and msrp > 0:
+                deal_score = round(min(99, max(50, ((msrp - new_price) / msrp) * 100 + 70)))
+            elif new_price <= new_atl:
+                deal_score = 80
+            else:
+                deal_score = 60
 
         # Save hardware component
         hw_payload = {
-            "current_price": new_price,
+            "current_price": new_price if new_price > 0 else old_price,
             "lowest_price_90d": new_atl,
+            "deal_score": deal_score,
             "retailer": best.retailer,
             "product_url": best.url,
             "image_url": best.image_url or existing.get("image_url"),

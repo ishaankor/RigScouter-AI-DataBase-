@@ -492,6 +492,7 @@ async def execute_daily_price_refresh():
                 print(f"  🔗 URL: {product_url[:80]}...")
 
                 primary_offer = await get_url_offer(product_url)
+                primary_in_stock = bool(primary_offer.get("inStock", True)) if primary_offer else False
                 new_price = float(primary_offer.get("price") or 0.0) if primary_offer else 0.0
 
                 # Also update other retailer offers for this component if present
@@ -500,9 +501,10 @@ async def execute_daily_price_refresh():
                         off_url = off.get("url")
                         if off_url and off_url != product_url:
                             sub_offer = await get_url_offer(off_url)
-                            if sub_offer and sub_offer.get("price") and float(sub_offer["price"]) > 0:
-                                off["price"] = float(sub_offer["price"])
-                                off["inStock"] = sub_offer.get("inStock", True)
+                            if sub_offer:
+                                if sub_offer.get("price") and float(sub_offer["price"]) > 0:
+                                    off["price"] = float(sub_offer["price"])
+                                off["inStock"] = bool(sub_offer.get("inStock", True))
 
                     # For retailer-specific rows (ending with retailer slug), preserve that retailer
                     is_retailer_specific = any(comp_id.endswith(f"-{r}") for r in ["amazon", "ebay", "best-buy", "micro-center", "newegg", "bh"])
@@ -513,40 +515,49 @@ async def execute_daily_price_refresh():
                         matched_ret_offer = next((o for o in valid_offers if o.get("retailer", "").lower() == current_retailer.lower()), None)
                         if matched_ret_offer and float(matched_ret_offer.get("price") or 0) > 0:
                             new_price = float(matched_ret_offer["price"])
+                            primary_in_stock = True
                             if matched_ret_offer.get("url"):
                                 product_url = matched_ret_offer["url"]
+                        else:
+                            primary_in_stock = False
                     elif valid_offers:
                         # For base components, determine best in-stock price among all retailer offers and sync both retailer AND url
                         valid_offers.sort(key=lambda x: float(x["price"]))
                         best_off = valid_offers[0]
                         new_price = float(best_off["price"])
+                        primary_in_stock = True
                         current_retailer = best_off.get("retailer", current_retailer)
                         if best_off.get("url"):
                             product_url = best_off["url"]
+                    else:
+                        primary_in_stock = False
 
-                if new_price <= 0:
-                    # ── Fallback: Run normal search scraper via HardwareAgent ──
+                if new_price <= 0 or not primary_in_stock:
+                    # ── Fallback: Run normal search scraper via HardwareAgent to look for in-stock alternatives ──
                     search_query = comp.get("model") or comp_name
-                    print(f"🔄 [Daily Refresh] Direct URL challenged for \"{comp_name[:45]}\". Falling back to normal scraper...")
+                    print(f"🔄 [Daily Refresh] Checking fallback scraper for in-stock offers for \"{comp_name[:45]}\"...")
                     try:
                         search_res = await agent_runner.run(search_query)
                         scraped_offers = search_res.get("scrapedOffers") or []
-                        if scraped_offers:
+                        in_stock_scraped = [o for o in scraped_offers if o.get("inStock", True) and float(o.get("price") or 0) > 0]
+                        if in_stock_scraped:
                             # 1. Look for matching offer from current retailer
-                            matched_ret_offer = next((o for o in scraped_offers if o.get("retailer", "").lower() == current_retailer.lower() and float(o.get("price") or 0) > 0), None)
+                            matched_ret_offer = next((o for o in in_stock_scraped if o.get("retailer", "").lower() == current_retailer.lower()), None)
                             
                             is_retailer_specific = any(comp_id.endswith(f"-{r}") for r in ["amazon", "ebay", "best-buy", "micro-center", "newegg", "bh"])
                             if is_retailer_specific and matched_ret_offer:
                                 new_price = float(matched_ret_offer["price"])
+                                primary_in_stock = True
                                 if matched_ret_offer.get("url"):
                                     product_url = matched_ret_offer["url"]
                                 if not primary_offer:
                                     primary_offer = {}
                                 primary_offer["imageUrl"] = matched_ret_offer.get("imageUrl")
-                                print(f"✅ [Daily Refresh Scraper Hit] Found {current_retailer} price: ${new_price:.2f}")
+                                print(f"✅ [Daily Refresh Scraper Hit] Found in-stock {current_retailer} price: ${new_price:.2f}")
                             elif not is_retailer_specific:
-                                best_offer = matched_ret_offer or scraped_offers[0]
+                                best_offer = matched_ret_offer or in_stock_scraped[0]
                                 new_price = float(best_offer["price"])
+                                primary_in_stock = True
                                 current_retailer = best_offer.get("retailer", current_retailer)
                                 if best_offer.get("url"):
                                     product_url = best_offer["url"]
@@ -554,35 +565,51 @@ async def execute_daily_price_refresh():
                                     primary_offer = {}
                                 primary_offer["imageUrl"] = best_offer.get("imageUrl")
                                 retailer_offers = scraped_offers
-                                print(f"✅ [Daily Refresh Scraper Hit] Best price via normal scraper: ${new_price:.2f} at {current_retailer}")
+                                print(f"✅ [Daily Refresh Scraper Hit] Best in-stock price via normal scraper: ${new_price:.2f} at {current_retailer}")
                     except Exception as scraper_err:
                         print(f"⚠️ [Daily Refresh Fallback Notice] Normal scraper exception for {comp_name}: {scraper_err}")
 
-                if new_price <= 0:
-                    if old_price > 0:
+                is_currently_in_stock = bool(primary_in_stock and new_price > 0)
+
+                if not is_currently_in_stock:
+                    misses = int(specs_data.get("consecutive_misses", 0)) + 1
+                    specs_data["consecutive_misses"] = misses
+                    specs_data["in_stock"] = False
+                    specs_data["is_sold_out"] = True
+                    if misses >= 3:
+                        specs_data["is_expired"] = True
+                    deal_score = 0  # Zero out deal score so sold-out item immediately drops off Deal Radar and active deal feeds!
+                    if new_price <= 0 and old_price > 0:
                         new_price = old_price
-                        print(f"ℹ️ [Daily Refresh Retained] \"{comp_name[:40]}\": ${old_price:.2f} (Retailer verification challenged, retaining last verified price)")
-                    else:
-                        print(f"⚠️ [Daily Refresh Notice] No price extracted from {product_url}, skipping.")
-                        continue
+                    print(f"🚫 [Daily Refresh Sold Out] \"{comp_name[:40]}\": Out of Stock / Gone. Deal score set to 0 (Miss #{misses}).")
+                else:
+                    specs_data["consecutive_misses"] = 0
+                    specs_data["in_stock"] = True
+                    specs_data["is_sold_out"] = False
+                    specs_data["is_expired"] = False
+                    specs_data["last_verified_stock_at"] = now_iso
+
+                    deal_score = comp.get("deal_score", 50)
+                    if msrp > new_price and msrp > 0:
+                        deal_score = round(min(99, max(50, ((msrp - new_price) / msrp) * 100 + 70)))
+                    elif new_price <= new_atl:
+                        deal_score = 80
+
+                if new_price <= 0:
+                    print(f"⚠️ [Daily Refresh Notice] No price extracted from {product_url}, skipping.")
+                    continue
 
                 price_changed = abs(new_price - old_price) >= 0.01
                 new_atl = min(old_atl if old_atl > 0 else new_price, new_price)
 
-                deal_score = comp.get("deal_score", 50)
-                if msrp > new_price and msrp > 0:
-                    deal_score = round(min(99, max(50, ((msrp - new_price) / msrp) * 100 + 70)))
-                elif new_price <= new_atl:
-                    deal_score = 80
-
-                if price_changed:
+                if price_changed and is_currently_in_stock:
                     diff = new_price - old_price
                     if diff < 0:
                         print(f"🔥 [Daily Refresh Drop] \"{comp_name[:40]}\": ${old_price:.2f} -> ${new_price:.2f} (DROP: ${abs(diff):.2f})")
                     else:
                         print(f"📈 [Daily Refresh Increase] \"{comp_name[:40]}\": ${old_price:.2f} -> ${new_price:.2f} (+${diff:.2f})")
-                else:
-                    print(f"ℹ️ [Daily Refresh Unchanged] \"{comp_name[:40]}\": ${new_price:.2f} (Verified)")
+                elif is_currently_in_stock:
+                    print(f"ℹ️ [Daily Refresh Unchanged] \"{comp_name[:40]}\": ${new_price:.2f} (Verified In Stock)")
 
                 # Update hardware_components row
                 hw_update = {
@@ -710,17 +737,55 @@ async def execute_daily_price_refresh():
                 res = await agent_runner.run(search_query)
                 offers = res.get("scrapedOffers") or []
                 if not offers:
-                    continue
-                best = res.get("bestOffer") or offers[0]
-                new_price = float(best.get("price") or 0.0)
-                if new_price <= 0:
+                    misses = int(specs_data.get("consecutive_misses", 0)) + 1
+                    specs_data["consecutive_misses"] = misses
+                    specs_data["in_stock"] = False
+                    specs_data["is_sold_out"] = True
+                    if misses >= 3:
+                        specs_data["is_expired"] = True
+                    await asyncio.to_thread(
+                        supabase.table("hardware_components").update({
+                            "deal_score": 0,
+                            "specs": json.dumps(specs_data),
+                            "updated_at": now_iso
+                        }).eq("id", comp_id).execute
+                    )
                     continue
 
-                new_atl = min(old_atl if old_atl > 0 else new_price, new_price)
-                specs_json = json.dumps({"RetailerOffers": offers})
+                in_stock_offers = [o for o in offers if o.get("inStock", True) and float(o.get("price") or 0) > 0]
+                is_currently_in_stock = len(in_stock_offers) > 0
+                best = in_stock_offers[0] if is_currently_in_stock else (res.get("bestOffer") or offers[0])
+                new_price = float(best.get("price") or 0.0)
+                if new_price <= 0 and old_price > 0:
+                    new_price = old_price
+
+                new_atl = min(old_atl if old_atl > 0 else new_price, new_price) if new_price > 0 else old_atl
+
+                specs_data["RetailerOffers"] = offers
+                specs_data["in_stock"] = is_currently_in_stock
+                specs_data["is_sold_out"] = not is_currently_in_stock
+
+                if not is_currently_in_stock:
+                    misses = int(specs_data.get("consecutive_misses", 0)) + 1
+                    specs_data["consecutive_misses"] = misses
+                    if misses >= 3:
+                        specs_data["is_expired"] = True
+                    deal_score = 0
+                else:
+                    specs_data["consecutive_misses"] = 0
+                    specs_data["is_expired"] = False
+                    specs_data["last_verified_stock_at"] = now_iso
+                    deal_score = comp.get("deal_score", 50)
+                    if msrp > new_price and msrp > 0:
+                        deal_score = round(min(99, max(50, ((msrp - new_price) / msrp) * 100 + 70)))
+                    elif new_price <= new_atl:
+                        deal_score = 80
+
+                specs_json = json.dumps(specs_data)
                 hw_payload = {
                     "current_price": new_price,
                     "lowest_price_90d": new_atl,
+                    "deal_score": deal_score,
                     "retailer": best.get("retailer", "Amazon"),
                     "product_url": best.get("url"),
                     "image_url": best.get("imageUrl") or comp.get("image_url"),

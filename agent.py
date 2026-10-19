@@ -29,16 +29,11 @@ load_dotenv()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 EBAY_CLIENT_ID = os.environ.get("EBAY_CLIENT_ID", "")
 EBAY_CLIENT_SECRET = os.environ.get("EBAY_CLIENT_SECRET", "")
-ZENROWS_API_KEY = os.environ.get("ZENROWS_API_KEY", "91418034a0339b39d3cfab8f77d001a8006896a7")
-ZENROWS_QUOTA_EXHAUSTED = True
+ZENROWS_API_KEY = os.environ.get("ZENROWS_API_KEY", "")
+ZENROWS_QUOTA_EXHAUSTED = False if ZENROWS_API_KEY else True
 
-TAVILY_API_KEYS = [
-    os.environ.get("TAVILY_API_KEY", ""),
-    "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",
-    "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",
-    "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",
-    "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"
-]
+raw_tavily = os.environ.get("TAVILY_API_KEYS", os.environ.get("TAVILY_API_KEY", ""))
+TAVILY_API_KEYS = [k.strip() for k in raw_tavily.split(",") if k.strip()]
 
 async def query_tavily_search(query: str, max_results: int = 3) -> list[dict]:
     active_keys = [k for k in TAVILY_API_KEYS if k]
@@ -255,7 +250,7 @@ class ProductAnalyzer:
             "Which of these are a genuine match? Return JSON."
         )
 
-        models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b"]
+        models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
         for model_name in models:
             try:
                 async with httpx.AsyncClient() as client:
@@ -491,7 +486,7 @@ class AmazonClient:
                 merchant_id = merchant_input.get("value") if merchant_input else None
                 product_url = f"https://www.amazon.com/dp/{asin}?smid={merchant_id}" if merchant_id else url
 
-                if title and price_val:
+                if title:
                     t_lower = title.lower()
                     if "renewed" in t_lower or "refurbished" in t_lower:
                         cond_tag = "refurbished"
@@ -503,22 +498,41 @@ class AmazonClient:
                         cond_tag = "new"
                         cond_label = "Brand New"
 
-                    offer = {
-                        "retailer": "Amazon",
-                        "title": title,
-                        "price": price_val,
-                        "originalPrice": None,
-                        "inStock": in_stock,
-                        "condition": cond_tag,
-                        "conditionLabel": cond_label,
-                        "isRefurbished": cond_tag in ["refurbished", "used"],
-                        "url": product_url,
-                        "imageUrl": image_url,
-                        "brand": None,
-                        "source": "amazon-direct"
-                    }
-                    print(f"✅ [Amazon Hit] ${offer['price']:.2f} ({cond_label}) -> {offer['title'][:60]}")
-                    return offer
+                    if price_val:
+                        offer = {
+                            "retailer": "Amazon",
+                            "title": title,
+                            "price": price_val,
+                            "originalPrice": None,
+                            "inStock": in_stock,
+                            "condition": cond_tag,
+                            "conditionLabel": cond_label,
+                            "isRefurbished": cond_tag in ["refurbished", "used"],
+                            "url": product_url,
+                            "imageUrl": image_url,
+                            "brand": None,
+                            "source": "amazon-direct"
+                        }
+                        status_str = " (Out of Stock)" if not in_stock else ""
+                        print(f"✅ [Amazon Hit] ${offer['price']:.2f}{status_str} ({cond_label}) -> {offer['title'][:60]}")
+                        return offer
+                    elif not in_stock:
+                        offer = {
+                            "retailer": "Amazon",
+                            "title": title,
+                            "price": 0.0,
+                            "originalPrice": None,
+                            "inStock": False,
+                            "condition": cond_tag,
+                            "conditionLabel": cond_label,
+                            "isRefurbished": cond_tag in ["refurbished", "used"],
+                            "url": product_url,
+                            "imageUrl": image_url,
+                            "brand": None,
+                            "source": "amazon-direct"
+                        }
+                        print(f"🚫 [Amazon Sold Out] {title[:60]}")
+                        return offer
             else:
                 print(f"⚠️ [Amazon Direct] HTTP {status_code} received when fetching ASIN {asin}")
         except Exception as e:
@@ -1413,19 +1427,22 @@ class BestBuyClient:
                 ])
                 in_stock = not is_sold_out
 
-                if title and price:
-                    return {
-                        "retailer": "Best Buy",
-                        "title": title,
-                        "price": price,
-                        "originalPrice": None,
-                        "inStock": in_stock,
-                        "isRefurbished": any(w in title.lower() for w in ["refurbished", "open-box", "open box"]),
-                        "url": url,
-                        "imageUrl": img,
-                        "brand": None,
-                        "source": "bestbuy-direct"
-                    }
+                if title:
+                    if price or not in_stock:
+                        status_note = "" if in_stock else " [Out of Stock]"
+                        print(f"✅ [Best Buy Direct Hit] ${price or 0.0:.2f}{status_note} -> {title[:60]}")
+                        return {
+                            "retailer": "Best Buy",
+                            "title": title,
+                            "price": price or 0.0,
+                            "originalPrice": None,
+                            "inStock": in_stock,
+                            "isRefurbished": any(w in title.lower() for w in ["refurbished", "open-box", "open box"]),
+                            "url": url,
+                            "imageUrl": img,
+                            "brand": None,
+                            "source": "bestbuy-direct"
+                        }
         except Exception as e:
             print(f"[Best Buy URL Lookup Error] {e}")
 

@@ -45,10 +45,19 @@ def parse_tavily_snippet_prices(txt: str) -> Tuple[Optional[float], Optional[flo
     # 1. Identify and strip discount/savings amounts (e.g. 'Save $30', '$50 off', 'Instant Savings $40')
     discount_patterns = [
         r"(?:save|off|discount|instant rebate|rebate|coupon)\s*(?:up to\s*)?:?\s*\$\s*[0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?",
-        r"\$\s*[0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?\s*(?:off|rebate|discount|coupon|instant savings)"
+        r"\$\s*[0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?\s*(?:off|rebate|discount|coupon|instant savings)",
+        r"(?:add[\s-]ons?|duster|air\s*duster|compressed\s*air|thermal\s*paste|protection\s*plan|tech\s*support|extended\s*warranty|in[\s-]store\s*only).*?\$\s*[0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?",
+        r"\$\s*[0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?\s*(?:air\s*duster|compressed\s*air|thermal\s*paste|protection\s*plan|tech\s*support|extended\s*warranty)"
     ]
     for pat in discount_patterns:
         working_txt = re.sub(pat, " ", working_txt, flags=re.IGNORECASE)
+    # Re-apply once in case multiple add-ons were listed sequentially
+    working_txt = re.sub(
+        r"(?:duster|air\s*duster|compressed\s*air|thermal\s*paste|protection\s*plan|tech\s*support).*?\$\s*[0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?",
+        " ",
+        working_txt,
+        flags=re.IGNORECASE
+    )
 
     # 2. Extract original / was / regular / MSRP price
     orig_pattern = r"(?:original(?:ly)?(?:\s+price)?|reg(?:ular)?(?:\s+price)?|list\s+price|msrp|previous(?:ly)?(?:\s+price)?|was(?:\s+the\s+price)?)\s*:?\s*\$\s*([0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?)"
