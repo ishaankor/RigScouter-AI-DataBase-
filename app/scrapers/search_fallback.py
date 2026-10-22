@@ -42,18 +42,24 @@ def parse_tavily_snippet_prices(txt: str) -> Tuple[Optional[float], Optional[flo
 
     working_txt = txt
 
-    # 1. Identify and strip discount/savings amounts (e.g. 'Save $30', '$50 off', 'Instant Savings $40')
+    # 1. Identify and strip discount/savings amounts, delivery minimums, monthly plans, gift cards, etc.
     discount_patterns = [
         r"(?:save|off|discount|instant rebate|rebate|coupon)\s*(?:up to\s*)?:?\s*\$\s*[0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?",
         r"\$\s*[0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?\s*(?:off|rebate|discount|coupon|instant savings)",
-        r"(?:add[\s-]ons?|duster|air\s*duster|compressed\s*air|thermal\s*paste|protection\s*plan|tech\s*support|extended\s*warranty|in[\s-]store\s*only).*?\$\s*[0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?",
-        r"\$\s*[0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?\s*(?:air\s*duster|compressed\s*air|thermal\s*paste|protection\s*plan|tech\s*support|extended\s*warranty)"
+        r"(?:free\s+(?:delivery|shipping)|shipping\s+on|orders?\s+over)\s*(?:orders?\s*)?(?:of\s*)?\$\s*[0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?",
+        r"\$\s*[0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?\s*(?:delivery|shipping|flat\s*rate)",
+        r"(?:pay|as\s+low\s+as|starting\s+at)\s*\$\s*[0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?\s*(?:/\s*mo|/\s*month|per\s+month|a\s+month)?",
+        r"\$\s*[0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?\s*(?:/\s*mo|/\s*month|per\s+month|a\s+month)",
+        r"(?:gift\s*card|visa|rewards|statement\s+credit|trade[\s-]in).*?\$\s*[0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?",
+        r"\$\s*[0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?\s*(?:gift\s*card|rewards|credit|back|trade[\s-]in)",
+        r"(?:add[\s-]ons?|duster|air\s*duster|compressed\s*air|thermal\s*paste|protection\s*plan|tech\s*support|extended\s*warranty|geek\s*squad|in[\s-]store\s*only).*?\$\s*[0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?",
+        r"\$\s*[0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?\s*(?:air\s*duster|compressed\s*air|thermal\s*paste|protection\s*plan|tech\s*support|extended\s*warranty|geek\s*squad)"
     ]
     for pat in discount_patterns:
         working_txt = re.sub(pat, " ", working_txt, flags=re.IGNORECASE)
-    # Re-apply once in case multiple add-ons were listed sequentially
+    # Re-apply once in case multiple add-ons or promos were listed sequentially
     working_txt = re.sub(
-        r"(?:duster|air\s*duster|compressed\s*air|thermal\s*paste|protection\s*plan|tech\s*support).*?\$\s*[0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?",
+        r"(?:duster|air\s*duster|compressed\s*air|thermal\s*paste|protection\s*plan|tech\s*support|free\s+delivery).*?\$\s*[0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{2})?",
         " ",
         working_txt,
         flags=re.IGNORECASE

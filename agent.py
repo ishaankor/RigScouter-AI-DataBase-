@@ -186,16 +186,20 @@ class ProductAnalyzer:
             if any(w in combined for w in ["FX-", "FX ", "AM3", "AM3+", "PHENOM", "ATHLON"]):
                 return True
 
-        # 3. NVIDIA GPUs: GTX series, RTX 2060/2070/2080
+        # 3. NVIDIA GPUs: GTX series, RTX 20-series, RTX 30-series (3090, 3080, 3070, 3060, 3050)
         if any(k in combined for k in ["GTX", "NVIDIA", "GEFORCE"]):
             if re.search(r'\bGTX\s*(?:\d{3,4})\b', combined):
                 return True
             if re.search(r'\bRTX\s*20\d{2}\b', combined):
                 return True
+            if re.search(r'\bRTX\s*30\d{2}(?:\s*TI)?\b', combined):
+                return True
 
-        # 4. AMD GPUs: RX 400/500 series, RX Vega, R9, R7
+        # 4. AMD GPUs: RX 400/500 series, RX Vega, R9, R7, RX 6000 series (6950, 6900, 6800, 6700, etc.)
         if any(k in combined for k in ["RADEON", "AMD", "RX"]):
             if re.search(r'\bRX\s*[45][6-9]0\b', combined):
+                return True
+            if re.search(r'\bRX\s*6\d{3}(?:\s*XT)?\b', combined):
                 return True
             if any(w in combined for w in ["VEGA 56", "VEGA 64", "R9 390", "R9 290"]):
                 return True
@@ -546,37 +550,47 @@ class AmazonClient:
         if tavily_results:
             for item in tavily_results:
                 txt = (item.get("title") or "") + " " + (item.get("content") or "")
-                pm = re.search(r'\$([0-9,]+\.[0-9]{2})', txt)
-                if pm:
-                    fallback_price = float(pm.group(1).replace(",", ""))
-                    if fallback_price > 10.0:
-                        raw_title = item.get("title", "").replace("Amazon.com:", "").strip()
-                        t_lower = raw_title.lower()
-                        if "renewed" in t_lower or "refurbished" in t_lower:
-                            cond_tag = "refurbished"
-                            cond_label = "Amazon Renewed"
-                        elif "used" in t_lower:
-                            cond_tag = "used"
-                            cond_label = "Used"
-                        else:
-                            cond_tag = "new"
-                            cond_label = "Brand New"
 
-                        print(f"✅ [Amazon Tavily Hit] ${fallback_price:.2f} ({cond_label}) -> {raw_title[:60]}")
-                        return {
-                            "retailer": "Amazon",
-                            "title": raw_title or f"Amazon Product {asin}",
-                            "price": fallback_price,
-                            "originalPrice": None,
-                            "inStock": True,
-                            "condition": cond_tag,
-                            "conditionLabel": cond_label,
-                            "isRefurbished": cond_tag in ["refurbished", "used"],
-                            "url": url,
-                            "imageUrl": None,
-                            "brand": None,
-                            "source": "tavily-amazon"
-                        }
+                # Check for out-of-stock indicators in Amazon snippet
+                t_lower = txt.lower()
+                is_sold_out = any(phrase in t_lower for phrase in [
+                    "currently unavailable", "out of stock", "temporarily out of stock",
+                    "we don't know when or if this item will be back in stock", "no longer available"
+                ])
+
+                # Use robust price parsing that filters shipping minimums ($35), monthly plans, and gift cards
+                from app.scrapers.search_fallback import parse_tavily_snippet_prices
+                fallback_price, orig_price = parse_tavily_snippet_prices(txt)
+
+                if fallback_price and fallback_price > 10.0:
+                    raw_title = item.get("title", "").replace("Amazon.com:", "").strip()
+                    rt_lower = raw_title.lower()
+                    if "renewed" in rt_lower or "refurbished" in rt_lower:
+                        cond_tag = "refurbished"
+                        cond_label = "Amazon Renewed"
+                    elif "used" in rt_lower:
+                        cond_tag = "used"
+                        cond_label = "Used"
+                    else:
+                        cond_tag = "new"
+                        cond_label = "Brand New"
+
+                    status_str = " (Out of Stock)" if is_sold_out else ""
+                    print(f"✅ [Amazon Tavily Hit] ${fallback_price:.2f}{status_str} ({cond_label}) -> {raw_title[:60]}")
+                    return {
+                        "retailer": "Amazon",
+                        "title": raw_title or f"Amazon Product {asin}",
+                        "price": fallback_price,
+                        "originalPrice": orig_price,
+                        "inStock": not is_sold_out,
+                        "condition": cond_tag,
+                        "conditionLabel": cond_label,
+                        "isRefurbished": cond_tag in ["refurbished", "used"],
+                        "url": url,
+                        "imageUrl": None,
+                        "brand": None,
+                        "source": "tavily-amazon"
+                    }
 
         return None
 
@@ -1406,13 +1420,23 @@ class BestBuyClient:
                 if title_m:
                     title = title_m.group(1).strip()
 
-                price_m = re.search(r"\"customerPrice\":\s*([0-9.]+)", text)
+                price_m = re.search(r"\"customerPrice\":\s*([0-9.]+)", text) or re.search(r"\"currentPrice\":\s*([0-9.]+)", text)
                 if price_m:
                     price = float(price_m.group(1))
                 else:
-                    pm = re.search(r"\$([0-9,]+\.[0-9]{2})", text)
-                    if pm:
-                        price = float(pm.group(1).replace(",", ""))
+                    for m in re.finditer(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', text, re.DOTALL):
+                        try:
+                            ld = json.loads(m.group(1))
+                            if isinstance(ld, list):
+                                ld = ld[0]
+                            offers_ld = ld.get("offers", {}) if isinstance(ld, dict) else {}
+                            if isinstance(offers_ld, list) and offers_ld:
+                                offers_ld = offers_ld[0]
+                            if isinstance(offers_ld, dict) and offers_ld.get("price"):
+                                price = float(offers_ld["price"])
+                                break
+                        except Exception:
+                            continue
 
                 img_m = re.search(r"\"(?:piscesHref|href)\":\"(https://pisces\.bbystatic\.com/[^\"]+)\"", text)
                 if img_m:
@@ -1674,6 +1698,40 @@ class HardwareAgent:
             return await self.ebay.lookup_url(clean_url)
         elif "bestbuy.com" in domain:
             return await self.bestbuy.lookup_url(clean_url)
+        elif "microcenter.com" in domain and getattr(self, "microcenter", None):
+            try:
+                off = await self.microcenter.get_price(clean_url)
+                if off:
+                    return {
+                        "retailer": "Micro Center",
+                        "title": off.title,
+                        "price": off.price,
+                        "originalPrice": off.original_price,
+                        "inStock": off.in_stock,
+                        "url": clean_url,
+                        "imageUrl": off.image_url,
+                        "source": "microcenter-direct"
+                    }
+            except Exception as e:
+                print(f"[Micro Center Direct URL Notice] {e}")
+            return await self.generic.lookup_url(clean_url)
+        elif "newegg.com" in domain and getattr(self, "newegg", None):
+            try:
+                off = await self.newegg.get_price(clean_url)
+                if off:
+                    return {
+                        "retailer": "Newegg",
+                        "title": off.title,
+                        "price": off.price,
+                        "originalPrice": off.original_price,
+                        "inStock": off.in_stock,
+                        "url": clean_url,
+                        "imageUrl": getattr(off, "image_url", None),
+                        "source": "newegg-direct"
+                    }
+            except Exception as e:
+                print(f"[Newegg Direct URL Notice] {e}")
+            return await self.generic.lookup_url(clean_url)
         else:
             return await self.generic.lookup_url(clean_url)
 

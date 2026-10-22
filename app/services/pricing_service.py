@@ -115,7 +115,12 @@ class PricingService:
 
         old_price = float(existing.get("current_price") or 0.0)
         old_atl = float(existing.get("lowest_price_90d") or old_price or new_price)
-        new_atl = min(old_atl if old_atl > 0 else new_price, new_price)
+        is_anomalous_drop = (old_price > 80.0 and new_price < old_price * 0.35)
+        if is_anomalous_drop:
+            logger.warning(f"⚠️ [Pricing Anomaly] {comp_id}: Dropped from ${old_price:.2f} to ${new_price:.2f}. Preserving ATL.")
+            new_atl = old_atl if old_atl > 0 else new_price
+        else:
+            new_atl = min(old_atl if old_atl > 0 else new_price, new_price)
 
         # Merge price history
         history = list(specs_dict.get("price_history") or [])

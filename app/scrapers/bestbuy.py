@@ -63,10 +63,27 @@ class BestBuyScraper(BaseScraper):
             if sku:
                 pb = await self._fetch_priceblocks(sku)
                 if pb:
-                    price = pb.get("customerPrice")
-                    orig_price = pb.get("regularPrice")
+                    sku_obj = pb.get("sku", {}) if isinstance(pb.get("sku"), dict) else pb
+                    price_obj = sku_obj.get("price", {}) if isinstance(sku_obj.get("price"), dict) else pb.get("price", {})
+                    c_p = price_obj.get("currentPrice") or pb.get("customerPrice")
+                    r_p = price_obj.get("regularPrice") or pb.get("regularPrice")
+                    btn = sku_obj.get("buttonState", {}) if isinstance(sku_obj.get("buttonState"), dict) else pb.get("buttonState", {})
+                    btn_state = str(btn.get("buttonState", "")).upper()
+                    in_stock = bool(btn.get("purchasable", True) and btn_state not in ["SOLD_OUT", "UNAVAILABLE", "NOT_ORDERABLE"])
+                    if c_p:
+                        try:
+                            price = float(c_p)
+                        except (ValueError, TypeError):
+                            price = None
+                    if r_p:
+                        try:
+                            orig_price = float(r_p)
+                        except (ValueError, TypeError):
+                            orig_price = None
+                    names = sku_obj.get("names", {})
+                    if names.get("short") or names.get("title"):
+                        raw_title = names.get("short") or names.get("title")
 
-            in_stock = True
             cond = "new"
 
             if not price:
@@ -111,14 +128,30 @@ class BestBuyScraper(BaseScraper):
 
         if sku:
             pb = await self._fetch_priceblocks(sku)
-            if pb and pb.get("customerPrice"):
-                return Offer(
-                    retailer=self.retailer_name,
-                    price=float(pb["customerPrice"]),
-                    original_price=float(pb.get("regularPrice", 0)) or None,
-                    url=url,
-                    title="Best Buy Product"
-                )
+            if pb:
+                sku_obj = pb.get("sku", {}) if isinstance(pb.get("sku"), dict) else pb
+                price_obj = sku_obj.get("price", {}) if isinstance(sku_obj.get("price"), dict) else pb.get("price", {})
+                c_p = price_obj.get("currentPrice") or pb.get("customerPrice")
+                r_p = price_obj.get("regularPrice") or pb.get("regularPrice")
+                btn = sku_obj.get("buttonState", {}) if isinstance(sku_obj.get("buttonState"), dict) else pb.get("buttonState", {})
+                btn_state = str(btn.get("buttonState", "")).upper()
+                in_stk = bool(btn.get("purchasable", True) and btn_state not in ["SOLD_OUT", "UNAVAILABLE", "NOT_ORDERABLE"])
+                names = sku_obj.get("names", {})
+                title = names.get("short") or names.get("title") or "Best Buy Product"
+                if c_p:
+                    try:
+                        p_val = float(c_p)
+                        orig_val = float(r_p) if r_p else None
+                        return Offer(
+                            retailer=self.retailer_name,
+                            price=p_val,
+                            original_price=orig_val,
+                            url=url,
+                            title=title,
+                            in_stock=in_stk
+                        )
+                    except (ValueError, TypeError):
+                        pass
 
         # Fallback to smart parsing
         t_hits = await query_tavily_search(f'"{url}" price', max_results=2)

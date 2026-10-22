@@ -15,13 +15,15 @@ SMART_PARSER_SYSTEM_PROMPT = (
     "CRITICAL RULES:\n"
     "1. ACTIVE PRICE: Extract the actual current checkout price in USD (e.g. 219.99). "
     "Do NOT confuse 'Save $50', '$50 off', 'Instant Rebate $30', or 'Was $299' with the current price! "
-    "Do NOT pick up prices of recommended items, carousel products (e.g. 'Customers also viewed $559'), "
+    "Do NOT pick up monthly financing (e.g. '$89.00/mo', '$35/month'), shipping minimums (e.g. 'FREE delivery on $35.00', '$9.99 shipping'), "
+    "gift card promos ('$100 gift card'), carousel products (e.g. 'Customers also viewed $559'), "
     "or add-on accessories (e.g. 'Compressed Air Duster $29.99', 'Ultra Duster $9.99', 'Thermal Paste', 'Protection Plan'). "
     "Extract ONLY the price of the standalone component itself.\n"
     "2. ORIGINAL PRICE: If there is a clear previous/original price ('Was $XXX', 'Regular Price $XXX', 'List Price $XXX'), "
     "extract it; otherwise null.\n"
     "3. STOCK STATUS: Determine if the product is in stock (true) or out of stock (false). "
-    "Words like '0 in stock', 'sold out', 'out of stock', 'currently unavailable', 'backorder', 'not available online' mean in_stock: false.\n"
+    "Words and phrases like '0 in stock', 'sold out', 'out of stock', 'currently unavailable', 'no longer available', "
+    "'this item is no longer available', 'no longer carried', 'discontinued', 'backorder', 'not available online', 'not available for shipping' mean in_stock: false.\n"
     "4. STANDALONE COMPONENT MATCH: The user is looking for a standalone PC rig part. "
     "If the item is a full desktop PC prebuilt, laptop, motherboard bundle, upgrade kit, or accessory (air duster, sticker, empty box, toy, poster, cable), "
     "set is_standalone_match: false. If it is the genuine standalone hardware component, set is_standalone_match: true.\n"
@@ -159,7 +161,10 @@ def _fallback_heuristic_parse(
     is_sold_out = any(
         phrase in t_lower for phrase in [
             "0 in stock", "sold out", "out of stock", "currently unavailable",
-            "not in stock", "backorder", "pick up in store only - 0"
+            "not in stock", "backorder", "pick up in store only - 0",
+            "no longer available", "this item is no longer available",
+            "no longer carried", "discontinued", "not available for shipping",
+            "not available in new condition"
         ]
     )
 

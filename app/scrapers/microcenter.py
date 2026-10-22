@@ -175,8 +175,21 @@ class MicroCenterScraper(BaseScraper):
         page_text = soup.text.lower()
         is_sold_out = any(phrase in page_text for phrase in [
             "sold out", "0 in stock", "out of stock", "currently unavailable",
-            "not available for shipping and sold out", "pick up in store only - 0"
+            "no longer available", "this item is no longer available",
+            "item no longer available", "no longer carried", "discontinued",
+            "not available for shipping and sold out", "pick up in store only - 0",
+            "not available in store or online", "not available for shipping"
         ])
+
+        # Check dedicated inventory status tags in Micro Center DOM
+        inv_el = soup.select_one(".inventoryCnt, .inventory, .out-of-stock, .unavailable, .order-status")
+        if inv_el:
+            inv_text = inv_el.text.lower()
+            if any(p in inv_text for p in [
+                "no longer available", "sold out", "0 in stock", "out of stock",
+                "no longer carried", "unavailable", "discontinued"
+            ]):
+                is_sold_out = True
 
         # 6. Extract image
         img_el = (

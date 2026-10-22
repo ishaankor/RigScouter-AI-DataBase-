@@ -505,6 +505,12 @@ async def execute_daily_price_refresh():
                                 if sub_offer.get("price") and float(sub_offer["price"]) > 0:
                                     off["price"] = float(sub_offer["price"])
                                 off["inStock"] = bool(sub_offer.get("inStock", True))
+                            else:
+                                off_ret = (off.get("retailer") or "").lower()
+                                if any(r in off_ret for r in ["micro center", "best buy"]):
+                                    fake_analysis = ProductAnalysis(comp_name, None, comp_name, comp.get("category", "GPU"), True, comp_name, [])
+                                    if ProductAnalyzer.is_legacy_or_discontinued(fake_analysis):
+                                        off["inStock"] = False
 
                     # For retailer-specific rows (ending with retailer slug), preserve that retailer
                     is_retailer_specific = any(comp_id.endswith(f"-{r}") for r in ["amazon", "ebay", "best-buy", "micro-center", "newegg", "bh"])
@@ -600,7 +606,14 @@ async def execute_daily_price_refresh():
                     continue
 
                 price_changed = abs(new_price - old_price) >= 0.01
-                new_atl = min(old_atl if old_atl > 0 else new_price, new_price)
+
+                # Anomaly guard: prevent scraper glitch (e.g. $35 shipping fee) from destroying 90-day ATL
+                is_anomalous_drop = (old_price > 80.0 and new_price < old_price * 0.35)
+                if is_anomalous_drop:
+                    print(f"⚠️ [Daily Refresh Anomaly] Suspicious price drop: \"{comp_name[:40]}\" ${old_price:.2f} -> ${new_price:.2f}. Preserving ATL.")
+                    new_atl = old_atl if old_atl > 0 else new_price
+                else:
+                    new_atl = min(old_atl if old_atl > 0 else new_price, new_price)
 
                 if price_changed and is_currently_in_stock:
                     diff = new_price - old_price
