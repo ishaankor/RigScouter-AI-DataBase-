@@ -130,12 +130,21 @@ class ScraperService:
             targets = [r.lower().replace(" ", "").replace("-", "") for r in (retailers or list(self.scrapers.keys()))]
             active_scrapers = []
 
+            from agent import ProductAnalyzer
+            effective_analysis = analysis
+            if not effective_analysis and query:
+                effective_analysis = ProductAnalysis(query, None, query, "Hardware", True, query, [])
+            is_legacy = ProductAnalyzer.is_legacy_or_discontinued(effective_analysis) if effective_analysis else False
+
             for key, scraper in self.scrapers.items():
+                if is_legacy and key in ["microcenter", "bestbuy"]:
+                    logger.info(f"📦 [Hardware Lifecycle] Skipping {scraper.retailer_name} for legacy/discontinued hardware: '{query}'")
+                    continue
                 if any(t in key or key in t for t in targets):
                     active_scrapers.append(scraper)
 
             if not active_scrapers:
-                active_scrapers = list(self.scrapers.values())
+                active_scrapers = [s for k, s in self.scrapers.items() if not (is_legacy and k in ["microcenter", "bestbuy"])]
 
             async def _safe_search(scraper):
                 try:

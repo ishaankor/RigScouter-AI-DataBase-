@@ -29,7 +29,8 @@ SMART_PARSER_SYSTEM_PROMPT = (
     "If the item is a full desktop PC prebuilt, laptop, motherboard bundle, upgrade kit, or accessory (air duster, sticker, empty box, toy, poster, cable), "
     "set is_standalone_match: false. If it is the genuine standalone hardware component, set is_standalone_match: true.\n"
     "5. CONDITION: One of: 'new', 'open_box', 'refurbished', 'used'. Default is 'new'.\n"
-    "6. CLEAN TITLE: Extract the accurate, clean product title without retailer branding noise (e.g. strip '| Newegg.com', 'Best Buy:').\n\n"
+    "6. CLEAN TITLE: Extract the accurate, clean product title without retailer branding noise (e.g. strip '| Newegg.com', 'Best Buy:').\n"
+    "7. NO LONGER CARRIED: If the text states 'no longer carried', 'this item is no longer carried', 'item no longer carried', or the retailer permanently discontinued carrying this product, set is_standalone_match: false with rejection_reason: 'No longer carried by retailer'.\n\n"
     "Return JSON format:\n"
     "{\n"
     "  \"offers\": [\n"
@@ -59,6 +60,16 @@ async def parse_result_text(
     Converts unstructured web snippet text into accurate structured offers without fragile regexes.
     """
     if not text or not text.strip():
+        return []
+
+    text_lower = text.lower()
+    if any(p in text_lower for p in [
+        "no longer carried",
+        "this item is no longer carried",
+        "item no longer carried",
+        "this item is no longer carried by micro center"
+    ]):
+        logger.info(f"🚫 [{retailer_name} Smart Filtered] Product is marked 'no longer carried'")
         return []
 
     groq_key = settings.GROQ_API_KEY
@@ -159,6 +170,15 @@ def _fallback_heuristic_parse(
         return []
 
     t_lower = text.lower()
+    if any(p in t_lower for p in [
+        "no longer carried",
+        "this item is no longer carried",
+        "item no longer carried",
+        "this item is no longer carried by micro center"
+    ]):
+        logger.info(f"🚫 [{retailer_name} Fallback] Product is marked 'no longer carried'")
+        return []
+
     has_active_buy = any(w in t_lower for w in ["buy it now", "add to cart", "in stock", "available"])
     has_explicit_sold_out = any(
         phrase in t_lower for phrase in [

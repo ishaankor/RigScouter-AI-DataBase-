@@ -88,6 +88,20 @@ class MicroCenterScraper(BaseScraper):
         if not html or len(html.strip()) < 50:
             return None
 
+        lower_html = html.lower()
+        # Terminal check: Micro Center displays "This item is no longer carried by Micro Center" for deleted SKUs.
+        # These pages retain obsolete JSON-LD prices (e.g. $79.99) but cannot be purchased. Return None.
+        if any(p in lower_html for p in [
+            "no longer carried",
+            "this item is no longer carried",
+            "item no longer carried",
+            "this item is no longer carried by micro center",
+            "not available in store or online",
+            "this item is no longer available"
+        ]):
+            logger.info(f"🚫 [Micro Center DOM] Product is no longer carried: {url}")
+            return None
+
         soup = BeautifulSoup(html, "html.parser")
 
         # 1. CRITICAL: Remove add-on accessories, warranty upsells, and related product carousels
@@ -173,21 +187,31 @@ class MicroCenterScraper(BaseScraper):
 
         # 5. Extract stock availability
         page_text = soup.text.lower()
+        if any(p in page_text for p in [
+            "no longer carried", "this item is no longer carried", "item no longer carried"
+        ]):
+            logger.info(f"🚫 [Micro Center DOM Text] Product is no longer carried: {url}")
+            return None
+
         is_sold_out = any(phrase in page_text for phrase in [
             "sold out", "0 in stock", "out of stock", "currently unavailable",
             "no longer available", "this item is no longer available",
-            "item no longer available", "no longer carried", "discontinued",
-            "not available for shipping and sold out", "pick up in store only - 0",
-            "not available in store or online", "not available for shipping"
+            "discontinued", "not available for shipping and sold out",
+            "pick up in store only - 0", "not available for shipping"
         ])
 
         # Check dedicated inventory status tags in Micro Center DOM
-        inv_el = soup.select_one(".inventoryCnt, .inventory, .out-of-stock, .unavailable, .order-status")
+        inv_el = soup.select_one(".inventoryCnt, .inventory, .out-of-stock, .unavailable, .order-status, .not-available")
         if inv_el:
             inv_text = inv_el.text.lower()
             if any(p in inv_text for p in [
+                "no longer carried", "item no longer carried"
+            ]):
+                logger.info(f"🚫 [Micro Center DOM Inventory] Product no longer carried: {url}")
+                return None
+            if any(p in inv_text for p in [
                 "no longer available", "sold out", "0 in stock", "out of stock",
-                "no longer carried", "unavailable", "discontinued"
+                "unavailable", "discontinued"
             ]):
                 is_sold_out = True
 
@@ -219,17 +243,42 @@ class MicroCenterScraper(BaseScraper):
         # 1. Attempt direct live HTML fetch & DOM extraction
         status, html = await self._fetch_html(url)
         if status == 200 and html:
+            lower_html = html.lower()
+            if any(p in lower_html for p in [
+                "no longer carried",
+                "this item is no longer carried",
+                "item no longer carried",
+                "this item is no longer carried by micro center",
+                "not available in store or online",
+                "this item is no longer available"
+            ]):
+                logger.info(f"🚫 [Micro Center] Live page confirmed product no longer carried: {url}")
+                return None
+
             offer = self._parse_product_page(html, url)
             if offer and offer.price:
                 logger.info(f"✅ [Micro Center DOM Hit] ${offer.price:.2f} -> {offer.title[:60]}")
                 return offer
 
-        # 2. Fallback to Tavily snippet search if direct page fetch was completely blocked
+            # If live fetch loaded (200 OK) but wasn't a valid product, do not fall back to Tavily
+            return None
+
+        # 2. Fallback to Tavily snippet search ONLY if direct page fetch was completely blocked (e.g. 403 / Akamai)
         logger.info(f"🔍 [Micro Center Fallback] Direct fetch blocked; querying Tavily for {url}...")
         t_hits = await query_tavily_search(f'"{url}" price', max_results=2)
         if t_hits:
             hit = t_hits[0]
             txt = (hit.get("title", "") or "") + "\n" + (hit.get("content", "") or "")
+            if any(p in txt.lower() for p in [
+                "no longer carried",
+                "this item is no longer carried",
+                "item no longer carried",
+                "not available in store or online",
+                "this item is no longer available"
+            ]):
+                logger.info(f"🚫 [Micro Center Fallback] Tavily snippet indicates product no longer carried: {url}")
+                return None
+
             smart_listings = await parse_result_text(txt, self.retailer_name, url, url)
             if smart_listings:
                 sl = smart_listings[0]
@@ -252,6 +301,14 @@ class MicroCenterScraper(BaseScraper):
         offers: List[Offer] = []
         clean_query = query.replace('"', '').strip()
 
+        # If analysis indicates legacy / discontinued hardware, Micro Center will not carry it.
+        # Bail early to avoid wasted Tavily queries and timeouts.
+        if analysis:
+            from agent import ProductAnalyzer
+            if ProductAnalyzer.is_legacy_or_discontinued(analysis):
+                logger.info(f"📦 [Micro Center] Skipping search for legacy/discontinued hardware: '{query}'")
+                return []
+
         # Query Micro Center product pages via Tavily
         t_query = f'site:microcenter.com/product/ "{clean_query}" price'
         results = await query_tavily_search(t_query, max_results=4)
@@ -263,6 +320,21 @@ class MicroCenterScraper(BaseScraper):
             if "microcenter.com/product/" not in url:
                 continue
 
+            raw_title = item.get("title", "")
+            snippet = item.get("content", "")
+            combined_text = f"{raw_title} {snippet}".lower()
+
+            # Discard any hits where snippet/title reveals the product is no longer carried
+            if any(p in combined_text for p in [
+                "no longer carried",
+                "this item is no longer carried",
+                "item no longer carried",
+                "not available in store or online",
+                "this item is no longer available"
+            ]):
+                logger.info(f"🚫 [Micro Center Search] Dropping no longer carried product: {raw_title[:60]}")
+                continue
+
             # First try direct live DOM extraction for this product URL to get the true price ($59.99)
             live_offer = await self.get_price(url)
             if live_offer:
@@ -270,10 +342,12 @@ class MicroCenterScraper(BaseScraper):
                 if is_valid:
                     offers.append(live_offer)
                     continue
+            else:
+                # If get_price returned None, the product was confirmed no longer carried or invalid.
+                # Do NOT fall back to parsing dead snippet text!
+                continue
 
-            # If live DOM fetch failed, fall back to smart LLM-powered snippet parsing
-            raw_title = item.get("title", "")
-            snippet = item.get("content", "")
+            # Fall back to smart LLM snippet parsing only if live DOM fetch was blocked
             smart_listings = await parse_result_text(
                 f"{raw_title}\n{snippet}",
                 self.retailer_name,

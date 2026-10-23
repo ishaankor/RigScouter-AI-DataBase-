@@ -162,12 +162,32 @@ class ProductAnalyzer:
     @staticmethod
     def is_legacy_or_discontinued(analysis: ProductAnalysis) -> bool:
         """Returns True if component is legacy/discontinued hardware no longer stocked by retail chains.
-        Prevents Best Buy / Micro Center timeout hangs and false prebuilt/review matches."""
+        Prevents Best Buy / Micro Center timeout hangs, deleted SKU scraping, and false prebuilt matches."""
         model = (analysis.model or "").upper()
         raw = (analysis.raw_query or "").upper()
         combined = f"{model} {raw}"
 
-        # 1. Intel CPUs: Discontinued <= 11th Gen (2xxx - 11xxx, e.g. i7-4770K, i7-6700K, i7-10700KF)
+        # 1. Motherboards: AMD Legacy Chipsets & Sockets
+        # Modern retail AMD is AM5 (B650, X670, B850, X870, A620).
+        # AM4 chipsets (B550, B450, X570, A520, A320, X470, B350, X370) and older (AM3, AM2, FM2)
+        # are no longer carried by retail chains like Micro Center.
+        if any(w in combined for w in ["AM4", "AM3+", "AM3", "AM2+", "AM2", "FM2+", "FM2"]):
+            return True
+        if re.search(r'\b(?:A320|B350|X370|B450|X470|A520|B550|X570)[A-Z0-9\-]*\b', combined):
+            return True
+
+        # 2. Motherboards: Intel Legacy Chipsets & Sockets
+        # LGA 1200: Z590, B560, H570, H510, Z490, B460, H470, H410, W480
+        # LGA 1151: Z390, Z370, H370, B365, B360, H310, Z270, H270, B250, Z170, H170, B150, H110
+        # LGA 1150: Z97, H97, Z87, H87, B85, H81
+        # LGA 1155: Z77, Z75, Z68, P67, H67, H61
+        # Modern retail Intel is LGA 1700 (Z690, B660, H610, Z790, B760) and LGA 1851 (Z890, B860)
+        if any(w in combined for w in ["LGA 1200", "LGA 1151", "LGA 1150", "LGA 1155", "LGA 775", "LGA 1366", "LGA 2011", "LGA 2066"]):
+            return True
+        if re.search(r'\b(?:Z590|B560|H570|H510|Z490|B460|H470|H410|W480|Z390|Z370|H370|B365|B360|H310|Z270|H270|B250|Z170|H170|B150|H110|Z97|H97|Z87|H87|B85|H81|Z77|Z75|Z68|P67|H67|H61)[A-Z0-9\-]*\b', combined):
+            return True
+
+        # 3. Intel CPUs: Discontinued <= 11th Gen (2xxx - 11xxx, e.g. i7-4770K, i7-6700K, i7-10700KF)
         # Modern retail: 12xxx, 13xxx, 14xxx, Core Ultra 1xx/2xx
         if any(k in combined for k in ["INTEL", "CORE", "I3-", "I5-", "I7-", "I9-", "I3 ", "I5 ", "I7 ", "I9 "]):
             m = re.search(r'\b(?:I[3579][ -]?)?([2-9]\d{3}|1[01]\d{3})([A-Z]{0,3})\b', combined)
@@ -175,37 +195,43 @@ class ProductAnalyzer:
                 num = int(m.group(1))
                 if num <= 11900:
                     return True
-            if any(w in combined for w in ["CORE 2", "LGA 1150", "LGA 1155", "LGA 1151", "LGA 775", "LGA 1366"]):
+            if any(w in combined for w in ["CORE 2", "LGA 1200", "LGA 1150", "LGA 1155", "LGA 1151", "LGA 775", "LGA 1366", "LGA 2011", "LGA 2066"]):
                 return True
 
-        # 2. AMD CPUs: Ryzen 1000, 2000, 3000 series, FX series, Phenom, Athlon
-        if any(k in combined for k in ["RYZEN", "AMD"]):
-            m = re.search(r'\b(?:RYZEN\s*[3579]\s*)?([1-3]\d{3})([A-Z]{0,3})\b', combined)
+        # 4. AMD CPUs: Ryzen 1000, 2000, 3000, 4000 series, FX series, Phenom, Athlon, Threadripper 1000-3000
+        if any(k in combined for k in ["RYZEN", "AMD", "THREADRIPPER"]):
+            m = re.search(r'\b(?:RYZEN\s*[3579]\s*)?([1-4]\d{3})([A-Z]{0,3})\b', combined)
             if m:
                 return True
-            if any(w in combined for w in ["FX-", "FX ", "AM3", "AM3+", "PHENOM", "ATHLON"]):
+            if any(w in combined for w in ["FX-", "FX ", "AM3", "AM3+", "AM2", "FM2", "PHENOM", "ATHLON"]):
+                return True
+            if re.search(r'\b(?:THREADRIPPER\s*)?[1-3]\d{3}[A-Z]{0,2}\b', combined):
                 return True
 
-        # 3. NVIDIA GPUs: GTX series, RTX 20-series, RTX 30-series (3090, 3080, 3070, 3060, 3050)
-        if any(k in combined for k in ["GTX", "NVIDIA", "GEFORCE"]):
+        # 5. NVIDIA GPUs: GTX series, RTX 20-series, RTX 30-series (3090, 3080, 3070, 3060, 3050), GT series
+        if any(k in combined for k in ["GTX", "NVIDIA", "GEFORCE", "RTX", "GT "]):
             if re.search(r'\bGTX\s*(?:\d{3,4})\b', combined):
                 return True
             if re.search(r'\bRTX\s*20\d{2}\b', combined):
                 return True
             if re.search(r'\bRTX\s*30\d{2}(?:\s*TI)?\b', combined):
                 return True
+            if re.search(r'\bGT\s*(?:710|730|1030)\b', combined):
+                return True
 
-        # 4. AMD GPUs: RX 400/500 series, RX Vega, R9, R7, RX 6000 series (6950, 6900, 6800, 6700, etc.)
+        # 6. AMD GPUs: RX 400/500 series, RX 5000 series, RX 6000 series, RX Vega, R9, R7
         if any(k in combined for k in ["RADEON", "AMD", "RX"]):
             if re.search(r'\bRX\s*[45][6-9]0\b', combined):
                 return True
+            if re.search(r'\bRX\s*5\d{3}(?:\s*XT)?\b', combined):
+                return True
             if re.search(r'\bRX\s*6\d{3}(?:\s*XT)?\b', combined):
                 return True
-            if any(w in combined for w in ["VEGA 56", "VEGA 64", "R9 390", "R9 290"]):
+            if any(w in combined for w in ["VEGA 56", "VEGA 64", "RADEON VII", "R9 390", "R9 290"]):
                 return True
 
-        # 5. DDR3 RAM
-        if "DDR3" in combined:
+        # 7. DDR3 / DDR2 RAM
+        if any(w in combined for w in ["DDR3", "DDR2", "DDR1", "PC3-", "PC2-"]):
             return True
 
         return False
@@ -1851,7 +1877,10 @@ class HardwareAgent:
                     }
             except Exception as e:
                 print(f"[Micro Center Direct URL Notice] {e}")
-            return await self.generic.lookup_url(clean_url)
+            # Do NOT fall back to generic.lookup_url for microcenter.com!
+            # Micro Center pages for discontinued products still contain obsolete JSON-LD prices ($79.99)
+            # while displaying "This item is no longer carried by Micro Center".
+            return None
         elif "newegg.com" in domain and getattr(self, "newegg", None):
             try:
                 off = await self.newegg.get_price(clean_url)
