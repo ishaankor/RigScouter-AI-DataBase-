@@ -7,6 +7,8 @@ router = APIRouter(tags=["Events"])
 
 @router.get("/events")
 @router.get("/api/events")
+@router.get("/stream")
+@router.get("/api/stream")
 async def events_feed(request: Request):
     """
     Real-time Server-Sent Events endpoint subscribed to price drops & updates.
@@ -24,9 +26,18 @@ async def events_feed(request: Request):
             while True:
                 if await request.is_disconnected():
                     break
-                event = await client_queue.get()
-                yield event
+                try:
+                    event = await asyncio.wait_for(client_queue.get(), timeout=25.0)
+                    yield event
+                except asyncio.TimeoutError:
+                    yield {
+                        "event": "heartbeat",
+                        "data": '{"ping": "heartbeat"}'
+                    }
         finally:
             sse_service.clients.discard(client_queue)
 
-    return EventSourceResponse(event_generator())
+    return EventSourceResponse(
+        event_generator(),
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache, no-transform"}
+    )

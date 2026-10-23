@@ -37,28 +37,54 @@ async def run_daily_price_refresh_job():
         components = res.data or []
         logger.info(f"📊 [Daily Refresh] Found {len(components)} components to refresh.")
 
+        import json
+
         for comp in components:
             comp_id = comp.get("id")
             name = comp.get("name") or comp.get("model") or comp_id
             product_url = comp.get("product_url")
 
-            offers = []
-            if product_url and product_url.startswith("http"):
-                off = await scraper_service.get_price_for_url(product_url)
-                if off:
-                    offers.append(off)
+            raw_specs = comp.get("specs") or {}
+            specs_data = json.loads(raw_specs) if isinstance(raw_specs, str) else raw_specs
 
+            offers = []
+            seen_retailers = set()
+
+            # 1. Primary offer from product_url
+            if product_url and product_url.startswith("http"):
+                try:
+                    off = await scraper_service.get_price_for_url(product_url)
+                    if off:
+                        offers.append(off)
+                        seen_retailers.add(off.retailer.lower().strip())
+                except Exception as ex:
+                    logger.warning(f"Error fetching primary URL {product_url}: {ex}")
+
+            # 2. Check other retailer URLs from existing specs.RetailerOffers
+            existing_offers = specs_data.get("RetailerOffers") or []
+            for ret_off in existing_offers:
+                r_name = (ret_off.get("retailer") or "").lower().strip()
+                r_url = ret_off.get("url")
+                if r_url and r_url.startswith("http") and r_name not in seen_retailers:
+                    try:
+                        scraped = await scraper_service.get_price_for_url(r_url)
+                        if scraped:
+                            offers.append(scraped)
+                            seen_retailers.add(r_name)
+                    except Exception as ex:
+                        logger.debug(f"Error checking secondary retailer {r_name}: {ex}")
+
+            # 3. Fallback to broad search if no direct URLs yielded offers
             if not offers:
                 search_q = comp.get("model") or name
-                # Force live scrape during scheduled daily refresh
                 offers = await scraper_service.find_all_offers(
                     query=search_q,
                     comp_id=comp_id,
                     force=True
                 )
 
-            if offers:
-                await pricing_service.update_component_and_watchlist(comp_id, name, offers)
+            # 4. Always update component (even if empty, to trigger miss tracking & grace period)
+            await pricing_service.update_component_and_watchlist(comp_id, name, offers)
 
             await asyncio.sleep(1.0)  # Gentle spacing to avoid hitting rate limits
 

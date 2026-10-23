@@ -112,7 +112,7 @@ class ProductAnalyzer:
             "- \"negative_keywords\": Array of terms that indicate a candidate result is the WRONG product, accessory, toy, or broken item. CRITICAL: NEVER include standard hardware specification terms (e.g. 'socket', 'am5', 'am4', 'lga', 'pcie', 'ddr5', 'cores', 'threads') as negative keywords, because genuine hardware components always include their socket and specs in their titles."
         )
 
-        models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b", "groq/compound"]
+        models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
         for model_name in models:
             try:
                 async with httpx.AsyncClient() as client:
@@ -942,6 +942,34 @@ class EbayClient:
             print(f"[eBay Lookup Exception] {e}")
         return None
 
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.ebay.com/",
+    }
+
+    async def _fetch_html(self, url: str) -> tuple[int, str]:
+        status_code = 0
+        text = ""
+
+        if HAS_CURL_CFFI:
+            for profile in ["chrome124", "chrome120"]:
+                try:
+                    async with CurlAsyncSession(impersonate=profile) as session:
+                        res = await session.get(url, headers=self.HEADERS, timeout=12)
+                        if res.status_code == 200 and res.text:
+                            return res.status_code, res.text
+                except Exception:
+                    pass
+
+        try:
+            async with httpx.AsyncClient(headers=self.HEADERS, follow_redirects=True, timeout=12.0) as client:
+                res = await client.get(url)
+                return res.status_code, res.text
+        except Exception as e:
+            return status_code, text
+
     async def lookup_url(self, url: str) -> dict | None:
         item_id = self.extract_item_id(url)
         if item_id:
@@ -950,6 +978,115 @@ class EbayClient:
                 if url.startswith("http"):
                     res["url"] = url
                 return res
+
+        # Tier 2 Fallback: Direct DOM HTML extraction
+        status_code, html = await self._fetch_html(url)
+        if status_code == 200 and html:
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+                title = None
+                title_el = soup.find("h1", class_=re.compile(r"x-item-title__mainTitle", re.I)) or soup.find("h1")
+                if title_el:
+                    title = title_el.get_text(strip=True)
+                elif soup.title:
+                    title = soup.title.string.replace("| eBay", "").strip()
+
+                price_val = None
+                price_container = (
+                    soup.find("div", class_=re.compile(r"x-price-primary", re.I)) or
+                    soup.find("div", class_=re.compile(r"x-bin-price", re.I)) or
+                    soup.find("span", itemprop="price")
+                )
+                if price_container:
+                    m = re.search(r"[\$US\s]*([0-9,]+\.[0-9]{2})", price_container.get_text(strip=True))
+                    if m:
+                        price_val = float(m.group(1).replace(",", ""))
+
+                if not price_val:
+                    m_p = re.search(r"US\s*\$([0-9,]+\.[0-9]{2})", html)
+                    if m_p:
+                        price_val = float(m_p.group(1).replace(",", ""))
+
+                html_lower = html.lower()
+                has_bin_button = bool(
+                    soup.find(id="binBtn_btn_1") or
+                    soup.find(class_=re.compile(r"x-bin-action", re.I)) or
+                    re.search(r'["\'>]\s*buy it now\s*<', html_lower)
+                )
+                has_atc_button = bool(
+                    soup.find(id="atcBtn_btn_1") or
+                    soup.find(class_=re.compile(r"x-atc-action", re.I)) or
+                    re.search(r'["\'>]\s*add to cart\s*<', html_lower)
+                )
+                is_active = has_bin_button or has_atc_button
+                is_explicit_ended = any(phrase in html_lower for phrase in [
+                    "this listing was ended by the seller",
+                    "this item is out of stock",
+                    "ended:"
+                ])
+                in_stock = is_active and not is_explicit_ended
+
+                cond = "new"
+                cond_el = soup.find("div", class_=re.compile(r"x-item-condition-text", re.I))
+                if cond_el:
+                    c_txt = cond_el.get_text(strip=True).lower()
+                    if "refurbished" in c_txt:
+                        cond = "refurbished"
+                    elif any(w in c_txt for w in ["used", "pre-owned"]):
+                        cond = "used"
+                    elif "open" in c_txt:
+                        cond = "open_box"
+
+                img_el = soup.find("div", class_=re.compile(r"ux-image-carousel-item", re.I))
+                img_url = img_el.find("img")["src"] if (img_el and img_el.find("img")) else None
+
+                if price_val and price_val > 0:
+                    print(f"✅ [eBay Direct HTML Hit] ${price_val:.2f} (inStock={in_stock}) -> {title[:60] if title else url}")
+                    return {
+                        "retailer": "eBay",
+                        "title": title or "eBay Hardware Product",
+                        "price": price_val,
+                        "originalPrice": None,
+                        "inStock": in_stock,
+                        "condition": cond,
+                        "conditionLabel": "Brand New" if cond == "new" else ("Refurbished" if cond == "refurbished" else "Used"),
+                        "isRefurbished": cond in ["refurbished", "used"],
+                        "url": url,
+                        "imageUrl": img_url,
+                        "brand": None,
+                        "source": "ebay-direct-html"
+                    }
+            except Exception as e:
+                print(f"[eBay Direct HTML Parse Notice] {e}")
+
+        # Tier 3 Fallback: Tavily search
+        try:
+            from app.scrapers.search_fallback import query_tavily_search
+            from app.scrapers.smart import parse_result_text
+            t_hits = await query_tavily_search(f'site:ebay.com/itm/{item_id} price' if item_id else f'"{url}" price', max_results=2)
+            if t_hits:
+                hit = t_hits[0]
+                txt = (hit.get("title", "") or "") + "\n" + (hit.get("content", "") or "")
+                smart_listings = await parse_result_text(txt, "eBay", url, item_id or url)
+                if smart_listings:
+                    sl = smart_listings[0]
+                    return {
+                        "retailer": "eBay",
+                        "title": sl.get("title") or hit.get("title"),
+                        "price": sl["price"],
+                        "originalPrice": sl.get("original_price"),
+                        "inStock": sl.get("in_stock", True),
+                        "condition": sl.get("condition", "new"),
+                        "conditionLabel": "Brand New" if sl.get("condition") == "new" else "Used",
+                        "isRefurbished": sl.get("condition") in ["refurbished", "used"],
+                        "url": url,
+                        "imageUrl": None,
+                        "brand": None,
+                        "source": "ebay-tavily-smart"
+                    }
+        except Exception as tavily_err:
+            print(f"[eBay Tavily Fallback Notice] {tavily_err}")
+
         return None
 
 

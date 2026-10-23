@@ -495,6 +495,27 @@ async def execute_daily_price_refresh():
                 primary_in_stock = bool(primary_offer.get("inStock", True)) if primary_offer else False
                 new_price = float(primary_offer.get("price") or 0.0) if primary_offer else 0.0
 
+                # Synchronize primary_offer directly into retailer_offers so it is never stale
+                if primary_offer and primary_offer.get("price") and float(primary_offer["price"]) > 0:
+                    matched_primary_in_list = False
+                    for off in retailer_offers:
+                        if off.get("url") == product_url or (off.get("retailer", "").lower() == current_retailer.lower()):
+                            off["price"] = float(primary_offer["price"])
+                            off["inStock"] = primary_in_stock
+                            off["url"] = primary_offer.get("url") or product_url
+                            if primary_offer.get("imageUrl"):
+                                off["imageUrl"] = primary_offer["imageUrl"]
+                            matched_primary_in_list = True
+                            break
+                    if not matched_primary_in_list:
+                        retailer_offers.append({
+                            "retailer": current_retailer,
+                            "price": new_price,
+                            "inStock": primary_in_stock,
+                            "url": product_url,
+                            "imageUrl": primary_offer.get("imageUrl")
+                        })
+
                 # Also update other retailer offers for this component if present
                 if retailer_offers:
                     for off in retailer_offers:
@@ -524,6 +545,8 @@ async def execute_daily_price_refresh():
                             primary_in_stock = True
                             if matched_ret_offer.get("url"):
                                 product_url = matched_ret_offer["url"]
+                        elif primary_offer and primary_in_stock and new_price > 0:
+                            pass
                         else:
                             primary_in_stock = False
                     elif valid_offers:
@@ -535,6 +558,8 @@ async def execute_daily_price_refresh():
                         current_retailer = best_off.get("retailer", current_retailer)
                         if best_off.get("url"):
                             product_url = best_off["url"]
+                    elif primary_offer and primary_in_stock and new_price > 0:
+                        pass
                     else:
                         primary_in_stock = False
 
@@ -580,14 +605,23 @@ async def execute_daily_price_refresh():
                 if not is_currently_in_stock:
                     misses = int(specs_data.get("consecutive_misses", 0)) + 1
                     specs_data["consecutive_misses"] = misses
-                    specs_data["in_stock"] = False
-                    specs_data["is_sold_out"] = True
+                    # Enterprise grace period: require at least 2 consecutive misses to prevent intermittent scraper/network throttles
+                    # from falsely flagging an active item as sold out or wiping deal_score to 0
+                    if misses >= 2:
+                        specs_data["in_stock"] = False
+                        specs_data["is_sold_out"] = True
+                        deal_score = 0  # Confirmed sold out: remove from Deal Radar and active deal feeds
+                        print(f"🚫 [Daily Refresh Confirmed Sold Out] \"{comp_name[:40]}\": Out of Stock / Gone. Deal score set to 0 (Miss #{misses}).")
+                    else:
+                        # Grace period: preserve previous stock status & deal score
+                        specs_data["in_stock"] = specs_data.get("in_stock", True)
+                        specs_data["is_sold_out"] = specs_data.get("is_sold_out", False)
+                        deal_score = comp.get("deal_score", 50)
+                        print(f"⚠️ [Daily Refresh Temporary Miss] \"{comp_name[:40]}\": Miss #{misses}. In grace period, preserving stock status and deal score {deal_score}.")
                     if misses >= 3:
                         specs_data["is_expired"] = True
-                    deal_score = 0  # Zero out deal score so sold-out item immediately drops off Deal Radar and active deal feeds!
                     if new_price <= 0 and old_price > 0:
                         new_price = old_price
-                    print(f"🚫 [Daily Refresh Sold Out] \"{comp_name[:40]}\": Out of Stock / Gone. Deal score set to 0 (Miss #{misses}).")
                 else:
                     specs_data["consecutive_misses"] = 0
                     specs_data["in_stock"] = True
@@ -679,7 +713,7 @@ async def execute_daily_price_refresh():
                         title=comp_name,
                         product_url=product_url,
                         image_url=primary_offer.get("imageUrl") if primary_offer else comp.get("image_url"),
-                        in_stock=True,
+                        in_stock=is_currently_in_stock,
                         condition="used" if "used" in comp_name.lower() or "tested" in comp_name.lower() else "new"
                     )
 
@@ -752,13 +786,19 @@ async def execute_daily_price_refresh():
                 if not offers:
                     misses = int(specs_data.get("consecutive_misses", 0)) + 1
                     specs_data["consecutive_misses"] = misses
-                    specs_data["in_stock"] = False
-                    specs_data["is_sold_out"] = True
+                    if misses >= 2:
+                        specs_data["in_stock"] = False
+                        specs_data["is_sold_out"] = True
+                        deal_score = 0
+                    else:
+                        specs_data["in_stock"] = specs_data.get("in_stock", True)
+                        specs_data["is_sold_out"] = specs_data.get("is_sold_out", False)
+                        deal_score = comp.get("deal_score", 50)
                     if misses >= 3:
                         specs_data["is_expired"] = True
                     await asyncio.to_thread(
                         supabase.table("hardware_components").update({
-                            "deal_score": 0,
+                            "deal_score": deal_score,
                             "specs": json.dumps(specs_data),
                             "updated_at": now_iso
                         }).eq("id", comp_id).execute
@@ -775,17 +815,24 @@ async def execute_daily_price_refresh():
                 new_atl = min(old_atl if old_atl > 0 else new_price, new_price) if new_price > 0 else old_atl
 
                 specs_data["RetailerOffers"] = offers
-                specs_data["in_stock"] = is_currently_in_stock
-                specs_data["is_sold_out"] = not is_currently_in_stock
 
                 if not is_currently_in_stock:
                     misses = int(specs_data.get("consecutive_misses", 0)) + 1
                     specs_data["consecutive_misses"] = misses
+                    if misses >= 2:
+                        specs_data["in_stock"] = False
+                        specs_data["is_sold_out"] = True
+                        deal_score = 0
+                    else:
+                        specs_data["in_stock"] = specs_data.get("in_stock", True)
+                        specs_data["is_sold_out"] = specs_data.get("is_sold_out", False)
+                        deal_score = comp.get("deal_score", 50)
                     if misses >= 3:
                         specs_data["is_expired"] = True
-                    deal_score = 0
                 else:
                     specs_data["consecutive_misses"] = 0
+                    specs_data["in_stock"] = True
+                    specs_data["is_sold_out"] = False
                     specs_data["is_expired"] = False
                     specs_data["last_verified_stock_at"] = now_iso
                     deal_score = comp.get("deal_score", 50)

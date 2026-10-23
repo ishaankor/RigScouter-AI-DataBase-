@@ -22,8 +22,9 @@ SMART_PARSER_SYSTEM_PROMPT = (
     "2. ORIGINAL PRICE: If there is a clear previous/original price ('Was $XXX', 'Regular Price $XXX', 'List Price $XXX'), "
     "extract it; otherwise null.\n"
     "3. STOCK STATUS: Determine if the product is in stock (true) or out of stock (false). "
-    "Words and phrases like '0 in stock', 'sold out', 'out of stock', 'currently unavailable', 'no longer available', "
-    "'this item is no longer available', 'no longer carried', 'discontinued', 'backorder', 'not available online', 'not available for shipping' mean in_stock: false.\n"
+    "Explicit zero-inventory phrases like '0 in stock', '0 available', 'sold out', 'out of stock', 'currently unavailable', "
+    "'temporarily out of stock', 'this item is out of stock', 'this listing was ended by the seller', 'no longer available' mean in_stock: false. "
+    "CRITICAL: Do NOT mark an item out of stock merely because text mentions 'discontinued by manufacturer' or 'older generation' if the seller currently has units available for checkout or purchase buttons are active!\n"
     "4. STANDALONE COMPONENT MATCH: The user is looking for a standalone PC rig part. "
     "If the item is a full desktop PC prebuilt, laptop, motherboard bundle, upgrade kit, or accessory (air duster, sticker, empty box, toy, poster, cable), "
     "set is_standalone_match: false. If it is the genuine standalone hardware component, set is_standalone_match: true.\n"
@@ -158,15 +159,15 @@ def _fallback_heuristic_parse(
         return []
 
     t_lower = text.lower()
-    is_sold_out = any(
+    has_active_buy = any(w in t_lower for w in ["buy it now", "add to cart", "in stock", "available"])
+    has_explicit_sold_out = any(
         phrase in t_lower for phrase in [
-            "0 in stock", "sold out", "out of stock", "currently unavailable",
-            "not in stock", "backorder", "pick up in store only - 0",
-            "no longer available", "this item is no longer available",
-            "no longer carried", "discontinued", "not available for shipping",
-            "not available in new condition"
+            "0 in stock", "0 available", "sold out", "out of stock", "currently unavailable",
+            "not in stock", "this item is out of stock", "this listing was ended by the seller",
+            "this item is no longer available"
         ]
     )
+    is_sold_out = has_explicit_sold_out and not has_active_buy
 
     is_refurb = "refurbished" in t_lower
     is_open_box = any(w in t_lower for w in ["open-box", "open box"])

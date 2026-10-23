@@ -95,13 +95,21 @@ class PricingService:
         if not offers:
             misses = int(specs_dict.get("consecutive_misses", 0)) + 1
             specs_dict["consecutive_misses"] = misses
-            specs_dict["in_stock"] = False
-            specs_dict["is_sold_out"] = True
+            if misses >= 2:
+                specs_dict["in_stock"] = False
+                specs_dict["is_sold_out"] = True
+                deal_score = 0
+                logger.info(f"🚫 [Pricing Confirmed Sold Out] {comp_id}: Scrape miss #{misses}. Deal score set to 0.")
+            else:
+                specs_dict["in_stock"] = specs_dict.get("in_stock", True)
+                specs_dict["is_sold_out"] = specs_dict.get("is_sold_out", False)
+                deal_score = existing.get("deal_score", 50)
+                logger.info(f"⚠️ [Pricing Scrape Grace Period] {comp_id}: Miss #{misses}. Retaining stock status and deal score {deal_score}.")
             if misses >= 3:
                 specs_dict["is_expired"] = True
             await asyncio.to_thread(
                 supabase.table("hardware_components").update({
-                    "deal_score": 0,
+                    "deal_score": deal_score,
                     "specs": json.dumps(specs_dict),
                     "updated_at": now_iso
                 }).eq("id", comp_id).execute
@@ -131,17 +139,26 @@ class PricingService:
 
         specs_dict["RetailerOffers"] = [o.dict() for o in offers]
         specs_dict["price_history"] = history
-        specs_dict["in_stock"] = is_currently_in_stock
-        specs_dict["is_sold_out"] = not is_currently_in_stock
 
         if not is_currently_in_stock:
             misses = int(specs_dict.get("consecutive_misses", 0)) + 1
             specs_dict["consecutive_misses"] = misses
+            if misses >= 2:
+                specs_dict["in_stock"] = False
+                specs_dict["is_sold_out"] = True
+                deal_score = 0
+                logger.info(f"🚫 [Pricing Confirmed Sold Out] {comp_id}: Scrape miss #{misses}. Deal score set to 0.")
+            else:
+                specs_dict["in_stock"] = specs_dict.get("in_stock", True)
+                specs_dict["is_sold_out"] = specs_dict.get("is_sold_out", False)
+                deal_score = existing.get("deal_score", 50)
+                logger.info(f"⚠️ [Pricing Scrape Grace Period] {comp_id}: Miss #{misses}. Retaining stock status and deal score {deal_score}.")
             if misses >= 3:
                 specs_dict["is_expired"] = True
-            deal_score = 0
         else:
             specs_dict["consecutive_misses"] = 0
+            specs_dict["in_stock"] = True
+            specs_dict["is_sold_out"] = False
             specs_dict["is_expired"] = False
             specs_dict["last_verified_stock_at"] = now_iso
             msrp = float(existing.get("msrp") or 0.0)
