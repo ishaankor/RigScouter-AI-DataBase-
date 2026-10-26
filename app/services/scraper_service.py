@@ -21,9 +21,6 @@ class ScraperService:
     def __init__(self, max_concurrent: int = 4):
         self.scrapers = {
             "amazon": AmazonScraper(),
-            "bestbuy": BestBuyScraper(),
-            "newegg": NeweggScraper(),
-            "microcenter": MicroCenterScraper(),
             "ebay": EbayScraper(),
         }
         # Concurrency semaphore prevents flooding outbound networks & retailer anti-bot systems
@@ -172,15 +169,9 @@ class ScraperService:
         """Direct price lookup router based on URL domain guarded by semaphore."""
         async with self._semaphore:
             u_lower = url.lower()
-            if "amazon.com" in u_lower:
+            if "amazon." in u_lower or "amzn.to" in u_lower:
                 return await self.scrapers["amazon"].get_price(url)
-            elif "bestbuy.com" in u_lower:
-                return await self.scrapers["bestbuy"].get_price(url)
-            elif "newegg.com" in u_lower:
-                return await self.scrapers["newegg"].get_price(url)
-            elif "microcenter.com" in u_lower:
-                return await self.scrapers["microcenter"].get_price(url)
-            elif "ebay.com" in u_lower:
+            elif "ebay." in u_lower:
                 return await self.scrapers["ebay"].get_price(url)
             return None
 

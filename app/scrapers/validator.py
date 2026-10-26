@@ -60,6 +60,26 @@ def validate_offer_fast(
             if spam not in raw_lower and spam not in model_lower:
                 return False, f"Matches non-hardware / fake keyword: '{spam}'"
 
+    # Reject promotional headlines, marketing copy, review titles, and editorial articles
+    marketing_patterns = [
+        r'\btakes\s+.*?\s+to\s+(?:the\s+)?(?:limit|next\s+level|max)\b',
+        r'\bwelcome\s+to\b',
+        r'\bintroducing\b',
+        r'\bengineered\s+to\b',
+        r'\bdesigned\s+to\b',
+        r'\bbuilt\s+for\b',
+        r'\bunleash\s+the\b',
+        r'\bexperience\s+the\b',
+        r'\bhow\s+to\b',
+        r'\bbenchmarks?\s+and\s+review\b',
+        r'\breview\s*:\s*',
+        r'\bguide\b'
+    ]
+    for pat in marketing_patterns:
+        if re.search(pat, t_lower):
+            if not any(re.search(pat, q) for q in [raw_lower, model_lower]):
+                return False, f"Promotional/marketing slogan detected in title"
+
     if analysis:
         # Negative keywords from analysis (protecting standard specification terms)
         PROTECTED_SPEC_TERMS = {
@@ -81,7 +101,7 @@ def validate_offer_fast(
             cpu_acc = [
                 "cpu cooler", "air cooler", "liquid cooler", "aio cooler", "water cooler",
                 "cooler master", "thermalright", "noctua", "deepcool", "thermal paste",
-                "contact frame", "mounting bracket", "retention bracket", "cpu fan"
+                "contact frame", "mounting bracket", "retention bracket", "cpu fan", "delid tool"
             ]
             for acc in cpu_acc:
                 if re.search(r'\b' + re.escape(acc) + r'\b', t_lower):
@@ -90,24 +110,30 @@ def validate_offer_fast(
         elif cat_upper in ["GPU", "GRAPHICS CARD"]:
             gpu_acc = [
                 "gpu bracket", "support bracket", "riser cable", "vertical mount",
-                "backplate", "water block", "cooling fan replacement"
+                "backplate", "water block", "waterblock", "cooling fan replacement",
+                "cooler fan", "replacement fan", "fan replacement", "cooling fans",
+                "fan for", "fans for", "cooler for", "heatsink", "shroud", "faceplate",
+                "anti-sag", "gpu holder", "gpu stand", "thermal pad", "copper shim",
+                "dummy card", "display prop", "12vhpwr", "power adapter cable", "pcie cable"
             ]
             for acc in gpu_acc:
                 if re.search(r'\b' + re.escape(acc) + r'\b', t_lower):
                     if acc not in raw_lower and acc not in model_lower:
                         return False, f"Accessory item: '{acc}'"
         elif cat_upper in ["MOTHERBOARD"]:
-            mb_acc = ["io shield only", "antenna only", "replacement bios chip"]
+            mb_acc = ["io shield only", "antenna only", "replacement bios chip", "motherboard backplate"]
             for acc in mb_acc:
                 if re.search(r'\b' + re.escape(acc) + r'\b', t_lower):
                     if acc not in raw_lower and acc not in model_lower:
                         return False, f"Accessory item: '{acc}'"
 
         # Distinctive model number matching (e.g. 9600, 5600, 4070, 850, 990, 650, 790, 360)
-        # Extract 3-5 digit model numbers from model or raw query
-        nums = re.findall(r'(?<!\d)(\d{3,5})(?!\d)', model_str)
+        # Strip currency prices (e.g. $1,099 or $450) to avoid false matches on price numbers
+        clean_model_for_nums = re.sub(r'\$[\s\d,.]+', ' ', model_str)
+        clean_raw_for_nums = re.sub(r'\$[\s\d,.]+', ' ', raw_query)
+        nums = [n for n in re.findall(r'(?<!\d)(\d{3,5})(?!\d)', clean_model_for_nums) if not n.startswith('0')]
         if not nums:
-            nums = re.findall(r'(?<!\d)(\d{3,5})(?!\d)', raw_query)
+            nums = [n for n in re.findall(r'(?<!\d)(\d{3,5})(?!\d)', clean_raw_for_nums) if not n.startswith('0')]
 
         for num in nums:
             if not re.search(r'(?<!\d)' + num + r'(?!\d)', t_lower):
@@ -134,11 +160,23 @@ def validate_offer_fast(
                 return False, f"Missing requested variant '{found_suffix.upper()}'"
 
         # Universal Price Floor Check:
-        # Prevents $2-$5 cables/stickers and misidentified motherboard bundle discounts
-        # from passing for expensive flagship components
-        if min_price and min_price > 0:
-            if cat_upper in ["CPU", "PROCESSOR", "GPU", "GRAPHICS CARD"]:
-                floor = max(30.0, min_price * 0.50)
+        # Prevents $2-$5 cables/stickers, accessories, and promotional blurbs
+        # from passing for dedicated standalone hardware
+        if cat_upper in ["GPU", "GRAPHICS CARD"]:
+            # Dedicated GPUs have clear market baselines (even legacy 1080/1080Ti are >$120)
+            is_mid_or_high_gpu = any(re.search(r'\b' + pat + r'\b', model_lower) for pat in [
+                r'1070', r'1080', r'2070', r'2080', r'3060', r'3070', r'3080', r'3090',
+                r'4060', r'4070', r'4080', r'4090', r'5070', r'5080', r'5090',
+                r'6700', r'6800', r'6900', r'7700', r'7800', r'7900'
+            ])
+            gpu_floor = 120.0 if is_mid_or_high_gpu else 50.0
+            if min_price and min_price > 0:
+                gpu_floor = max(gpu_floor, min_price * 0.50)
+            if price < gpu_floor:
+                return False, f"Price ${price:.2f} is below realistic GPU floor (${gpu_floor:.2f})"
+        elif min_price and min_price > 0:
+            if cat_upper in ["CPU", "PROCESSOR"]:
+                floor = max(35.0, min_price * 0.50)
             elif cat_upper in ["MOTHERBOARD", "POWER SUPPLY"]:
                 floor = max(25.0, min_price * 0.40)
             else:

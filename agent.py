@@ -89,6 +89,12 @@ class ProductAnalyzer:
     @staticmethod
     async def analyze_query(query: str) -> ProductAnalysis:
         clean = query.strip()
+        # Clean web page title noise like "Price: $1,099 — United States | GPU Prices"
+        clean = re.sub(r'\|\s*.*$', '', clean)
+        clean = re.sub(r'—\s*.*$', '', clean)
+        clean = re.sub(r'Price:\s*\$[\d,.]+', '', clean, flags=re.I)
+        clean = re.sub(r'\b(?:Amazon\.com|eBay|Best Buy|Newegg|Micro Center)\b.*', '', clean, flags=re.I)
+        clean = re.sub(r'[\t\r\n]+', ' ', clean).strip()
         if not clean:
             return ProductAnalysis(clean, None, clean, "Other", False, clean, [])
 
@@ -656,27 +662,63 @@ class AmazonClient:
                     if not item_asin:
                         continue
 
-                    # Extract title
+                    # Extract product title: prioritize product link with /dp/ or /gp/ and meaningful text
                     title = None
-                    for a in it.find_all("a", class_="a-link-normal"):
-                        txt = a.text.strip()
-                        if len(txt) > 20 and not txt.startswith("("):
-                            title = txt
-                            break
+                    for a in it.find_all("a", href=True):
+                        href = a.get("href", "")
+                        if ("/dp/" in href or "/gp/product/" in href) and not a.find("img"):
+                            txt = a.get_text(" ", strip=True)
+                            if len(txt) > 15 and "out of 5 stars" not in txt.lower() and not txt.startswith("(") and "takes " not in txt.lower():
+                                title = txt
+                                break
+
+                    if not title:
+                        h2_el = it.find("h2")
+                        if h2_el:
+                            h2_txt = h2_el.get_text(" ", strip=True)
+                            if len(h2_txt) > 15 and "takes " not in h2_txt.lower():
+                                title = h2_txt
+
+                    if not title:
+                        for a in it.find_all("a", class_="a-link-normal"):
+                            txt = a.get_text(" ", strip=True)
+                            if len(txt) > 20 and not txt.startswith("(") and "takes " not in txt.lower() and "out of 5 stars" not in txt.lower():
+                                title = txt
+                                break
+
                     if not title:
                         img = it.find("img", class_="s-image")
                         if img and img.get("alt"):
-                            title = img.get("alt")
+                            alt_txt = img.get("alt").strip()
+                            if len(alt_txt) > 15 and "takes " not in alt_txt.lower():
+                                title = alt_txt
+
+                    if not title:
+                        continue
 
                     # Extract price
+                    price_val = None
                     price_el = it.find("span", class_="a-price")
-                    price_offscreen = price_el.find("span", class_="a-offscreen") if price_el else None
-                    if not price_offscreen or not title:
+                    if price_el:
+                        off = price_el.find("span", class_="a-offscreen")
+                        if off:
+                            m = re.search(r'[\$]?([0-9,]+\.[0-9]{2})', off.text)
+                            if m:
+                                price_val = float(m.group(1).replace(",", ""))
+
+                    if not price_val:
+                        whole_el = it.find("span", class_="a-price-whole")
+                        if whole_el:
+                            frac_el = it.find("span", class_="a-price-fraction")
+                            w_str = whole_el.text.replace(",", "").replace(".", "").strip()
+                            f_str = frac_el.text.strip() if frac_el else "00"
+                            try:
+                                price_val = float(f"{w_str}.{f_str}")
+                            except ValueError:
+                                pass
+
+                    if not price_val or price_val <= 0:
                         continue
-                    m = re.search(r'[\$]?([0-9,]+\.[0-9]{2})', price_offscreen.text)
-                    if not m:
-                        continue
-                    price_val = float(m.group(1).replace(",", ""))
 
                     # Fast-fail only (LLM validation happens centrally in HardwareAgent.run)
                     is_valid, reason = ProductAnalyzer.validate_offer_fast(analysis, title, price_val)
@@ -1957,26 +1999,12 @@ class HardwareAgent:
                 "failed_retailers": []
             }
 
-        # 2. Concurrently scrape retailers with lifecycle intelligence
-        search_target = clean_prompt
-        is_legacy = ProductAnalyzer.is_legacy_or_discontinued(analysis)
-
-        if is_legacy:
-            print(f"📦 [Hardware Lifecycle] '{analysis.model}' identified as legacy/discontinued hardware.")
-            print(f"   Skipping retail-only chains (Best Buy, Micro Center); focusing on secondary marketplaces (eBay, Amazon Renewed, Newegg).")
-            tasks = [
-                self.amazon.search(analysis),
-                self.ebay.search(analysis),
-                self._search_newegg(search_target, analysis),
-            ]
-        else:
-            tasks = [
-                self.amazon.search(analysis),
-                self.ebay.search(analysis),
-                self.bestbuy.search(analysis),
-                self._search_newegg(search_target, analysis),
-                self._search_microcenter(search_target, analysis),
-            ]
+        # 2. Concurrently scrape our two concrete primary retailers: Amazon and eBay
+        print(f"🛒 [Retailer Engine] Concurrently querying Amazon and eBay for '{analysis.model}'...")
+        tasks = [
+            self.amazon.search(analysis),
+            self.ebay.search(analysis),
+        ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Flatten all raw candidates into one pool

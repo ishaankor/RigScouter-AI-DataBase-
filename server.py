@@ -228,6 +228,30 @@ async def _run_scrape_and_persist(target_query: str, user_id: str = None, pendin
                 condition="used" if off.get("isRefurbished") else "new"
             )
 
+        # Also upsert canonical parent row with id=comp_id so component_id=comp_id lookups in watchlist match instantly
+        parent_payload = {
+            "id": comp_id,
+            "name": best_offer.get("title") or res.get("normalized_query", target_query),
+            "model": res.get("normalized_query", target_query),
+            "category": res.get("category", "Hardware"),
+            "brand": res.get("brand"),
+            "current_price": price,
+            "msrp": global_msrp,
+            "lowest_price_90d": price,
+            "deal_score": 90,
+            "retailer": best_offer.get("retailer", "Amazon"),
+            "product_url": best_offer.get("url"),
+            "image_url": image_url,
+            "specs": specs_json,
+            "updated_at": now_iso
+        }
+        try:
+            await asyncio.to_thread(
+                supabase.table("hardware_components").upsert(parent_payload).execute
+            )
+        except Exception as p_err:
+            print(f"⚠️ [DB Save Parent Notice]: {p_err}")
+
         print(f"💾 [DB Persisted] Saved {len(offers)} retailer offer(s) for '{target_query}'")
 
         # 2. Sync to watchlist if this was user-requested
@@ -445,7 +469,24 @@ async def execute_daily_price_refresh():
     except Exception as e:
         print(f"[Daily Refresh Notice] Fetching watchlist_items: {e}")
 
-    print(f"[Daily Refresh] Found {len(hw_components)} hardware component(s) and {len(watchlist_items)} watchlist item(s).")
+    # Guarantee every tracked item in users' watchlists is included in the daily refresh
+    hw_ids = {c.get("id") for c in hw_components if c.get("id")}
+    for wl in watchlist_items:
+        wl_comp_id = wl.get("component_id")
+        if wl_comp_id and wl_comp_id not in hw_ids:
+            hw_components.append({
+                "id": wl_comp_id,
+                "name": wl.get("component_name"),
+                "model": wl.get("component_name"),
+                "product_url": wl.get("product_url"),
+                "current_price": wl.get("current_price"),
+                "lowest_price_90d": wl.get("all_time_low"),
+                "retailer": wl.get("retailer") or "Amazon",
+                "specs": "{}"
+            })
+            hw_ids.add(wl_comp_id)
+
+    print(f"[Daily Refresh] Total refresh catalog: {len(hw_components)} component(s) covering {len(watchlist_items)} watchlist item(s).")
 
     # In-memory URL cache for this cycle so identical URLs are never fetched twice
     url_cache = {}
@@ -516,8 +557,9 @@ async def execute_daily_price_refresh():
                             "imageUrl": primary_offer.get("imageUrl")
                         })
 
-                # Also update other retailer offers for this component if present
+                # Also update other retailer offers for this component if present (Amazon & eBay)
                 if retailer_offers:
+                    retailer_offers = [o for o in retailer_offers if (o.get("retailer") or "").lower() in ["amazon", "ebay"]]
                     for off in retailer_offers:
                         off_url = off.get("url")
                         if off_url and off_url != product_url:
@@ -526,12 +568,6 @@ async def execute_daily_price_refresh():
                                 if sub_offer.get("price") and float(sub_offer["price"]) > 0:
                                     off["price"] = float(sub_offer["price"])
                                 off["inStock"] = bool(sub_offer.get("inStock", True))
-                            else:
-                                off_ret = (off.get("retailer") or "").lower()
-                                if any(r in off_ret for r in ["micro center", "best buy"]):
-                                    fake_analysis = ProductAnalysis(comp_name, None, comp_name, comp.get("category", "GPU"), True, comp_name, [])
-                                    if ProductAnalyzer.is_legacy_or_discontinued(fake_analysis):
-                                        off["inStock"] = False
 
                     # For retailer-specific rows (ending with retailer slug), preserve that retailer
                     is_retailer_specific = any(comp_id.endswith(f"-{r}") for r in ["amazon", "ebay", "best-buy", "micro-center", "newegg", "bh"])
@@ -566,6 +602,11 @@ async def execute_daily_price_refresh():
                 if new_price <= 0 or not primary_in_stock:
                     # ── Fallback: Run normal search scraper via HardwareAgent to look for in-stock alternatives ──
                     search_query = comp.get("model") or comp_name
+                    search_query = re.sub(r'\|\s*.*$', '', search_query)
+                    search_query = re.sub(r'—\s*.*$', '', search_query)
+                    search_query = re.sub(r'Price:\s*\$[\d,.]+', '', search_query, flags=re.I)
+                    search_query = re.sub(r'\b(?:Amazon\.com|eBay|Best Buy|Newegg|Micro Center)\b.*', '', search_query, flags=re.I)
+                    search_query = re.sub(r'[\t\r\n]+', ' ', search_query).strip()
                     print(f"🔄 [Daily Refresh] Checking fallback scraper for in-stock offers for \"{comp_name[:45]}\"...")
                     try:
                         search_res = await agent_runner.run(search_query)
@@ -780,6 +821,11 @@ async def execute_daily_price_refresh():
             # ── Scenario B: Missing product_url (Fallback only) ──
             else:
                 search_query = comp.get("model") or comp_name
+                search_query = re.sub(r'\|\s*.*$', '', search_query)
+                search_query = re.sub(r'—\s*.*$', '', search_query)
+                search_query = re.sub(r'Price:\s*\$[\d,.]+', '', search_query, flags=re.I)
+                search_query = re.sub(r'\b(?:Amazon\.com|eBay|Best Buy|Newegg|Micro Center)\b.*', '', search_query, flags=re.I)
+                search_query = re.sub(r'[\t\r\n]+', ' ', search_query).strip()
                 print(f"\n[Daily Refresh Fallback] No product_url for \"{comp_name}\", searching via agent...")
                 res = await agent_runner.run(search_query)
                 offers = res.get("scrapedOffers") or []

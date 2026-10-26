@@ -63,36 +63,85 @@ class AmazonScraper(BaseScraper):
             soup = BeautifulSoup(html, "html.parser")
             items = soup.find_all("div", {"data-component-type": "s-search-result"})
 
-            for it in items[:6]:
+            for it in items[:8]:
                 try:
-                    title_el = it.find("h2")
-                    title = title_el.text.strip() if title_el else ""
-
-                    price_whole = it.find("span", class_="a-price-whole")
-                    price_fraction = it.find("span", class_="a-price-fraction")
-                    if not price_whole:
+                    asin = it.get("data-asin", "")
+                    if not asin:
                         continue
 
-                    price_str = price_whole.text.replace(",", "").replace(".", "").strip()
-                    frac_str = price_fraction.text.strip() if price_fraction else "00"
-                    price = float(f"{price_str}.{frac_str}")
+                    # Extract product title: prioritize product link with /dp/ or /gp/ and meaningful text
+                    title = None
+                    for a in it.find_all("a", href=True):
+                        href = a.get("href", "")
+                        if ("/dp/" in href or "/gp/product/" in href) and not a.find("img"):
+                            txt = a.get_text(" ", strip=True)
+                            if len(txt) > 15 and "out of 5 stars" not in txt.lower() and not txt.startswith("(") and "takes " not in txt.lower():
+                                title = txt
+                                break
 
-                    asin = it.get("data-asin", "")
-                    url = f"https://www.amazon.com/dp/{asin}" if asin else search_url
+                    if not title:
+                        h2_el = it.find("h2")
+                        if h2_el:
+                            h2_txt = h2_el.get_text(" ", strip=True)
+                            if len(h2_txt) > 15 and "takes " not in h2_txt.lower():
+                                title = h2_txt
+
+                    if not title:
+                        for a in it.find_all("a", class_="a-link-normal"):
+                            txt = a.get_text(" ", strip=True)
+                            if len(txt) > 20 and not txt.startswith("(") and "takes " not in txt.lower() and "out of 5 stars" not in txt.lower():
+                                title = txt
+                                break
+
+                    if not title:
+                        img = it.find("img", class_="s-image")
+                        if img and img.get("alt"):
+                            alt_txt = img.get("alt").strip()
+                            if len(alt_txt) > 15 and "takes " not in alt_txt.lower():
+                                title = alt_txt
+
+                    if not title:
+                        continue
+
+                    price_val = None
+                    price_el = it.find("span", class_="a-price")
+                    if price_el:
+                        off = price_el.find("span", class_="a-offscreen")
+                        if off and off.text:
+                            m = re.search(r"[\$]?([0-9,]+\.[0-9]{2})", off.text)
+                            if m:
+                                price_val = float(m.group(1).replace(",", ""))
+
+                    if not price_val:
+                        price_whole = it.find("span", class_="a-price-whole")
+                        if price_whole:
+                            price_fraction = it.find("span", class_="a-price-fraction")
+                            price_str = price_whole.text.replace(",", "").replace(".", "").strip()
+                            frac_str = price_fraction.text.strip() if price_fraction else "00"
+                            try:
+                                price_val = float(f"{price_str}.{frac_str}")
+                            except ValueError:
+                                pass
+
+                    if not price_val or price_val <= 0:
+                        continue
+
+                    url = f"https://www.amazon.com/dp/{asin}"
                     img_el = it.find("img", class_="s-image")
                     img_url = img_el.get("src") if img_el else None
 
-                    is_valid, _ = validate_offer_fast(title, price, analysis)
+                    is_valid, _ = validate_offer_fast(title, price_val, analysis)
                     if is_valid:
                         offers.append(Offer(
                             retailer=self.retailer_name,
-                            price=price,
+                            price=price_val,
                             url=url,
                             image_url=img_url,
                             title=title,
                             in_stock=True
                         ))
                 except Exception:
+                    continue
                     continue
 
         # If direct search was blocked or returned no items, use smart Tavily search
